@@ -1,0 +1,6 @@
+bin/
+certs/
+logs/
+*.exe
+*.test
+

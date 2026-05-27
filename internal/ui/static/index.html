@@ -1,0 +1,124 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>Meshlink 控制台</title>
+    <link rel="stylesheet" href="/style.css">
+  </head>
+  <body>
+    <header class="topbar">
+      <div>
+        <h1>Meshlink 控制台</h1>
+        <p id="cwd">正在读取工作目录...</p>
+      </div>
+      <button id="refreshStatus" type="button">刷新</button>
+    </header>
+
+    <main class="layout">
+      <section class="panel service-panel">
+        <div class="panel-title">
+          <h2>系统服务</h2>
+          <span id="serviceState" class="status">未知</span>
+        </div>
+        <label>
+          服务名
+          <input id="serviceName" value="MeshlinkAgent" autocomplete="off">
+        </label>
+        <label>
+          配置文件路径
+          <input id="configPath" autocomplete="off">
+        </label>
+        <div class="actions">
+          <button data-action="install" type="button">安装</button>
+          <button data-action="start" type="button">启动</button>
+          <button data-action="stop" type="button">停止</button>
+          <button data-action="uninstall" type="button">卸载</button>
+        </div>
+      </section>
+
+      <section class="panel cert-panel">
+        <div class="panel-title">
+          <h2>证书</h2>
+        </div>
+        <div class="grid two">
+          <label>
+            输出目录
+            <input id="certOut" value="certs" autocomplete="off">
+          </label>
+          <label>
+            CA 名称
+            <input id="caName" value="my-mesh" autocomplete="off">
+          </label>
+        </div>
+        <button id="initCA" type="button">创建 CA</button>
+
+        <div class="divider"></div>
+
+        <div class="grid two">
+          <label>
+            节点名
+            <input id="nodeName" value="home-hub" autocomplete="off">
+          </label>
+          <label>
+            DNS 备用名
+            <input id="dnsSans" placeholder="home.example.com" autocomplete="off">
+          </label>
+          <label>
+            IP 备用名
+            <input id="ipSans" placeholder="192.0.2.10" autocomplete="off">
+          </label>
+          <label>
+            有效天数
+            <input id="certDays" value="825" inputmode="numeric">
+          </label>
+        </div>
+        <button id="issueCert" type="button">签发节点证书</button>
+      </section>
+
+      <section class="panel config-panel">
+        <div class="panel-title">
+          <h2>配置</h2>
+          <div class="actions compact">
+            <button id="loadConfig" type="button">读取</button>
+            <button id="saveConfig" type="button">保存</button>
+          </div>
+        </div>
+        <textarea id="configEditor" spellcheck="false"></textarea>
+      </section>
+
+      <section class="panel log-panel">
+        <div class="panel-title">
+          <h2>日志</h2>
+          <button id="loadLogs" type="button">读取日志</button>
+        </div>
+        <pre id="logs"></pre>
+      </section>
+
+      <section class="panel rdp-panel">
+        <div class="panel-title">
+          <h2>远程桌面</h2>
+        </div>
+        <label>
+          目标地址
+          <input id="rdpTarget" value="192.168.1.50" autocomplete="off">
+        </label>
+        <div class="actions">
+          <button id="checkRdp" type="button">检查 RDP</button>
+          <button id="openRdp" type="button">打开远程桌面</button>
+        </div>
+      </section>
+
+      <section class="panel diagnostics-panel">
+        <div class="panel-title">
+          <h2>诊断</h2>
+          <button id="runDiagnostics" type="button">开始诊断</button>
+        </div>
+        <div id="diagnostics" class="checks"></div>
+      </section>
+    </main>
+
+    <div id="toast" role="status" aria-live="polite"></div>
+    <script src="/app.js"></script>
+  </body>
+</html>
