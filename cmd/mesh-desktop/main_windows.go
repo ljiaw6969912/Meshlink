@@ -4,6 +4,7 @@ package main
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -25,6 +26,8 @@ import (
 	"meshlink/internal/diagnose"
 	"meshlink/internal/rdp"
 	"meshlink/internal/runner"
+	meshupdate "meshlink/internal/update"
+	"meshlink/internal/version"
 	"meshlink/internal/winservice"
 )
 
@@ -40,20 +43,24 @@ type desktopApp struct {
 	ipSANs      *walk.LineEdit
 	certDays    *walk.LineEdit
 	rdpTarget   *walk.LineEdit
+	updateURL   *walk.LineEdit
 
 	serviceState *walk.Label
 	quickState   *walk.Label
+	updateState  *walk.Label
 	configEdit   *walk.TextEdit
 	meshList     *walk.ListBox
 	meshDetail   *walk.TextEdit
 	meshSummary  *walk.Label
 	meshModel    *meshNodeModel
 	meshSelected string
+	latestUpdate *meshupdate.Manifest
 	output       *walk.TextEdit
 }
 
 type desktopSettings struct {
 	LastConfigPath string `json:"last_config_path"`
+	LastUpdateURL  string `json:"last_update_url,omitempty"`
 }
 
 type meshNode struct {
@@ -204,6 +211,7 @@ func (a *desktopApp) run() error {
 	baseDir := appBaseDir()
 	defaultConfig := rememberedConfigPath(baseDir)
 	defaultCertOut := filepath.Join(baseDir, "certs")
+	defaultUpdateURL := rememberedUpdateURL(baseDir)
 
 	bg := SolidColorBrush{Color: walk.RGB(246, 248, 251)}
 	header := SolidColorBrush{Color: walk.RGB(20, 33, 48)}
@@ -316,6 +324,20 @@ func (a *desktopApp) run() error {
 									PushButton{Text: "打开远程桌面", OnClicked: a.openRDP, ColumnSpan: 2},
 								},
 							},
+							GroupBox{
+								Title:      "软件更新",
+								Background: panel,
+								Layout:     Grid{Columns: 3, Margins: Margins{Left: 12, Top: 18, Right: 12, Bottom: 12}, Spacing: 8},
+								Children: []Widget{
+									Label{Text: "更新地址", TextColor: muted},
+									LineEdit{AssignTo: &a.updateURL, Text: defaultUpdateURL, ColumnSpan: 2},
+									Label{Text: "当前版本", TextColor: muted},
+									Label{Text: version.Display(), TextColor: ink, ColumnSpan: 2},
+									PushButton{Text: "检查更新", OnClicked: a.checkUpdate},
+									PushButton{Text: "立即更新", OnClicked: a.applyUpdate, ColumnSpan: 2},
+									Label{AssignTo: &a.updateState, Text: "更新状态：未检查", TextColor: muted, ColumnSpan: 3},
+								},
+							},
 							Composite{
 								Background: bg,
 								Layout:     HBox{MarginsZero: true, Spacing: 8},
@@ -425,16 +447,33 @@ func settingsPath(baseDir string) string {
 	return filepath.Join(baseDir, "configs", "desktop-state.json")
 }
 
-func rememberedConfigPath(baseDir string) string {
-	defaultPath := defaultConfigPath(baseDir)
+func loadDesktopSettings(baseDir string) desktopSettings {
 	b, err := os.ReadFile(settingsPath(baseDir))
 	if err != nil {
-		return defaultPath
+		return desktopSettings{}
 	}
 	var settings desktopSettings
 	if err := json.Unmarshal(b, &settings); err != nil {
-		return defaultPath
+		return desktopSettings{}
 	}
+	return settings
+}
+
+func saveDesktopSettings(baseDir string, settings desktopSettings) error {
+	b, err := json.MarshalIndent(settings, "", "  ")
+	if err != nil {
+		return err
+	}
+	path := settingsPath(baseDir)
+	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
+		return err
+	}
+	return os.WriteFile(path, append(b, '\n'), 0o600)
+}
+
+func rememberedConfigPath(baseDir string) string {
+	defaultPath := defaultConfigPath(baseDir)
+	settings := loadDesktopSettings(baseDir)
 	path := strings.TrimSpace(settings.LastConfigPath)
 	if path == "" {
 		return defaultPath
@@ -454,16 +493,32 @@ func rememberConfigPath(baseDir, configPath string) error {
 	if err != nil {
 		return err
 	}
-	settings := desktopSettings{LastConfigPath: absPath}
-	b, err := json.MarshalIndent(settings, "", "  ")
+	settings := loadDesktopSettings(baseDir)
+	settings.LastConfigPath = absPath
+	return saveDesktopSettings(baseDir, settings)
+}
+
+func rememberedUpdateURL(baseDir string) string {
+	settings := loadDesktopSettings(baseDir)
+	updateURL := strings.TrimSpace(settings.LastUpdateURL)
+	if updateURL == "" {
+		return meshupdate.DefaultServerURL
+	}
+	return updateURL
+}
+
+func rememberUpdateURL(baseDir, updateURL string) error {
+	updateURL = strings.TrimSpace(updateURL)
+	if updateURL == "" {
+		return nil
+	}
+	normalized, err := meshupdate.NormalizeBaseURL(updateURL)
 	if err != nil {
 		return err
 	}
-	path := settingsPath(baseDir)
-	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
-		return err
-	}
-	return os.WriteFile(path, append(b, '\n'), 0o600)
+	settings := loadDesktopSettings(baseDir)
+	settings.LastUpdateURL = normalized
+	return saveDesktopSettings(baseDir, settings)
 }
 
 func formatJSON(b []byte) (string, error) {
@@ -841,6 +896,93 @@ func (a *desktopApp) openRDP() {
 	a.info("已打开远程桌面：" + target)
 }
 
+func (a *desktopApp) checkUpdate() {
+	updateURL := strings.TrimSpace(a.updateURL.Text())
+	normalized, err := meshupdate.NormalizeBaseURL(updateURL)
+	if err != nil {
+		a.fail("更新地址无效", err)
+		return
+	}
+	a.updateURL.SetText(normalized)
+	if err := rememberUpdateURL(appBaseDir(), normalized); err != nil {
+		a.fail("保存更新地址失败", err)
+		return
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 12*time.Second)
+	defer cancel()
+	result, err := meshupdate.Check(ctx, normalized, version.Version)
+	if err != nil {
+		a.latestUpdate = nil
+		a.updateState.SetText("更新状态：检查失败")
+		a.fail("检查更新失败", err)
+		return
+	}
+	if result.UpdateAvailable {
+		a.latestUpdate = &result.Manifest
+		a.updateState.SetText("更新状态：发现新版本 " + result.Manifest.Version)
+		a.info(formatUpdateResult(result))
+		return
+	}
+	a.latestUpdate = nil
+	a.updateState.SetText("更新状态：已是最新版本")
+	a.info(formatUpdateResult(result))
+}
+
+func (a *desktopApp) applyUpdate() {
+	if a.latestUpdate == nil {
+		a.checkUpdate()
+		if a.latestUpdate == nil {
+			return
+		}
+	}
+	manifest := *a.latestUpdate
+	if meshupdate.CompareVersions(manifest.Version, version.Version) <= 0 {
+		a.info("当前已经是最新版本，无需更新。")
+		return
+	}
+	confirm := walk.MsgBox(
+		a.mw,
+		"确认更新",
+		"将下载并安装 Meshlink "+manifest.Version+"。\r\n\r\n更新会关闭桌面控制台，停止并重启 MeshlinkAgent 服务；配置、证书和日志不会被覆盖。\r\n\r\n建议以管理员身份运行本控制台。",
+		walk.MsgBoxOKCancel|walk.MsgBoxIconInformation,
+	)
+	if confirm != walk.DlgCmdOK {
+		return
+	}
+
+	baseDir := appBaseDir()
+	updateURL := strings.TrimSpace(a.updateURL.Text())
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
+	defer cancel()
+	packagePath, err := meshupdate.DownloadPackage(ctx, updateURL, manifest, filepath.Join(baseDir, "updates", "downloads"))
+	if err != nil {
+		a.updateState.SetText("更新状态：下载失败")
+		a.fail("下载更新失败", err)
+		return
+	}
+	scriptPath, err := meshupdate.WriteApplyScript(meshupdate.ApplyOptions{
+		BaseDir:     baseDir,
+		PackagePath: packagePath,
+		Version:     manifest.Version,
+		ServiceName: strings.TrimSpace(a.serviceName.Text()),
+		WaitPID:     os.Getpid(),
+	})
+	if err != nil {
+		a.updateState.SetText("更新状态：准备失败")
+		a.fail("准备更新失败", err)
+		return
+	}
+	cmd := exec.Command("powershell.exe", "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", scriptPath)
+	if err := cmd.Start(); err != nil {
+		a.updateState.SetText("更新状态：启动失败")
+		a.fail("启动更新脚本失败", err)
+		return
+	}
+	a.info("更新脚本已启动：\r\n" + scriptPath + "\r\n\r\n控制台即将关闭，更新完成后会自动重新打开。")
+	a.mw.Close()
+}
+
 func (a *desktopApp) info(text string) {
 	a.output.SetText(text)
 }
@@ -863,6 +1005,44 @@ func formatReport(report diagnose.Report) string {
 	b.WriteString(report.Summary.ConfigPath)
 	b.WriteString("\r\n\r\n")
 	b.WriteString(formatChecks(report.Checks))
+	return b.String()
+}
+
+func formatUpdateResult(result meshupdate.CheckResult) string {
+	var b strings.Builder
+	b.WriteString("当前版本：")
+	b.WriteString(result.CurrentVersion)
+	b.WriteString("\r\n最新版本：")
+	b.WriteString(result.Manifest.Version)
+	if result.Manifest.BuildTime != "" {
+		b.WriteString("\r\n构建时间：")
+		b.WriteString(result.Manifest.BuildTime)
+	}
+	b.WriteString("\r\n包文件：")
+	b.WriteString(result.Manifest.Package.File)
+	if result.Manifest.Package.Size > 0 {
+		b.WriteString("\r\n包大小：")
+		b.WriteString(strconv.FormatInt(result.Manifest.Package.Size, 10))
+		b.WriteString(" 字节")
+	}
+	if result.Manifest.Package.SHA256 != "" {
+		b.WriteString("\r\nSHA256：")
+		b.WriteString(result.Manifest.Package.SHA256)
+	}
+	b.WriteString("\r\n更新状态：")
+	if result.UpdateAvailable {
+		b.WriteString("可更新")
+	} else {
+		b.WriteString("已是最新")
+	}
+	if len(result.Manifest.Notes) > 0 {
+		b.WriteString("\r\n\r\n更新说明：\r\n")
+		for _, note := range result.Manifest.Notes {
+			b.WriteString("- ")
+			b.WriteString(note)
+			b.WriteString("\r\n")
+		}
+	}
 	return b.String()
 }
 

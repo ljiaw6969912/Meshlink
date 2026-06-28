@@ -88,7 +88,12 @@ func (a *Agent) connectOnce(ctx context.Context, tlsCfg *tls.Config, devicePacke
 	write := func(typ byte, payload []byte) error {
 		writeMu.Lock()
 		defer writeMu.Unlock()
-		return proto.Write(conn, typ, payload)
+		if err := conn.SetWriteDeadline(time.Now().Add(peerWriteTimeout)); err != nil {
+			return err
+		}
+		err := proto.Write(conn, typ, payload)
+		_ = conn.SetWriteDeadline(time.Time{})
+		return err
 	}
 
 	go func() {

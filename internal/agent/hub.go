@@ -25,6 +25,8 @@ type peer struct {
 	log       *slog.Logger
 }
 
+const peerWriteTimeout = 10 * time.Second
+
 type router struct {
 	mu    sync.RWMutex
 	peers map[string]*peer
@@ -34,16 +36,22 @@ func newRouter() *router {
 	return &router{peers: make(map[string]*peer)}
 }
 
-func (r *router) add(p *peer) {
+func (r *router) add(p *peer) *peer {
 	r.mu.Lock()
 	defer r.mu.Unlock()
+	old := r.peers[p.id]
 	r.peers[p.id] = p
+	return old
 }
 
-func (r *router) remove(id string) {
+func (r *router) removeIf(id string, p *peer) bool {
 	r.mu.Lock()
 	defer r.mu.Unlock()
+	if r.peers[id] != p {
+		return false
+	}
 	delete(r.peers, id)
+	return true
 }
 
 func (r *router) list() []*peer {
@@ -150,7 +158,11 @@ func (a *Agent) handlePeer(ctx context.Context, rt *router, conn net.Conn) {
 		conn:      conn,
 		log:       a.log.With("peer", hello.NodeID, "remote", conn.RemoteAddr()),
 	}
-	rt.add(p)
+	old := rt.add(p)
+	if old != nil && old != p {
+		p.log.Warn("replacing existing peer connection", "old_remote", old.conn.RemoteAddr())
+		_ = old.conn.Close()
+	}
 	a.status.upsertPeer(PeerStatus{
 		NodeID:      hello.NodeID,
 		VirtualIP:   hello.VirtualIP,
@@ -162,9 +174,10 @@ func (a *Agent) handlePeer(ctx context.Context, rt *router, conn net.Conn) {
 	})
 	a.broadcastRoster(rt)
 	defer func() {
-		rt.remove(p.id)
-		a.status.removePeer(p.id)
-		a.broadcastRoster(rt)
+		if rt.removeIf(p.id, p) {
+			a.status.removePeer(p.id)
+			a.broadcastRoster(rt)
+		}
 	}()
 
 	p.log.Info("peer connected", "virtual_ip", hello.VirtualIP, "routes", hello.Routes, "mtu", hello.MTU)
@@ -224,7 +237,10 @@ func (a *Agent) handlePeerFrame(rt *router, p *peer, frame proto.Frame) error {
 			p.log.Debug("no route for packet", "dst", dst)
 			return nil
 		}
-		return target.write(proto.TypePacket, frame.Payload)
+		if err := target.write(proto.TypePacket, frame.Payload); err != nil {
+			a.dropPeer(rt, target, "dropping peer after packet forward failed", err)
+		}
+		return nil
 	case proto.TypePing:
 		return p.write(proto.TypePong, nil)
 	case proto.TypePong:
@@ -307,15 +323,33 @@ func (a *Agent) deviceToPeers(ctx context.Context, rt *router) error {
 			continue
 		}
 		if err := target.write(proto.TypePacket, packet); err != nil {
-			return err
+			a.dropPeer(rt, target, "dropping peer after device packet forward failed", err)
+			continue
 		}
 	}
+}
+
+func (a *Agent) dropPeer(rt *router, p *peer, msg string, err error) {
+	if p == nil {
+		return
+	}
+	p.log.Warn(msg, "err", err)
+	if rt.removeIf(p.id, p) {
+		a.status.removePeer(p.id)
+		a.broadcastRoster(rt)
+	}
+	_ = p.conn.Close()
 }
 
 func (p *peer) write(typ byte, payload []byte) error {
 	p.sendMu.Lock()
 	defer p.sendMu.Unlock()
-	return proto.Write(p.conn, typ, payload)
+	if err := p.conn.SetWriteDeadline(time.Now().Add(peerWriteTimeout)); err != nil {
+		return err
+	}
+	err := proto.Write(p.conn, typ, payload)
+	_ = p.conn.SetWriteDeadline(time.Time{})
+	return err
 }
 
 func mustAddr(s string) netip.Addr {
