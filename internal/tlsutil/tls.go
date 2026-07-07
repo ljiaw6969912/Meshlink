@@ -8,6 +8,10 @@ import (
 )
 
 func ServerConfig(caFile, certFile, keyFile string) (*tls.Config, error) {
+	return ServerConfigWithClientAuth(caFile, certFile, keyFile, tls.RequireAndVerifyClientCert)
+}
+
+func ServerConfigWithClientAuth(caFile, certFile, keyFile string, clientAuth tls.ClientAuthType) (*tls.Config, error) {
 	cert, pool, err := loadMaterial(caFile, certFile, keyFile)
 	if err != nil {
 		return nil, err
@@ -16,7 +20,7 @@ func ServerConfig(caFile, certFile, keyFile string) (*tls.Config, error) {
 		MinVersion:   tls.VersionTLS13,
 		Certificates: []tls.Certificate{cert},
 		ClientCAs:    pool,
-		ClientAuth:   tls.RequireAndVerifyClientCert,
+		ClientAuth:   clientAuth,
 	}, nil
 }
 

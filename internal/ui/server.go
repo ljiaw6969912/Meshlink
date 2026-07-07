@@ -1,14 +1,17 @@
 package ui
 
 import (
+	"bytes"
 	"embed"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"io/fs"
 	"log/slog"
 	"net/http"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strconv"
 	"strings"
@@ -16,6 +19,7 @@ import (
 	"meshlink/internal/certutil"
 	"meshlink/internal/config"
 	"meshlink/internal/diagnose"
+	"meshlink/internal/onboarding"
 	"meshlink/internal/rdp"
 	"meshlink/internal/winservice"
 )
@@ -24,13 +28,24 @@ import (
 var staticFS embed.FS
 
 type Server struct {
-	log *slog.Logger
+	log     *slog.Logger
+	baseDir string
 }
 
 func NewServer(logger *slog.Logger) http.Handler {
-	server := &Server{log: logger}
+	return NewServerWithBaseDir(logger, "")
+}
+
+func NewServerWithBaseDir(logger *slog.Logger, baseDir string) http.Handler {
+	server := &Server{log: logger, baseDir: baseDir}
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /api/info", server.handleInfo)
+	mux.HandleFunc("GET /api/onboarding/defaults", server.handleOnboardingDefaults)
+	mux.HandleFunc("POST /api/onboarding/start-server", server.handleOnboardingStartServer)
+	mux.HandleFunc("POST /api/onboarding/create-hub", server.handleOnboardingCreateHub)
+	mux.HandleFunc("POST /api/onboarding/invite", server.handleOnboardingInvite)
+	mux.HandleFunc("POST /api/onboarding/join", server.handleOnboardingJoin)
+	mux.HandleFunc("GET /api/onboarding/devices", server.handleOnboardingDevices)
 	mux.HandleFunc("GET /api/service/status", server.handleServiceStatus)
 	mux.HandleFunc("POST /api/service", server.handleServiceAction)
 	mux.HandleFunc("POST /api/certs/init-ca", server.handleInitCA)
@@ -62,11 +77,85 @@ func localOnly(next http.Handler) http.Handler {
 }
 
 func (s *Server) handleInfo(w http.ResponseWriter, r *http.Request) {
-	cwd, _ := os.Getwd()
+	cwd := s.effectiveBaseDir()
 	writeJSON(w, http.StatusOK, map[string]any{
 		"ok":  true,
 		"cwd": cwd,
 	})
+}
+
+func (s *Server) handleOnboardingDefaults(w http.ResponseWriter, r *http.Request) {
+	host, _ := os.Hostname()
+	writeJSON(w, http.StatusOK, map[string]any{
+		"ok":          true,
+		"base_dir":    s.effectiveBaseDir(),
+		"node_name":   host,
+		"network":     "我的组网",
+		"listen_port": 8443,
+		"protocol":    "tcp_tls_v1",
+		"config_path": filepath.Join(s.effectiveBaseDir(), "configs", "active.json"),
+	})
+}
+
+func (s *Server) handleOnboardingStartServer(w http.ResponseWriter, r *http.Request) {
+	var req onboarding.StartServerRequest
+	if !decodeJSON(w, r, &req) {
+		return
+	}
+	result, err := s.onboardingManager().StartServerMode(req)
+	if err != nil {
+		writeError(w, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "result": result})
+}
+
+func (s *Server) handleOnboardingCreateHub(w http.ResponseWriter, r *http.Request) {
+	var req onboarding.CreateHubRequest
+	if !decodeJSON(w, r, &req) {
+		return
+	}
+	result, err := s.onboardingManager().CreateHub(req)
+	if err != nil {
+		writeError(w, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "result": result})
+}
+
+func (s *Server) handleOnboardingInvite(w http.ResponseWriter, r *http.Request) {
+	var req onboarding.CreateInviteRequest
+	if !decodeJSON(w, r, &req) {
+		return
+	}
+	invite, err := s.onboardingManager().CreateInvite(req)
+	if err != nil {
+		writeError(w, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "invite": invite})
+}
+
+func (s *Server) handleOnboardingJoin(w http.ResponseWriter, r *http.Request) {
+	var req onboarding.JoinSpokeRequest
+	if !decodeJSON(w, r, &req) {
+		return
+	}
+	result, err := s.onboardingManager().JoinSpoke(req)
+	if err != nil {
+		writeError(w, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "result": result})
+}
+
+func (s *Server) handleOnboardingDevices(w http.ResponseWriter, r *http.Request) {
+	devices, err := s.onboardingManager().Devices(r.URL.Query().Get("service_name"))
+	if err != nil {
+		writeError(w, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "devices": devices})
 }
 
 func (s *Server) handleServiceStatus(w http.ResponseWriter, r *http.Request) {
@@ -91,7 +180,7 @@ func (s *Server) handleServiceAction(w http.ResponseWriter, r *http.Request) {
 	var err error
 	switch req.Action {
 	case "install":
-		err = winservice.Install(req.ServiceName, req.ConfigPath)
+		err = installAgentService(req.ServiceName, req.ConfigPath)
 	case "uninstall":
 		err = winservice.Uninstall(req.ServiceName)
 	case "start":
@@ -285,6 +374,63 @@ func tailFile(path string, maxBytes int64) (string, error) {
 		return "", err
 	}
 	return string(b), nil
+}
+
+func installAgentService(name, configPath string) error {
+	if name == "" {
+		name = winservice.DefaultName
+	}
+	agentPath, err := findAgentExe()
+	if err != nil {
+		return err
+	}
+	configPath, err = filepath.Abs(configPath)
+	if err != nil {
+		return err
+	}
+	cmd := exec.Command(agentPath, "-service", "install", "-service-name", name, "-config", configPath)
+	var out bytes.Buffer
+	cmd.Stdout = &out
+	cmd.Stderr = &out
+	if err := cmd.Run(); err != nil {
+		msg := strings.TrimSpace(out.String())
+		if msg != "" {
+			return fmt.Errorf("%w: %s", err, msg)
+		}
+		return err
+	}
+	return nil
+}
+
+func findAgentExe() (string, error) {
+	exe, err := os.Executable()
+	if err != nil {
+		return "", err
+	}
+	cwd, _ := os.Getwd()
+	candidates := []string{
+		filepath.Join(filepath.Dir(exe), "mesh-agent.exe"),
+		filepath.Join(cwd, "mesh-agent.exe"),
+		filepath.Join(cwd, "bin", "mesh-agent.exe"),
+	}
+	for _, candidate := range candidates {
+		if info, err := os.Stat(candidate); err == nil && !info.IsDir() {
+			return filepath.Abs(candidate)
+		}
+	}
+	return "", fmt.Errorf("找不到 mesh-agent.exe，请确认它和当前程序在同一目录，或位于当前目录的 bin 目录下")
+}
+
+func (s *Server) effectiveBaseDir() string {
+	if s.baseDir != "" {
+		return s.baseDir
+	}
+	cwd, _ := os.Getwd()
+	return cwd
+}
+
+func (s *Server) onboardingManager() onboarding.Manager {
+	return onboarding.Manager{BaseDir: s.effectiveBaseDir()}
 }
 
 func decodeJSON(w http.ResponseWriter, r *http.Request, v any) bool {

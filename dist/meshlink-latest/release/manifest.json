@@ -1,0 +1,14 @@
+{
+  "product": "Meshlink",
+  "version": "0.1.1",
+  "build_time": "2026-07-01T03:37:34Z",
+  "generated_at": "2026-07-01T03:37:40.1210798Z",
+  "package": {
+    "file": "meshlink-0.1.1.zip",
+    "sha256": "71e9a02ffc87ecf9573da0c2a16e1c1cbf8e15f6dd25b485a30b0d64afeab65f",
+    "size": 21375036
+  },
+  "notes": [
+    "Manual update package. Keeps local configs, certificates and logs; updates binaries and example configs only."
+  ]
+}

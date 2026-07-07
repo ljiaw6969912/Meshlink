@@ -1,6 +1,7 @@
 package agent
 
 import (
+	"bufio"
 	"context"
 	"crypto/tls"
 	"errors"
@@ -8,10 +9,12 @@ import (
 	"io"
 	"log/slog"
 	"net"
+	"net/http"
 	"net/netip"
 	"sync"
 	"time"
 
+	"meshlink/internal/onboarding"
 	"meshlink/internal/proto"
 	"meshlink/internal/tlsutil"
 )
@@ -25,7 +28,15 @@ type peer struct {
 	log       *slog.Logger
 }
 
-const peerWriteTimeout = 10 * time.Second
+const (
+	peerHelloTimeout       = 20 * time.Second
+	peerHeartbeatInterval  = 30 * time.Second
+	peerReadTimeout        = 95 * time.Second
+	peerWriteTimeout       = 10 * time.Second
+	spokeReconnectMinDelay = 1 * time.Second
+	spokeReconnectMaxDelay = 60 * time.Second
+	spokeStableResetAfter  = 2 * time.Minute
+)
 
 type router struct {
 	mu    sync.RWMutex
@@ -81,7 +92,7 @@ func (r *router) find(dst netip.Addr) *peer {
 }
 
 func (a *Agent) runHub(ctx context.Context) error {
-	tlsCfg, err := tlsutil.ServerConfig(a.cfg.CAFile, a.cfg.CertFile, a.cfg.KeyFile)
+	tlsCfg, err := tlsutil.ServerConfigWithClientAuth(a.cfg.CAFile, a.cfg.CertFile, a.cfg.KeyFile, tls.VerifyClientCertIfGiven)
 	if err != nil {
 		return err
 	}
@@ -113,7 +124,7 @@ func (a *Agent) runHub(ctx context.Context) error {
 				return err
 			}
 		}
-		go a.handlePeer(ctx, rt, conn)
+		go a.handleHubConn(ctx, rt, conn)
 
 		select {
 		case err := <-errCh:
@@ -125,10 +136,56 @@ func (a *Agent) runHub(ctx context.Context) error {
 	}
 }
 
+func (a *Agent) handleHubConn(ctx context.Context, rt *router, conn net.Conn) {
+	reader := bufio.NewReader(conn)
+	if err := conn.SetReadDeadline(time.Now().Add(peerHelloTimeout)); err != nil {
+		a.log.Warn("failed to set connection sniff deadline", "remote", conn.RemoteAddr(), "err", err)
+		_ = conn.Close()
+		return
+	}
+	prefix, err := reader.Peek(4)
+	_ = conn.SetReadDeadline(time.Time{})
+	if err != nil {
+		a.log.Warn("failed to sniff hub connection", "remote", conn.RemoteAddr(), "err", err)
+		_ = conn.Close()
+		return
+	}
+	buffered := &bufferedConn{Conn: conn, reader: reader}
+	if isHTTPPreface(prefix) {
+		a.serveEnrollHTTP(buffered)
+		return
+	}
+	if !hasVerifiedClientCertificate(buffered) {
+		a.log.Warn("rejecting mesh connection without a verified client certificate", "remote", conn.RemoteAddr())
+		_ = conn.Close()
+		return
+	}
+	a.handlePeer(ctx, rt, buffered)
+}
+
+func (a *Agent) serveEnrollHTTP(conn net.Conn) {
+	listener := newSingleConnListener(conn)
+	manager := onboarding.Manager{BaseDir: a.baseDir}
+	server := &http.Server{
+		Handler:           manager.EnrollHTTPHandler(),
+		ReadHeaderTimeout: 5 * time.Second,
+		ConnState: func(_ net.Conn, state http.ConnState) {
+			switch state {
+			case http.StateIdle, http.StateClosed, http.StateHijacked:
+				_ = listener.Close()
+			}
+		},
+	}
+	err := server.Serve(listener)
+	if err != nil && !errors.Is(err, net.ErrClosed) && !errors.Is(err, http.ErrServerClosed) {
+		a.log.Warn("enrollment HTTP connection failed", "remote", conn.RemoteAddr(), "err", err)
+	}
+}
+
 func (a *Agent) handlePeer(ctx context.Context, rt *router, conn net.Conn) {
 	defer conn.Close()
 
-	helloFrame, err := proto.Read(conn)
+	helloFrame, err := readFrameWithTimeout(conn, peerHelloTimeout)
 	if err != nil {
 		a.log.Warn("failed to read hello", "remote", conn.RemoteAddr(), "err", err)
 		return
@@ -181,13 +238,13 @@ func (a *Agent) handlePeer(ctx context.Context, rt *router, conn net.Conn) {
 	}()
 
 	p.log.Info("peer connected", "virtual_ip", hello.VirtualIP, "routes", hello.Routes, "mtu", hello.MTU)
-	ticker := time.NewTicker(30 * time.Second)
+	ticker := time.NewTicker(peerHeartbeatInterval)
 	defer ticker.Stop()
 
 	errCh := make(chan error, 1)
 	go func() {
 		for {
-			frame, err := proto.Read(conn)
+			frame, err := readFrameWithTimeout(conn, peerReadTimeout)
 			if err != nil {
 				errCh <- err
 				return
@@ -204,16 +261,93 @@ func (a *Agent) handlePeer(ctx context.Context, rt *router, conn net.Conn) {
 		case <-ctx.Done():
 			return
 		case err := <-errCh:
-			if err != nil && !errors.Is(err, io.EOF) {
+			if isTimeout(err) {
+				p.log.Warn("peer heartbeat timed out", "timeout", peerReadTimeout)
+			} else if err != nil && !errors.Is(err, io.EOF) {
 				p.log.Warn("peer disconnected", "err", err)
 			} else {
 				p.log.Info("peer disconnected")
 			}
 			return
 		case <-ticker.C:
-			_ = p.write(proto.TypePing, nil)
+			if err := p.write(proto.TypePing, nil); err != nil {
+				p.log.Warn("peer ping failed", "err", err)
+				return
+			}
 		}
 	}
+}
+
+type bufferedConn struct {
+	net.Conn
+	reader *bufio.Reader
+}
+
+func (c *bufferedConn) Read(b []byte) (int, error) {
+	return c.reader.Read(b)
+}
+
+func (c *bufferedConn) ConnectionState() tls.ConnectionState {
+	tlsConn, ok := c.Conn.(*tls.Conn)
+	if !ok {
+		return tls.ConnectionState{}
+	}
+	return tlsConn.ConnectionState()
+}
+
+type singleConnListener struct {
+	conn      net.Conn
+	accepted  bool
+	closeOnce sync.Once
+	closed    chan struct{}
+}
+
+func newSingleConnListener(conn net.Conn) *singleConnListener {
+	return &singleConnListener{conn: conn, closed: make(chan struct{})}
+}
+
+func (l *singleConnListener) Accept() (net.Conn, error) {
+	if !l.accepted {
+		l.accepted = true
+		return l.conn, nil
+	}
+	<-l.closed
+	return nil, net.ErrClosed
+}
+
+func (l *singleConnListener) Close() error {
+	l.closeOnce.Do(func() {
+		close(l.closed)
+		_ = l.conn.Close()
+	})
+	return nil
+}
+
+func (l *singleConnListener) Addr() net.Addr {
+	return l.conn.LocalAddr()
+}
+
+func isHTTPPreface(prefix []byte) bool {
+	if len(prefix) < 4 {
+		return false
+	}
+	switch string(prefix[:4]) {
+	case "GET ", "POST", "HEAD", "PUT ", "PATC", "DELE", "OPTI":
+		return true
+	default:
+		return false
+	}
+}
+
+func hasVerifiedClientCertificate(conn net.Conn) bool {
+	stateProvider, ok := conn.(interface {
+		ConnectionState() tls.ConnectionState
+	})
+	if !ok {
+		return false
+	}
+	state := stateProvider.ConnectionState()
+	return len(state.VerifiedChains) > 0
 }
 
 func (a *Agent) handlePeerFrame(rt *router, p *peer, frame proto.Frame) error {
@@ -259,6 +393,7 @@ func (a *Agent) broadcastRoster(rt *router) {
 	for _, p := range rt.list() {
 		if err := p.write(proto.TypeRoster, payload); err != nil {
 			p.log.Warn("failed to send roster", "err", err)
+			_ = p.conn.Close()
 		}
 	}
 }
@@ -350,6 +485,24 @@ func (p *peer) write(typ byte, payload []byte) error {
 	err := proto.Write(p.conn, typ, payload)
 	_ = p.conn.SetWriteDeadline(time.Time{})
 	return err
+}
+
+func readFrameWithTimeout(conn net.Conn, timeout time.Duration) (proto.Frame, error) {
+	if timeout > 0 {
+		if err := conn.SetReadDeadline(time.Now().Add(timeout)); err != nil {
+			return proto.Frame{}, err
+		}
+	}
+	frame, err := proto.Read(conn)
+	if timeout > 0 {
+		_ = conn.SetReadDeadline(time.Time{})
+	}
+	return frame, err
+}
+
+func isTimeout(err error) bool {
+	var netErr net.Error
+	return errors.As(err, &netErr) && netErr.Timeout()
 }
 
 func mustAddr(s string) netip.Addr {

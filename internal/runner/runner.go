@@ -41,7 +41,10 @@ func Run(ctx context.Context, configPath string, logger *slog.Logger, opts ...Op
 	}
 	resolveConfigPaths(cfg, configPath)
 
-	runner, err := agent.New(cfg, logger, agent.WithStatusPath(StatusPath(configPath, settings.serviceName)))
+	runner, err := agent.New(cfg, logger,
+		agent.WithStatusPath(StatusPath(configPath, settings.serviceName)),
+		agent.WithBaseDir(agent.BaseDirFromConfigPath(configPath)),
+	)
 	if err != nil {
 		return fmt.Errorf("create agent: %w", err)
 	}

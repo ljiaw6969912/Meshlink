@@ -26,7 +26,9 @@ func (a *Agent) runSpoke(ctx context.Context) error {
 		deviceErr <- a.readDevicePackets(ctx, devicePackets)
 	}()
 
+	reconnectDelay := spokeReconnectMinDelay
 	for {
+		started := time.Now()
 		err := a.connectOnce(ctx, tlsCfg, devicePackets)
 		if ctx.Err() != nil {
 			return ctx.Err()
@@ -36,12 +38,17 @@ func (a *Agent) runSpoke(ctx context.Context) error {
 			return devErr
 		default:
 		}
-		a.log.Warn("spoke connection ended, reconnecting soon", "err", err)
+		if time.Since(started) >= spokeStableResetAfter {
+			reconnectDelay = spokeReconnectMinDelay
+		}
+		wait := jitterDelay(reconnectDelay)
+		a.log.Warn("spoke connection ended, reconnecting", "err", err, "delay", wait)
 		select {
 		case <-ctx.Done():
 			return ctx.Err()
-		case <-time.After(3 * time.Second):
+		case <-time.After(wait):
 		}
+		reconnectDelay = nextReconnectDelay(reconnectDelay)
 	}
 }
 
@@ -57,6 +64,29 @@ func (a *Agent) connectOnce(ctx context.Context, tlsCfg *tls.Config, devicePacke
 	if err := conn.HandshakeContext(ctx); err != nil {
 		return err
 	}
+	connCtx, cancelConn := context.WithCancel(ctx)
+	defer cancelConn()
+
+	errCh := make(chan error, 3)
+	sendErr := func(err error) {
+		select {
+		case errCh <- err:
+		case <-connCtx.Done():
+		}
+	}
+
+	var writeMu sync.Mutex
+	write := func(typ byte, payload []byte) error {
+		writeMu.Lock()
+		defer writeMu.Unlock()
+		if err := conn.SetWriteDeadline(time.Now().Add(peerWriteTimeout)); err != nil {
+			return err
+		}
+		err := proto.Write(conn, typ, payload)
+		_ = conn.SetWriteDeadline(time.Time{})
+		return err
+	}
+
 	commonName, fingerprint := certInfoFromState(conn.ConnectionState())
 	peerID := commonName
 	if peerID == "" {
@@ -79,32 +109,19 @@ func (a *Agent) connectOnce(ctx context.Context, tlsCfg *tls.Config, devicePacke
 	if err != nil {
 		return err
 	}
-	if err := proto.Write(conn, proto.TypeHello, hello); err != nil {
-		return err
-	}
-
-	errCh := make(chan error, 2)
-	var writeMu sync.Mutex
-	write := func(typ byte, payload []byte) error {
-		writeMu.Lock()
-		defer writeMu.Unlock()
-		if err := conn.SetWriteDeadline(time.Now().Add(peerWriteTimeout)); err != nil {
-			return err
-		}
-		err := proto.Write(conn, typ, payload)
-		_ = conn.SetWriteDeadline(time.Time{})
+	if err := write(proto.TypeHello, hello); err != nil {
 		return err
 	}
 
 	go func() {
 		for {
 			select {
-			case <-ctx.Done():
-				errCh <- ctx.Err()
+			case <-connCtx.Done():
+				sendErr(connCtx.Err())
 				return
 			case packet := <-devicePackets:
 				if err := write(proto.TypePacket, packet); err != nil {
-					errCh <- err
+					sendErr(err)
 					return
 				}
 			}
@@ -113,34 +130,50 @@ func (a *Agent) connectOnce(ctx context.Context, tlsCfg *tls.Config, devicePacke
 
 	go func() {
 		for {
-			frame, err := proto.Read(conn)
+			frame, err := readFrameWithTimeout(conn, peerReadTimeout)
 			if err != nil {
-				errCh <- err
+				sendErr(err)
 				return
 			}
 			a.status.touchPeer(peerID)
 			switch frame.Type {
 			case proto.TypePacket:
 				if err := a.dev.WritePacket(frame.Payload); err != nil {
-					errCh <- err
+					sendErr(err)
 					return
 				}
 			case proto.TypePing:
 				if err := write(proto.TypePong, nil); err != nil {
-					errCh <- err
+					sendErr(err)
 					return
 				}
 			case proto.TypePong:
 			case proto.TypeRoster:
 				roster, err := proto.ParseRoster(frame.Payload)
 				if err != nil {
-					errCh <- err
+					sendErr(err)
 					return
 				}
 				a.status.applyRoster(roster)
 			default:
-				errCh <- fmt.Errorf("unsupported frame type from hub: %d", frame.Type)
+				sendErr(fmt.Errorf("unsupported frame type from hub: %d", frame.Type))
 				return
+			}
+		}
+	}()
+
+	go func() {
+		ticker := time.NewTicker(peerHeartbeatInterval)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-connCtx.Done():
+				return
+			case <-ticker.C:
+				if err := write(proto.TypePing, nil); err != nil {
+					sendErr(err)
+					return
+				}
 			}
 		}
 	}()
@@ -149,11 +182,42 @@ func (a *Agent) connectOnce(ctx context.Context, tlsCfg *tls.Config, devicePacke
 	case <-ctx.Done():
 		return ctx.Err()
 	case err := <-errCh:
+		cancelConn()
 		if errors.Is(err, io.EOF) || errors.Is(err, context.Canceled) {
 			return err
 		}
 		return err
 	}
+}
+
+func nextReconnectDelay(delay time.Duration) time.Duration {
+	if delay <= 0 {
+		return spokeReconnectMinDelay
+	}
+	next := delay * 2
+	if next > spokeReconnectMaxDelay {
+		return spokeReconnectMaxDelay
+	}
+	return next
+}
+
+func jitterDelay(delay time.Duration) time.Duration {
+	if delay <= 0 {
+		return spokeReconnectMinDelay
+	}
+	window := delay / 5
+	if window <= 0 {
+		return delay
+	}
+	offset := time.Duration(time.Now().UnixNano()%int64(window*2+1)) - window
+	result := delay + offset
+	if result < spokeReconnectMinDelay {
+		return spokeReconnectMinDelay
+	}
+	if result > spokeReconnectMaxDelay {
+		return spokeReconnectMaxDelay
+	}
+	return result
 }
 
 func (a *Agent) readDevicePackets(ctx context.Context, out chan<- []byte) error {

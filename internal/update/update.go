@@ -85,6 +85,9 @@ func Check(ctx context.Context, baseURL, currentVersion string) (CheckResult, er
 	if strings.TrimSpace(manifest.Package.File) == "" {
 		return CheckResult{}, errors.New("manifest package file is empty")
 	}
+	if packageVersion := packageVersionFromFile(manifest.Package.File); packageVersion != "" && CompareVersions(packageVersion, manifest.Version) != 0 {
+		return CheckResult{}, fmt.Errorf("manifest version %q does not match package file version %q (%s)", manifest.Version, packageVersion, manifest.Package.File)
+	}
 	return CheckResult{
 		CurrentVersion:  currentVersion,
 		Manifest:        manifest,
@@ -262,6 +265,20 @@ func validateZip(path string) error {
 		return fmt.Errorf("invalid update package: %w", err)
 	}
 	return r.Close()
+}
+
+func packageVersionFromFile(file string) string {
+	base := filepath.Base(strings.TrimSpace(file))
+	ext := filepath.Ext(base)
+	if !strings.EqualFold(ext, ".zip") {
+		return ""
+	}
+	const prefix = "meshlink-"
+	if !strings.HasPrefix(strings.ToLower(base), prefix) {
+		return ""
+	}
+	version := strings.TrimSuffix(base[len(prefix):], ext)
+	return strings.TrimSpace(version)
 }
 
 func parseVersion(raw string) ([]int, string) {

@@ -1,11 +1,14 @@
 package agent
 
 import (
+	"bufio"
 	"io"
 	"log/slog"
 	"net"
 	"net/netip"
+	"strings"
 	"testing"
+	"time"
 )
 
 func testPeer(t *testing.T, id, ip string) (*peer, func()) {
@@ -49,4 +52,48 @@ func TestRouterReplacePeerIgnoresStaleRemove(t *testing.T) {
 	if got := rt.find(netip.MustParseAddr("10.77.0.2")); got != nil {
 		t.Fatalf("route still points to %v after active removal", got)
 	}
+}
+
+func TestNextReconnectDelayCapsAtMax(t *testing.T) {
+	if got := nextReconnectDelay(0); got != spokeReconnectMinDelay {
+		t.Fatalf("nextReconnectDelay(0) = %s, want %s", got, spokeReconnectMinDelay)
+	}
+	if got := nextReconnectDelay(time.Second); got != 2*time.Second {
+		t.Fatalf("nextReconnectDelay(1s) = %s, want 2s", got)
+	}
+	if got := nextReconnectDelay(spokeReconnectMaxDelay); got != spokeReconnectMaxDelay {
+		t.Fatalf("nextReconnectDelay(max) = %s, want %s", got, spokeReconnectMaxDelay)
+	}
+}
+
+func TestServeEnrollHTTPKeepsSingleConnectionOpenForRequest(t *testing.T) {
+	serverConn, clientConn := net.Pipe()
+	defer clientConn.Close()
+
+	agent := &Agent{
+		baseDir: t.TempDir(),
+		log:     slog.New(slog.NewTextHandler(io.Discard, nil)),
+	}
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		agent.serveEnrollHTTP(serverConn)
+	}()
+
+	time.Sleep(20 * time.Millisecond)
+	if err := clientConn.SetDeadline(time.Now().Add(2 * time.Second)); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := io.WriteString(clientConn, "GET /enroll/health HTTP/1.1\r\nHost: meshlink\r\nConnection: close\r\n\r\n"); err != nil {
+		t.Fatalf("write request: %v", err)
+	}
+
+	status, err := bufio.NewReader(clientConn).ReadString('\n')
+	if err != nil {
+		t.Fatalf("read response status: %v", err)
+	}
+	if !strings.Contains(status, "200 OK") {
+		t.Fatalf("status = %q, want 200 OK", status)
+	}
+	<-done
 }

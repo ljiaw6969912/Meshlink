@@ -1,0 +1,31 @@
+{
+  "nodes": [
+    {
+      "node_id": "DESKTOP-FUQ441S",
+      "virtual_ip": "10.77.0.2",
+      "source_addr": "175.42.58.165:60551",
+      "cert_fingerprint": "SHA256:35:4C:84:25:2B:86:19:2B:FE:54:4C:EA:91:2F:1E:7E:EF:55:98:0C:00:E8:DD:5A:D2:2F:83:58:57:F6:8B:68",
+      "created_at": "2026-07-07T08:37:28.4386144+08:00",
+      "last_seen": "2026-07-07T08:37:28.4386144+08:00",
+      "status": "offline"
+    },
+    {
+      "node_id": "DESKTOP-FUQ441S",
+      "virtual_ip": "10.77.0.3",
+      "source_addr": "175.42.58.165:53896",
+      "cert_fingerprint": "SHA256:DA:BB:61:9A:E2:34:62:15:BC:32:1A:C7:7F:47:39:D3:B1:DA:86:5C:66:85:32:BD:58:3B:53:60:57:5B:B9:82",
+      "created_at": "2026-07-07T08:38:31.6405061+08:00",
+      "last_seen": "2026-07-07T08:38:31.6405061+08:00",
+      "status": "offline"
+    },
+    {
+      "node_id": "DESKTOP-FUQ441S",
+      "virtual_ip": "10.77.0.4",
+      "source_addr": "175.42.58.165:63383",
+      "cert_fingerprint": "SHA256:EC:5A:8C:53:CD:86:4B:77:08:B8:5D:32:5A:4F:18:EF:37:ED:CC:AA:23:BC:13:A6:B7:48:6A:C2:07:2A:BE:96",
+      "created_at": "2026-07-07T11:22:39.6995446+08:00",
+      "last_seen": "2026-07-07T11:22:39.6995446+08:00",
+      "status": "offline"
+    }
+  ]
+}

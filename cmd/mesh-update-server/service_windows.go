@@ -9,6 +9,7 @@ import (
 	"log/slog"
 	"os"
 	"path/filepath"
+	"syscall"
 	"time"
 
 	meshupdate "meshlink/internal/update"
@@ -56,8 +57,21 @@ func installService(name, listen, releaseDir string) error {
 	}
 	defer m.Disconnect()
 	if existing, err := m.OpenService(name); err == nil {
-		existing.Close()
-		return fmt.Errorf("service %q already exists", name)
+		defer existing.Close()
+		cfg, err := existing.Config()
+		if err != nil {
+			return err
+		}
+		cfg.DisplayName = "Meshlink 更新服务"
+		cfg.Description = "Serves Meshlink release packages over the private mesh"
+		cfg.StartType = mgr.StartAutomatic
+		cfg.ServiceStartName = "LocalSystem"
+		cfg.Password = ""
+		cfg.BinaryPathName = updateServiceBinaryPath(exePath, name, listen, releaseDir)
+		if err := existing.UpdateConfig(cfg); err != nil {
+			return err
+		}
+		return configureServiceRecovery(existing)
 	}
 	s, err := m.CreateService(name, exePath, mgr.Config{
 		DisplayName:      "Meshlink 更新服务",
@@ -69,7 +83,14 @@ func installService(name, listen, releaseDir string) error {
 		return err
 	}
 	defer s.Close()
-	return nil
+	return configureServiceRecovery(s)
+}
+
+func updateServiceBinaryPath(exePath, name, listen, releaseDir string) string {
+	return syscall.EscapeArg(exePath) +
+		" -service run -service-name " + syscall.EscapeArg(name) +
+		" -listen " + syscall.EscapeArg(listen) +
+		" -dir " + syscall.EscapeArg(releaseDir)
 }
 
 func deleteService(name string) error {
@@ -89,6 +110,7 @@ func startService(name string) error {
 	}
 	defer m.Disconnect()
 	defer s.Close()
+	_ = configureServiceRecovery(s)
 	return s.Start()
 }
 
@@ -128,6 +150,18 @@ func openService(name string) (*mgr.Mgr, *mgr.Service, error) {
 		return nil, nil, err
 	}
 	return m, s, nil
+}
+
+func configureServiceRecovery(s *mgr.Service) error {
+	actions := []mgr.RecoveryAction{
+		{Type: mgr.ServiceRestart, Delay: 5 * time.Second},
+		{Type: mgr.ServiceRestart, Delay: 30 * time.Second},
+		{Type: mgr.ServiceRestart, Delay: 60 * time.Second},
+	}
+	if err := s.SetRecoveryActions(actions, 24*60*60); err != nil {
+		return err
+	}
+	return s.SetRecoveryActionsOnNonCrashFailures(true)
 }
 
 type updateServiceHandler struct {

@@ -32,8 +32,38 @@ type IssueOptions struct {
 	Days      int
 }
 
+type CSROptions struct {
+	OutDir   string
+	Name     string
+	DNSNames []string
+	IPAddrs  []string
+}
+
+type IssueCSROptions struct {
+	CSRPEM    []byte
+	OutDir    string
+	Name      string
+	CAPath    string
+	CAKeyPath string
+	Days      int
+}
+
 type Result struct {
 	Files []string `json:"files"`
+}
+
+type CSRResult struct {
+	Files   []string `json:"files"`
+	KeyPath string   `json:"key_path"`
+	CSRPath string   `json:"csr_path"`
+	CSRPEM  []byte   `json:"csr_pem"`
+}
+
+type IssueCSRResult struct {
+	Files         []string `json:"files,omitempty"`
+	CertPath      string   `json:"cert_path,omitempty"`
+	CertPEM       []byte   `json:"cert_pem"`
+	PrivateKeyPEM []byte   `json:"private_key_pem,omitempty"`
 }
 
 func InitCA(opts CAOptions) (Result, error) {
@@ -79,6 +109,64 @@ func InitCA(opts CAOptions) (Result, error) {
 		return Result{}, err
 	}
 	return Result{Files: []string{certPath, keyPath}}, nil
+}
+
+func CreateCSR(opts CSROptions) (CSRResult, error) {
+	if opts.OutDir == "" {
+		opts.OutDir = "certs"
+	}
+	if opts.Name == "" {
+		return CSRResult{}, fmt.Errorf("missing node name")
+	}
+	key, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+	if err != nil {
+		return CSRResult{}, fmt.Errorf("generate key: %w", err)
+	}
+	tpl := &x509.CertificateRequest{
+		Subject: pkix.Name{CommonName: opts.Name},
+	}
+	for _, dns := range opts.DNSNames {
+		dns = strings.TrimSpace(dns)
+		if dns != "" {
+			tpl.DNSNames = append(tpl.DNSNames, dns)
+		}
+	}
+	for _, rawIP := range opts.IPAddrs {
+		rawIP = strings.TrimSpace(rawIP)
+		if rawIP == "" {
+			continue
+		}
+		ip := net.ParseIP(rawIP)
+		if ip == nil {
+			return CSRResult{}, fmt.Errorf("invalid IP SAN: %s", rawIP)
+		}
+		if ip.To4() == nil {
+			return CSRResult{}, fmt.Errorf("IPv6 IP SANs are not supported: %s", rawIP)
+		}
+		tpl.IPAddresses = append(tpl.IPAddresses, ip)
+	}
+	der, err := x509.CreateCertificateRequest(rand.Reader, tpl, key)
+	if err != nil {
+		return CSRResult{}, fmt.Errorf("create csr: %w", err)
+	}
+	if err := os.MkdirAll(opts.OutDir, 0o700); err != nil {
+		return CSRResult{}, err
+	}
+	keyPath := filepath.Join(opts.OutDir, opts.Name+"-key.pem")
+	csrPath := filepath.Join(opts.OutDir, opts.Name+".csr")
+	csrPEM := pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE REQUEST", Bytes: der})
+	if err := writeKey(keyPath, key); err != nil {
+		return CSRResult{}, err
+	}
+	if err := os.WriteFile(csrPath, csrPEM, 0o600); err != nil {
+		return CSRResult{}, err
+	}
+	return CSRResult{
+		Files:   []string{keyPath, csrPath},
+		KeyPath: keyPath,
+		CSRPath: csrPath,
+		CSRPEM:  csrPEM,
+	}, nil
 }
 
 func Issue(opts IssueOptions) (Result, error) {
@@ -156,6 +244,78 @@ func Issue(opts IssueOptions) (Result, error) {
 		return Result{}, err
 	}
 	return Result{Files: []string{certPath, keyPath}}, nil
+}
+
+func IssueCSR(opts IssueCSROptions) (IssueCSRResult, error) {
+	if len(opts.CSRPEM) == 0 {
+		return IssueCSRResult{}, fmt.Errorf("missing csr pem")
+	}
+	if opts.CAPath == "" {
+		opts.CAPath = filepath.Join("certs", "ca.pem")
+	}
+	if opts.CAKeyPath == "" {
+		opts.CAKeyPath = filepath.Join("certs", "ca-key.pem")
+	}
+	if opts.Days == 0 {
+		opts.Days = 825
+	}
+	caCert, err := readCert(opts.CAPath)
+	if err != nil {
+		return IssueCSRResult{}, err
+	}
+	caKey, err := readKey(opts.CAKeyPath)
+	if err != nil {
+		return IssueCSRResult{}, err
+	}
+	block, _ := pem.Decode(opts.CSRPEM)
+	if block == nil || block.Type != "CERTIFICATE REQUEST" {
+		return IssueCSRResult{}, fmt.Errorf("invalid certificate request PEM")
+	}
+	csr, err := x509.ParseCertificateRequest(block.Bytes)
+	if err != nil {
+		return IssueCSRResult{}, err
+	}
+	if err := csr.CheckSignature(); err != nil {
+		return IssueCSRResult{}, fmt.Errorf("invalid csr signature: %w", err)
+	}
+	name := opts.Name
+	if name == "" {
+		name = csr.Subject.CommonName
+	}
+	if name == "" {
+		return IssueCSRResult{}, fmt.Errorf("missing node name")
+	}
+	tpl := &x509.Certificate{
+		SerialNumber: serial(),
+		Subject:      csr.Subject,
+		NotBefore:    time.Now().Add(-time.Minute),
+		NotAfter:     time.Now().AddDate(0, 0, opts.Days),
+		KeyUsage:     x509.KeyUsageDigitalSignature,
+		ExtKeyUsage:  []x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth, x509.ExtKeyUsageClientAuth},
+		DNSNames:     csr.DNSNames,
+		IPAddresses:  csr.IPAddresses,
+	}
+	if opts.Name != "" {
+		tpl.Subject.CommonName = opts.Name
+	}
+	der, err := x509.CreateCertificate(rand.Reader, tpl, caCert, csr.PublicKey, caKey)
+	if err != nil {
+		return IssueCSRResult{}, fmt.Errorf("create cert: %w", err)
+	}
+	certPEM := pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: der})
+	result := IssueCSRResult{CertPEM: certPEM}
+	if opts.OutDir != "" {
+		if err := os.MkdirAll(opts.OutDir, 0o700); err != nil {
+			return IssueCSRResult{}, err
+		}
+		certPath := filepath.Join(opts.OutDir, name+".pem")
+		if err := os.WriteFile(certPath, certPEM, 0o600); err != nil {
+			return IssueCSRResult{}, err
+		}
+		result.CertPath = certPath
+		result.Files = []string{certPath}
+	}
+	return result, nil
 }
 
 func SplitCSV(s string) []string {

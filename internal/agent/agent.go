@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"log/slog"
 	"net/netip"
+	"path/filepath"
 
 	"meshlink/internal/config"
 	"meshlink/internal/device"
@@ -13,23 +14,31 @@ import (
 )
 
 type Agent struct {
-	cfg    *config.Config
-	log    *slog.Logger
-	dev    device.Device
-	hello  proto.Hello
-	routes []netip.Prefix
-	status *statusStore
+	cfg     *config.Config
+	log     *slog.Logger
+	dev     device.Device
+	hello   proto.Hello
+	routes  []netip.Prefix
+	status  *statusStore
+	baseDir string
 }
 
 type Option func(*options)
 
 type options struct {
 	statusPath string
+	baseDir    string
 }
 
 func WithStatusPath(path string) Option {
 	return func(opts *options) {
 		opts.statusPath = path
+	}
+}
+
+func WithBaseDir(path string) Option {
+	return func(opts *options) {
+		opts.baseDir = path
 	}
 }
 
@@ -66,13 +75,22 @@ func New(cfg *config.Config, logger *slog.Logger, opts ...Option) (*Agent, error
 	}
 
 	return &Agent{
-		cfg:    cfg,
-		log:    logger.With("node", cfg.NodeID, "mode", cfg.Mode),
-		dev:    dev,
-		hello:  hello,
-		routes: routes,
-		status: newStatusStore(settings.statusPath, nodeStatusFromConfig(cfg, cfg.CertFile)),
+		cfg:     cfg,
+		log:     logger.With("node", cfg.NodeID, "mode", cfg.Mode),
+		dev:     dev,
+		hello:   hello,
+		routes:  routes,
+		status:  newStatusStore(settings.statusPath, nodeStatusFromConfig(cfg, cfg.CertFile)),
+		baseDir: settings.baseDir,
 	}, nil
+}
+
+func BaseDirFromConfigPath(configPath string) string {
+	configDir := filepath.Dir(configPath)
+	if filepath.Base(configDir) == "configs" {
+		return filepath.Dir(configDir)
+	}
+	return configDir
 }
 
 func (a *Agent) Run(ctx context.Context) error {

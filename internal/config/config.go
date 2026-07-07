@@ -10,19 +10,27 @@ import (
 )
 
 type Config struct {
-	NodeID     string       `json:"node_id"`
-	Mode       string       `json:"mode"`
-	Listen     string       `json:"listen,omitempty"`
-	Connect    string       `json:"connect,omitempty"`
-	ServerName string       `json:"server_name,omitempty"`
-	CAFile     string       `json:"ca_file"`
-	CertFile   string       `json:"cert_file"`
-	KeyFile    string       `json:"key_file"`
-	VirtualIP  string       `json:"virtual_ip"`
-	Routes     []Route      `json:"routes,omitempty"`
-	MTU        int          `json:"mtu,omitempty"`
-	Device     DeviceConfig `json:"device"`
-	Setup      SetupConfig  `json:"setup,omitempty"`
+	NodeID     string          `json:"node_id"`
+	Mode       string          `json:"mode"`
+	Transport  TransportConfig `json:"transport,omitempty"`
+	Listen     string          `json:"listen,omitempty"`
+	Connect    string          `json:"connect,omitempty"`
+	ServerName string          `json:"server_name,omitempty"`
+	CAFile     string          `json:"ca_file"`
+	CertFile   string          `json:"cert_file"`
+	KeyFile    string          `json:"key_file"`
+	VirtualIP  string          `json:"virtual_ip"`
+	Routes     []Route         `json:"routes,omitempty"`
+	MTU        int             `json:"mtu,omitempty"`
+	Device     DeviceConfig    `json:"device"`
+	Setup      SetupConfig     `json:"setup,omitempty"`
+}
+
+type TransportConfig struct {
+	Protocol   string `json:"protocol,omitempty"`
+	Listen     string `json:"listen,omitempty"`
+	Connect    string `json:"connect,omitempty"`
+	ServerName string `json:"server_name,omitempty"`
 }
 
 type Route struct {
@@ -66,6 +74,9 @@ func Load(path string) (*Config, error) {
 func (c *Config) Validate() error {
 	if c.NodeID == "" {
 		return errors.New("node_id is required")
+	}
+	if err := c.normalizeTransport(); err != nil {
+		return err
 	}
 	switch c.Mode {
 	case "hub":
@@ -131,6 +142,44 @@ func (c *Config) Validate() error {
 		}
 	} else if c.Setup.NAT.Enabled {
 		return errors.New("setup.enabled must be true when setup.nat.enabled is true")
+	}
+	return nil
+}
+
+func (c *Config) normalizeTransport() error {
+	if c.Transport.Protocol == "" {
+		c.Transport.Protocol = "tcp_tls_v1"
+	}
+	if c.Transport.Protocol != "tcp_tls_v1" {
+		return fmt.Errorf("unsupported transport protocol %q", c.Transport.Protocol)
+	}
+	if c.Transport.ServerName != "" {
+		if c.ServerName != "" && c.ServerName != c.Transport.ServerName {
+			return fmt.Errorf("server_name %q conflicts with transport.server_name %q", c.ServerName, c.Transport.ServerName)
+		}
+		c.ServerName = c.Transport.ServerName
+	} else if c.ServerName != "" {
+		c.Transport.ServerName = c.ServerName
+	}
+	switch c.Mode {
+	case "hub":
+		if c.Transport.Listen != "" {
+			if c.Listen != "" && c.Listen != c.Transport.Listen {
+				return fmt.Errorf("listen %q conflicts with transport.listen %q", c.Listen, c.Transport.Listen)
+			}
+			c.Listen = c.Transport.Listen
+		} else if c.Listen != "" {
+			c.Transport.Listen = c.Listen
+		}
+	case "spoke":
+		if c.Transport.Connect != "" {
+			if c.Connect != "" && c.Connect != c.Transport.Connect {
+				return fmt.Errorf("connect %q conflicts with transport.connect %q", c.Connect, c.Transport.Connect)
+			}
+			c.Connect = c.Transport.Connect
+		} else if c.Connect != "" {
+			c.Transport.Connect = c.Connect
+		}
 	}
 	return nil
 }

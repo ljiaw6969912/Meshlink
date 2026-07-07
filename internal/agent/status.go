@@ -234,11 +234,13 @@ func nodeStatusFromConfig(cfg *config.Config, certFile string) NodeStatus {
 }
 
 func certInfoFromTLS(conn net.Conn) (string, string) {
-	tlsConn, ok := conn.(*tls.Conn)
+	stateProvider, ok := conn.(interface {
+		ConnectionState() tls.ConnectionState
+	})
 	if !ok {
 		return "", ""
 	}
-	state := tlsConn.ConnectionState()
+	state := stateProvider.ConnectionState()
 	if len(state.PeerCertificates) == 0 {
 		return "", ""
 	}

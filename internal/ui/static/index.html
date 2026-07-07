@@ -3,119 +3,108 @@
   <head>
     <meta charset="utf-8">
     <meta name="viewport" content="width=device-width, initial-scale=1">
-    <title>Meshlink 控制台</title>
+    <title>Meshlink</title>
     <link rel="stylesheet" href="/style.css">
   </head>
   <body>
     <header class="topbar">
       <div>
-        <h1>Meshlink 控制台</h1>
-        <p id="cwd">正在读取工作目录...</p>
+        <h1>Meshlink</h1>
+        <p>自托管远程桌面组网</p>
       </div>
-      <button id="refreshStatus" type="button">刷新</button>
+      <div class="top-actions">
+        <span id="serviceState" class="status">未知</span>
+        <button id="refreshStatus" type="button">刷新</button>
+      </div>
     </header>
 
-    <main class="layout">
-      <section class="panel service-panel">
-        <div class="panel-title">
-          <h2>系统服务</h2>
-          <span id="serviceState" class="status">未知</span>
+    <main class="shell">
+      <nav class="modebar" aria-label="模式切换">
+        <button class="mode active" data-view="serverView" type="button">服务器模式</button>
+        <button class="mode" data-view="clientView" type="button">客户端模式</button>
+      </nav>
+
+      <section id="serverView" class="view active">
+        <div class="section-head">
+          <h2>服务器模式</h2>
+          <span id="serverStatus" class="muted">未启动</span>
         </div>
-        <label>
-          服务名
-          <input id="serviceName" value="MeshlinkAgent" autocomplete="off">
-        </label>
-        <label>
-          配置文件路径
-          <input id="configPath" autocomplete="off">
-        </label>
+        <div class="form-grid">
+          <label>
+            域名或公网地址
+            <input id="serverAddress" placeholder="example.com 或 203.0.113.10" autocomplete="off">
+          </label>
+          <label>
+            监听端口
+            <input id="listenPort" value="8443" inputmode="numeric">
+          </label>
+        </div>
         <div class="actions">
-          <button data-action="install" type="button">安装</button>
-          <button data-action="start" type="button">启动</button>
-          <button data-action="stop" type="button">停止</button>
-          <button data-action="uninstall" type="button">卸载</button>
-        </div>
-      </section>
-
-      <section class="panel cert-panel">
-        <div class="panel-title">
-          <h2>证书</h2>
-        </div>
-        <div class="grid two">
-          <label>
-            输出目录
-            <input id="certOut" value="certs" autocomplete="off">
-          </label>
-          <label>
-            CA 名称
-            <input id="caName" value="my-mesh" autocomplete="off">
+          <button id="startServer" type="button">启动服务器</button>
+          <button id="stopServer" type="button" class="secondary">停止服务器</button>
+          <button id="regenerateInvite" type="button" class="secondary">重新生成接入码</button>
+          <label class="check-label">
+            <input id="longLivedCode" type="checkbox">
+            长期接入码
           </label>
         </div>
-        <button id="initCA" type="button">创建 CA</button>
-
-        <div class="divider"></div>
-
-        <div class="grid two">
+        <div class="access-box">
           <label>
-            节点名
-            <input id="nodeName" value="home-hub" autocomplete="off">
+            接入链接
+            <textarea id="accessLink" readonly placeholder="服务器启动后自动生成"></textarea>
           </label>
-          <label>
-            DNS 备用名
-            <input id="dnsSans" placeholder="home.example.com" autocomplete="off">
-          </label>
-          <label>
-            IP 备用名
-            <input id="ipSans" placeholder="192.0.2.10" autocomplete="off">
-          </label>
-          <label>
-            有效天数
-            <input id="certDays" value="825" inputmode="numeric">
-          </label>
-        </div>
-        <button id="issueCert" type="button">签发节点证书</button>
-      </section>
-
-      <section class="panel config-panel">
-        <div class="panel-title">
-          <h2>配置</h2>
-          <div class="actions compact">
-            <button id="loadConfig" type="button">读取</button>
-            <button id="saveConfig" type="button">保存</button>
+          <div class="code-row">
+            <div>
+              <span>接入码</span>
+              <strong id="accessCode">------</strong>
+            </div>
+            <span id="inviteExpiry" class="muted">默认 10 分钟有效，使用一次失效</span>
+          </div>
+          <div class="actions">
+            <button id="copyInviteLink" type="button">复制链接</button>
+            <button id="copyInviteCode" type="button" class="secondary">复制接入码</button>
           </div>
         </div>
-        <textarea id="configEditor" spellcheck="false"></textarea>
       </section>
 
-      <section class="panel log-panel">
-        <div class="panel-title">
-          <h2>日志</h2>
-          <button id="loadLogs" type="button">读取日志</button>
-        </div>
-        <pre id="logs"></pre>
-      </section>
-
-      <section class="panel rdp-panel">
-        <div class="panel-title">
-          <h2>远程桌面</h2>
+      <section id="clientView" class="view">
+        <div class="section-head">
+          <h2>客户端模式</h2>
+          <span id="clientStatus" class="muted">未加入</span>
         </div>
         <label>
-          目标地址
-          <input id="rdpTarget" value="192.168.1.50" autocomplete="off">
+          接入链接
+          <input id="inviteLink" placeholder="meshlink://join?server=example.com:8443&token=..." autocomplete="off">
         </label>
+        <label>
+          接入码
+          <input id="inviteCode" inputmode="numeric" maxlength="6" autocomplete="one-time-code">
+        </label>
+        <details class="manual-server">
+          <summary>手动填写服务器地址</summary>
+          <label>
+            服务器地址
+            <input id="manualServerAddress" placeholder="example.com:8443" autocomplete="off">
+          </label>
+        </details>
         <div class="actions">
-          <button id="checkRdp" type="button">检查 RDP</button>
-          <button id="openRdp" type="button">打开远程桌面</button>
+          <button id="joinNetwork" type="button">加入网络</button>
+          <button id="exitNetwork" type="button" class="secondary">退出网络</button>
         </div>
       </section>
 
-      <section class="panel diagnostics-panel">
-        <div class="panel-title">
-          <h2>诊断</h2>
-          <button id="runDiagnostics" type="button">开始诊断</button>
+      <section id="devicesView" class="node-panel">
+        <div class="section-head">
+          <h2>组网机群节点列表</h2>
+          <button id="refreshDevices" type="button" class="secondary">刷新列表</button>
         </div>
-        <div id="diagnostics" class="checks"></div>
+        <div id="deviceList" class="device-list"></div>
+        <div id="deviceDetail" class="device-detail">点击节点后，这里会显示远程桌面目标和连接信息。</div>
       </section>
+
+      <input id="serviceName" type="hidden" value="MeshlinkAgent">
+      <input id="configPath" type="hidden">
+      <input id="rdpTarget" type="hidden" value="10.77.0.2">
     </main>
 
     <div id="toast" role="status" aria-live="polite"></div>

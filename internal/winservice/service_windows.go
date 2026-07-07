@@ -8,8 +8,11 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
+	"syscall"
 	"time"
 
+	"golang.org/x/sys/windows"
 	"golang.org/x/sys/windows/svc"
 	"golang.org/x/sys/windows/svc/mgr"
 
@@ -19,8 +22,9 @@ import (
 const DefaultName = "MeshlinkAgent"
 
 type ServiceStatus struct {
-	Installed bool   `json:"installed"`
-	State     string `json:"state,omitempty"`
+	Installed  bool   `json:"installed"`
+	State      string `json:"state,omitempty"`
+	ConfigPath string `json:"config_path,omitempty"`
 }
 
 func Install(name, configPath string) error {
@@ -50,8 +54,21 @@ func Install(name, configPath string) error {
 	defer m.Disconnect()
 
 	if existing, err := m.OpenService(name); err == nil {
-		existing.Close()
-		return fmt.Errorf("service %q already exists", name)
+		defer existing.Close()
+		cfg, err := existing.Config()
+		if err != nil {
+			return err
+		}
+		cfg.DisplayName = "Meshlink Agent"
+		cfg.Description = "Self-hosted TCP/TLS mesh access agent"
+		cfg.StartType = mgr.StartAutomatic
+		cfg.ServiceStartName = "LocalSystem"
+		cfg.Password = ""
+		cfg.BinaryPathName = serviceBinaryPath(exePath, name, configPath)
+		if err := existing.UpdateConfig(cfg); err != nil {
+			return err
+		}
+		return configureRecovery(existing)
 	}
 
 	s, err := m.CreateService(name, exePath, mgr.Config{
@@ -64,7 +81,13 @@ func Install(name, configPath string) error {
 		return err
 	}
 	defer s.Close()
-	return nil
+	return configureRecovery(s)
+}
+
+func serviceBinaryPath(exePath, name, configPath string) string {
+	return syscall.EscapeArg(exePath) +
+		" -service run -service-name " + syscall.EscapeArg(name) +
+		" -config " + syscall.EscapeArg(configPath)
 }
 
 func Uninstall(name string) error {
@@ -90,6 +113,7 @@ func Start(name string) error {
 	}
 	defer m.Disconnect()
 	defer s.Close()
+	_ = configureRecovery(s)
 	return s.Start()
 }
 
@@ -135,7 +159,8 @@ func Status(name string) (ServiceStatus, error) {
 	if err != nil {
 		return ServiceStatus{}, err
 	}
-	return ServiceStatus{Installed: true, State: stateName(status.State)}, nil
+	cfg, _ := s.Config()
+	return ServiceStatus{Installed: true, State: stateName(status.State), ConfigPath: configPathFromBinaryPath(cfg.BinaryPathName)}, nil
 }
 
 func Run(name, configPath string) error {
@@ -217,6 +242,31 @@ func open(name string) (*mgr.Mgr, *mgr.Service, error) {
 		return nil, nil, err
 	}
 	return m, s, nil
+}
+
+func configureRecovery(s *mgr.Service) error {
+	actions := []mgr.RecoveryAction{
+		{Type: mgr.ServiceRestart, Delay: 5 * time.Second},
+		{Type: mgr.ServiceRestart, Delay: 30 * time.Second},
+		{Type: mgr.ServiceRestart, Delay: 60 * time.Second},
+	}
+	if err := s.SetRecoveryActions(actions, 24*60*60); err != nil {
+		return err
+	}
+	return s.SetRecoveryActionsOnNonCrashFailures(true)
+}
+
+func configPathFromBinaryPath(binaryPath string) string {
+	args, err := windows.DecomposeCommandLine(binaryPath)
+	if err != nil {
+		return ""
+	}
+	for i := 0; i < len(args)-1; i++ {
+		if strings.EqualFold(args[i], "-config") {
+			return strings.TrimSpace(args[i+1])
+		}
+	}
+	return ""
 }
 
 func stateName(state svc.State) string {

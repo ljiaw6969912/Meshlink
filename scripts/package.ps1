@@ -70,6 +70,10 @@ $repairScript = Join-Path $root "repair-meshlink-admin.ps1"
 if (Test-Path $repairScript) {
   Copy-Item -LiteralPath $repairScript -Destination (Join-Path $packageDir "repair-meshlink-admin.ps1")
 }
+$publishUpdateScript = Join-Path $root "publish-update.bat"
+if (Test-Path $publishUpdateScript) {
+  Copy-Item -LiteralPath $publishUpdateScript -Destination (Join-Path $packageDir "publish-update.bat")
+}
 
 Compress-Archive -LiteralPath $packageDir -DestinationPath $zipPath
 Compress-Archive -LiteralPath $packageDir -DestinationPath $releaseZipPath

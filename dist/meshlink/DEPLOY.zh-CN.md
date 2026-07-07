@@ -111,13 +111,32 @@ release\meshlink-版本号.zip
 .\bin\mesh-update-server.exe -service start -service-name MeshlinkUpdateServer
 ```
 
-客户端打开桌面控制台，在“软件更新”中填写默认地址：
+客户端打开桌面控制台，在菜单栏选择“帮助 -> 关于 / 检查更新”，填写默认地址：
 
 ```text
-http://10.77.0.1:1263
+更新地址：10.77.0.1
+更新端口：1263
 ```
 
 点击“检查更新”，确认后点击“立即更新”。更新只替换程序文件和示例配置，不覆盖真实配置、证书和日志。
+
+版本迭代建议：
+
+推荐使用封装脚本，避免 `manifest.json` 版本和 zip 包版本不一致：
+
+```bat
+publish-update.bat 0.1.2 10.77.0.1:1263 C:\path\to\meshlink\release
+```
+
+参数依次是发布版本、更新服务监听地址、release 目录；后两个参数不填时默认使用 `10.77.0.1:1263` 和当前目录下的 `release`。
+
+手动流程：
+
+1. 每次发布先修改根目录 `VERSION`，例如 `0.1.2`。
+2. 执行 `powershell -ExecutionPolicy Bypass -File .\scripts\build.ps1 -Package`。
+3. 将生成的 `release\manifest.json` 和 `release\meshlink-版本号.zip` 同步到 hub 的 release 目录。
+4. 更新服务安装命令可以重复执行；如果服务已经存在，会更新启动参数中的监听地址和 release 目录。
+5. 客户端通过关于窗口检查更新，按 manifest 中的版本号决定是否下载。客户端会拒绝 `manifest.json` 版本和 zip 包文件名版本不一致的发布。
 
 ## 6. 验证链路
 

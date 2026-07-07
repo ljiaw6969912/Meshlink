@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"io"
 	"net"
+	"net/url"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -24,6 +25,7 @@ import (
 	"meshlink/internal/certutil"
 	"meshlink/internal/config"
 	"meshlink/internal/diagnose"
+	"meshlink/internal/onboarding"
 	"meshlink/internal/rdp"
 	"meshlink/internal/runner"
 	meshupdate "meshlink/internal/update"
@@ -34,28 +36,41 @@ import (
 type desktopApp struct {
 	mw *walk.MainWindow
 
-	serviceName *walk.LineEdit
-	configPath  *walk.LineEdit
-	certOut     *walk.LineEdit
-	caName      *walk.LineEdit
-	nodeName    *walk.LineEdit
-	dnsSANs     *walk.LineEdit
-	ipSANs      *walk.LineEdit
-	certDays    *walk.LineEdit
-	rdpTarget   *walk.LineEdit
-	updateURL   *walk.LineEdit
+	serviceName   *walk.LineEdit
+	configPath    *walk.LineEdit
+	networkName   *walk.LineEdit
+	hubNodeName   *walk.LineEdit
+	listenPort    *walk.LineEdit
+	inviteServer  *walk.LineEdit
+	inviteLink    *walk.LineEdit
+	inviteCode    *walk.LineEdit
+	longLivedCode *walk.CheckBox
+	spokeNodeName *walk.LineEdit
+	certOut       *walk.LineEdit
+	caName        *walk.LineEdit
+	nodeName      *walk.LineEdit
+	dnsSANs       *walk.LineEdit
+	ipSANs        *walk.LineEdit
+	certDays      *walk.LineEdit
+	rdpTarget     *walk.LineEdit
+	updateURL     *walk.LineEdit
+	updateHost    *walk.LineEdit
+	updatePort    *walk.LineEdit
 
-	serviceState *walk.Label
-	quickState   *walk.Label
-	updateState  *walk.Label
-	configEdit   *walk.TextEdit
-	meshList     *walk.ListBox
-	meshDetail   *walk.TextEdit
-	meshSummary  *walk.Label
-	meshModel    *meshNodeModel
-	meshSelected string
-	latestUpdate *meshupdate.Manifest
-	output       *walk.TextEdit
+	serviceState    *walk.Label
+	onboardingState *walk.Label
+	quickState      *walk.Label
+	updateState     *walk.Label
+	configEdit      *walk.TextEdit
+	updateOutput    *walk.TextEdit
+	inviteOutput    *walk.TextEdit
+	meshList        *walk.ListBox
+	meshDetail      *walk.TextEdit
+	meshSummary     *walk.Label
+	meshModel       *meshNodeModel
+	meshSelected    string
+	latestUpdate    *meshupdate.Manifest
+	output          *walk.TextEdit
 }
 
 type desktopSettings struct {
@@ -208,33 +223,35 @@ func main() {
 }
 
 func (a *desktopApp) run() error {
-	baseDir := appBaseDir()
-	defaultConfig := rememberedConfigPath(baseDir)
-	defaultCertOut := filepath.Join(baseDir, "certs")
-	defaultUpdateURL := rememberedUpdateURL(baseDir)
-
 	bg := SolidColorBrush{Color: walk.RGB(246, 248, 251)}
 	header := SolidColorBrush{Color: walk.RGB(20, 33, 48)}
 	panel := SolidColorBrush{Color: walk.RGB(255, 255, 255)}
 	ink := walk.RGB(24, 36, 52)
 	muted := walk.RGB(101, 113, 128)
 	accent := walk.RGB(9, 105, 98)
-	danger := walk.RGB(160, 45, 33)
 	mono := Font{Family: "Consolas", PointSize: 10}
 	a.meshModel = &meshNodeModel{}
 	meshStyler := &meshListStyler{list: &a.meshList, model: a.meshModel}
 
 	window := MainWindow{
 		AssignTo:   &a.mw,
-		Title:      "Meshlink 桌面控制台",
-		MinSize:    Size{1040, 720},
-		Size:       Size{1180, 780},
+		Title:      "Meshlink 远程桌面组网",
+		MinSize:    Size{960, 620},
+		Size:       Size{1060, 690},
 		Layout:     VBox{MarginsZero: true, SpacingZero: true},
 		Background: bg,
+		MenuItems: []MenuItem{
+			Menu{
+				Text: "帮助",
+				Items: []MenuItem{
+					Action{Text: "关于 / 检查更新", OnTriggered: a.showAboutDialog},
+				},
+			},
+		},
 		Children: []Widget{
 			Composite{
 				Background: header,
-				Layout:     HBox{Margins: Margins{Left: 22, Top: 18, Right: 22, Bottom: 18}, Spacing: 18},
+				Layout:     HBox{Margins: Margins{Left: 18, Top: 14, Right: 18, Bottom: 14}, Spacing: 14},
 				Children: []Widget{
 					Composite{
 						Layout:        VBox{MarginsZero: true, Spacing: 3},
@@ -242,19 +259,19 @@ func (a *desktopApp) run() error {
 						Background:    header,
 						Children: []Widget{
 							Label{
-								Text:      "Meshlink 桌面控制台",
+								Text:      "Meshlink 远程桌面组网",
 								TextColor: walk.RGB(255, 255, 255),
-								Font:      Font{Family: "Microsoft YaHei UI", PointSize: 18, Bold: true},
+								Font:      Font{Family: "Microsoft YaHei UI", PointSize: 16, Bold: true},
 							},
 							Label{
-								Text:      "自托管 TCP/TLS 异地组网 · 证书 · 服务 · 诊断 · 远程桌面",
+								Text:      "服务器模式 · 客户端模式 · 组网机群节点列表",
 								TextColor: walk.RGB(198, 210, 222),
 							},
 						},
 					},
 					Label{
 						AssignTo:      &a.quickState,
-						Text:          "未诊断",
+						Text:          "就绪",
 						TextColor:     walk.RGB(255, 255, 255),
 						MinSize:       Size{130, 28},
 						TextAlignment: AlignCenter,
@@ -267,101 +284,49 @@ func (a *desktopApp) run() error {
 				StretchFactor: 1,
 				Children: []Widget{
 					Composite{
-						MinSize:    Size{380, 0},
-						MaxSize:    Size{470, 0},
+						MinSize:    Size{340, 0},
+						MaxSize:    Size{410, 0},
 						Background: bg,
-						Layout:     VBox{Margins: Margins{Left: 16, Top: 16, Right: 10, Bottom: 16}, Spacing: 12},
+						Layout:     VBox{Margins: Margins{Left: 12, Top: 12, Right: 8, Bottom: 12}, Spacing: 8},
 						Children: []Widget{
 							GroupBox{
-								Title:      "系统服务",
+								Title:      "服务器模式",
 								Background: panel,
-								Layout:     Grid{Columns: 3, Margins: Margins{Left: 12, Top: 18, Right: 12, Bottom: 12}, Spacing: 8},
+								Layout:     Grid{Columns: 4, Margins: Margins{Left: 10, Top: 15, Right: 10, Bottom: 10}, Spacing: 6},
 								Children: []Widget{
-									Label{Text: "服务名", TextColor: muted},
-									LineEdit{AssignTo: &a.serviceName, Text: "MeshlinkAgent", ColumnSpan: 2},
-									Label{Text: "配置文件", TextColor: muted},
-									LineEdit{AssignTo: &a.configPath, Text: defaultConfig},
-									PushButton{Text: "选择文件", OnClicked: a.chooseConfigFile},
-									PushButton{Text: "读取配置", OnClicked: a.loadConfig},
-									PushButton{Text: "保存配置", OnClicked: a.saveConfig},
-									PushButton{Text: "服务状态", OnClicked: a.serviceStatus},
-									PushButton{Text: "安装服务", OnClicked: func() { a.serviceAction("install") }},
-									PushButton{Text: "启动服务", OnClicked: func() { a.serviceAction("start") }},
-									PushButton{Text: "停止服务", OnClicked: func() { a.serviceAction("stop") }},
-									PushButton{Text: "卸载服务", OnClicked: func() { a.serviceAction("uninstall") }},
-									Label{AssignTo: &a.serviceState, Text: "服务状态：未读取", TextColor: muted, ColumnSpan: 2},
+									Label{Text: "域名或公网地址", TextColor: muted},
+									LineEdit{AssignTo: &a.inviteServer, CueBanner: "example.com:8443", ColumnSpan: 3},
+									Label{Text: "监听端口", TextColor: muted},
+									LineEdit{AssignTo: &a.listenPort, Text: "8443", ColumnSpan: 3},
+									PushButton{Text: "启动服务器", OnClicked: a.createHubOnboarding, ColumnSpan: 2},
+									PushButton{Text: "停止服务器", OnClicked: func() { a.serviceAction("stop") }, ColumnSpan: 2},
+									PushButton{Text: "重新生成接入码", OnClicked: a.createInviteOnboarding, ColumnSpan: 2},
+									CheckBox{AssignTo: &a.longLivedCode, Text: "长期接入码", ColumnSpan: 2},
+									TextEdit{AssignTo: &a.inviteOutput, ReadOnly: true, MinSize: Size{0, 76}, MaxSize: Size{10000, 96}, ColumnSpan: 4},
+									Label{AssignTo: &a.onboardingState, Text: "状态：服务器未启动", TextColor: muted, ColumnSpan: 4},
 								},
 							},
 							GroupBox{
-								Title:      "证书",
+								Title:      "客户端模式",
 								Background: panel,
-								Layout:     Grid{Columns: 4, Margins: Margins{Left: 12, Top: 18, Right: 12, Bottom: 12}, Spacing: 8},
+								Layout:     Grid{Columns: 4, Margins: Margins{Left: 10, Top: 15, Right: 10, Bottom: 10}, Spacing: 6},
 								Children: []Widget{
-									Label{Text: "输出目录", TextColor: muted},
-									LineEdit{AssignTo: &a.certOut, Text: defaultCertOut, ColumnSpan: 3},
-									Label{Text: "CA 名称", TextColor: muted},
-									LineEdit{AssignTo: &a.caName, Text: "my-mesh", ColumnSpan: 3},
-									PushButton{Text: "创建 CA", OnClicked: a.createCA, ColumnSpan: 4},
-									Label{Text: "节点名", TextColor: muted},
-									LineEdit{AssignTo: &a.nodeName, Text: "home-hub", ColumnSpan: 3},
-									Label{Text: "DNS", TextColor: muted},
-									LineEdit{AssignTo: &a.dnsSANs, CueBanner: "home.example.com", ColumnSpan: 3},
-									Label{Text: "IP", TextColor: muted},
-									LineEdit{AssignTo: &a.ipSANs, CueBanner: "192.0.2.10", ColumnSpan: 3},
-									Label{Text: "天数", TextColor: muted},
-									LineEdit{AssignTo: &a.certDays, Text: "825", ColumnSpan: 3},
-									PushButton{Text: "签发节点证书", OnClicked: a.issueCert, ColumnSpan: 4},
-								},
-							},
-							GroupBox{
-								Title:      "远程桌面",
-								Background: panel,
-								Layout:     Grid{Columns: 3, Margins: Margins{Left: 12, Top: 18, Right: 12, Bottom: 12}, Spacing: 8},
-								Children: []Widget{
-									Label{Text: "目标地址", TextColor: muted},
-									LineEdit{AssignTo: &a.rdpTarget, Text: "192.168.1.50", ColumnSpan: 2},
-									PushButton{Text: "检查 RDP", OnClicked: a.checkRDP},
-									PushButton{Text: "打开远程桌面", OnClicked: a.openRDP, ColumnSpan: 2},
-								},
-							},
-							GroupBox{
-								Title:      "软件更新",
-								Background: panel,
-								Layout:     Grid{Columns: 3, Margins: Margins{Left: 12, Top: 18, Right: 12, Bottom: 12}, Spacing: 8},
-								Children: []Widget{
-									Label{Text: "更新地址", TextColor: muted},
-									LineEdit{AssignTo: &a.updateURL, Text: defaultUpdateURL, ColumnSpan: 2},
-									Label{Text: "当前版本", TextColor: muted},
-									Label{Text: version.Display(), TextColor: ink, ColumnSpan: 2},
-									PushButton{Text: "检查更新", OnClicked: a.checkUpdate},
-									PushButton{Text: "立即更新", OnClicked: a.applyUpdate, ColumnSpan: 2},
-									Label{AssignTo: &a.updateState, Text: "更新状态：未检查", TextColor: muted, ColumnSpan: 3},
-								},
-							},
-							Composite{
-								Background: bg,
-								Layout:     HBox{MarginsZero: true, Spacing: 8},
-								Children: []Widget{
-									PushButton{Text: "开始诊断", OnClicked: a.runDiagnostics, StretchFactor: 1},
-									PushButton{Text: "读取日志", OnClicked: a.loadLogs, StretchFactor: 1},
+									Label{Text: "邀请链接", TextColor: muted},
+									LineEdit{AssignTo: &a.inviteLink, CueBanner: "meshlink://join?...", ColumnSpan: 3},
+									Label{Text: "验证码", TextColor: muted},
+									LineEdit{AssignTo: &a.inviteCode, ColumnSpan: 3},
+									PushButton{Text: "加入网络", OnClicked: a.joinOnboarding, ColumnSpan: 2},
+									PushButton{Text: "退出网络", OnClicked: func() { a.serviceAction("stop") }, ColumnSpan: 2},
 								},
 							},
 						},
 					},
 					TabWidget{
 						StretchFactor:  1,
-						ContentMargins: Margins{Left: 14, Top: 14, Right: 14, Bottom: 14},
+						ContentMargins: Margins{Left: 10, Top: 10, Right: 10, Bottom: 10},
 						Pages: []TabPage{
 							{
-								Title:  "配置编辑",
-								Layout: VBox{MarginsZero: true, Spacing: 10},
-								Children: []Widget{
-									Label{Text: "JSON 配置", TextColor: ink, Font: Font{Family: "Microsoft YaHei UI", PointSize: 11, Bold: true}},
-									TextEdit{AssignTo: &a.configEdit, Font: mono, VScroll: true, HScroll: true, StretchFactor: 1},
-								},
-							},
-							{
-								Title:  "组网机群",
+								Title:  "组网机群节点列表",
 								Layout: VBox{MarginsZero: true, Spacing: 10},
 								Children: []Widget{
 									Composite{
@@ -369,6 +334,7 @@ func (a *desktopApp) run() error {
 										Children: []Widget{
 											Label{Text: "节点列表", TextColor: ink, Font: Font{Family: "Microsoft YaHei UI", PointSize: 11, Bold: true}},
 											Label{AssignTo: &a.meshSummary, Text: "等待刷新", TextColor: muted, StretchFactor: 1},
+											PushButton{Text: "打开远程桌面", OnClicked: a.openRDP},
 											PushButton{Text: "刷新列表", OnClicked: a.loadMeshStatus},
 										},
 									},
@@ -398,15 +364,6 @@ func (a *desktopApp) run() error {
 									},
 								},
 							},
-							{
-								Title:  "诊断和日志",
-								Layout: VBox{MarginsZero: true, Spacing: 10},
-								Children: []Widget{
-									Label{Text: "运行结果", TextColor: ink, Font: Font{Family: "Microsoft YaHei UI", PointSize: 11, Bold: true}},
-									TextEdit{AssignTo: &a.output, ReadOnly: true, Font: mono, VScroll: true, HScroll: true, Text: "就绪。", StretchFactor: 1},
-									Label{Text: "提示：真实 Wintun、路由、NAT 和 Windows 服务操作需要管理员权限。", TextColor: danger},
-								},
-							},
 						},
 					},
 				},
@@ -416,7 +373,8 @@ func (a *desktopApp) run() error {
 	if err := window.Create(); err != nil {
 		return err
 	}
-	a.loadConfigSilently()
+	a.restoreSimpleModeState()
+	a.refreshServiceStatusLabels()
 	a.loadMeshStatus()
 	stopRefresh := a.startMeshStatusAutoRefresh()
 	a.mw.Show()
@@ -439,8 +397,15 @@ func appBaseDir() string {
 	return "."
 }
 
+func defaultNodeName(fallback string) string {
+	if host, err := os.Hostname(); err == nil && strings.TrimSpace(host) != "" {
+		return host
+	}
+	return fallback
+}
+
 func defaultConfigPath(baseDir string) string {
-	return filepath.Join(baseDir, "configs", "spoke.example.json")
+	return filepath.Join(baseDir, "configs", "active.json")
 }
 
 func settingsPath(baseDir string) string {
@@ -484,6 +449,39 @@ func rememberedConfigPath(baseDir string) string {
 	return defaultPath
 }
 
+func (a *desktopApp) currentServiceName() string {
+	if a != nil && a.serviceName != nil {
+		if name := strings.TrimSpace(a.serviceName.Text()); name != "" {
+			return name
+		}
+	}
+	return winservice.DefaultName
+}
+
+func (a *desktopApp) currentConfigPath() string {
+	if a != nil && a.configPath != nil {
+		if path := strings.TrimSpace(a.configPath.Text()); path != "" {
+			return path
+		}
+	}
+	return discoverCurrentConfigPath(appBaseDir(), a.currentServiceName())
+}
+
+func (a *desktopApp) setCurrentConfigPath(configPath string) {
+	configPath = strings.TrimSpace(configPath)
+	if configPath == "" {
+		return
+	}
+	absPath, err := filepath.Abs(configPath)
+	if err == nil {
+		configPath = absPath
+	}
+	if a != nil && a.configPath != nil {
+		a.configPath.SetText(configPath)
+	}
+	_ = rememberConfigPath(appBaseDir(), configPath)
+}
+
 func rememberConfigPath(baseDir, configPath string) error {
 	configPath = strings.TrimSpace(configPath)
 	if configPath == "" {
@@ -496,6 +494,26 @@ func rememberConfigPath(baseDir, configPath string) error {
 	settings := loadDesktopSettings(baseDir)
 	settings.LastConfigPath = absPath
 	return saveDesktopSettings(baseDir, settings)
+}
+
+func discoverCurrentConfigPath(baseDir, serviceName string) string {
+	status, err := winservice.Status(serviceName)
+	if err == nil {
+		return configPathFromStatusOrSettings(baseDir, status)
+	}
+	return rememberedConfigPath(baseDir)
+}
+
+func configPathFromStatusOrSettings(baseDir string, status winservice.ServiceStatus) string {
+	if status.Installed {
+		configPath := strings.TrimSpace(status.ConfigPath)
+		if configPath != "" {
+			if info, err := os.Stat(configPath); err == nil && !info.IsDir() {
+				return configPath
+			}
+		}
+	}
+	return rememberedConfigPath(baseDir)
 }
 
 func rememberedUpdateURL(baseDir string) string {
@@ -521,6 +539,52 @@ func rememberUpdateURL(baseDir, updateURL string) error {
 	return saveDesktopSettings(baseDir, settings)
 }
 
+func updateBaseURLFromHostPort(host, port string) (string, error) {
+	host = strings.TrimSpace(host)
+	port = strings.TrimSpace(port)
+	if host == "" {
+		host = meshupdate.DefaultServerURL
+	}
+	if !strings.Contains(host, "://") {
+		host = "http://" + host
+	}
+	u, err := url.Parse(host)
+	if err != nil {
+		return "", err
+	}
+	if u.Host == "" {
+		return "", fmt.Errorf("更新地址为空")
+	}
+	if port != "" {
+		hostname := u.Hostname()
+		if hostname == "" {
+			hostname = u.Host
+		}
+		u.Host = net.JoinHostPort(hostname, port)
+	}
+	return meshupdate.NormalizeBaseURL(u.String())
+}
+
+func splitUpdateBaseURL(raw string) (string, string) {
+	normalized, err := meshupdate.NormalizeBaseURL(raw)
+	if err != nil {
+		normalized = meshupdate.DefaultServerURL
+	}
+	u, err := url.Parse(normalized)
+	if err != nil {
+		return "10.77.0.1", "1263"
+	}
+	host := u.Hostname()
+	if host == "" {
+		host = "10.77.0.1"
+	}
+	port := u.Port()
+	if port == "" {
+		port = "1263"
+	}
+	return host, port
+}
+
 func formatJSON(b []byte) (string, error) {
 	var out bytes.Buffer
 	if err := json.Indent(&out, b, "", "  "); err != nil {
@@ -530,6 +594,9 @@ func formatJSON(b []byte) (string, error) {
 }
 
 func (a *desktopApp) chooseConfigFile() {
+	if a.configPath == nil {
+		return
+	}
 	baseDir := appBaseDir()
 	currentPath := strings.TrimSpace(a.configPath.Text())
 	initialDir := filepath.Join(baseDir, "configs")
@@ -561,14 +628,17 @@ func (a *desktopApp) chooseConfigFile() {
 }
 
 func (a *desktopApp) loadConfig() {
-	path := strings.TrimSpace(a.configPath.Text())
+	path := a.currentConfigPath()
 	if err := a.loadConfigPath(path); err != nil {
 		a.fail("读取配置失败", err)
 	}
 }
 
 func (a *desktopApp) loadConfigSilently() {
-	path := strings.TrimSpace(a.configPath.Text())
+	if a.configEdit == nil {
+		return
+	}
+	path := a.currentConfigPath()
 	if err := a.loadConfigPath(path); err != nil {
 		a.configEdit.SetText("")
 	}
@@ -590,8 +660,10 @@ func (a *desktopApp) loadConfigPath(path string) error {
 	if err != nil {
 		return err
 	}
-	a.configPath.SetText(absPath)
-	a.configEdit.SetText(text)
+	a.setCurrentConfigPath(absPath)
+	if a.configEdit != nil {
+		a.configEdit.SetText(text)
+	}
 	if err := rememberConfigPath(appBaseDir(), absPath); err != nil {
 		return err
 	}
@@ -600,7 +672,11 @@ func (a *desktopApp) loadConfigPath(path string) error {
 }
 
 func (a *desktopApp) saveConfig() {
-	path := strings.TrimSpace(a.configPath.Text())
+	if a.configEdit == nil {
+		a.fail("保存配置失败", fmt.Errorf("普通模式不支持直接编辑配置"))
+		return
+	}
+	path := a.currentConfigPath()
 	if path == "" {
 		a.fail("保存配置失败", fmt.Errorf("配置文件路径为空"))
 		return
@@ -632,7 +708,7 @@ func (a *desktopApp) saveConfig() {
 		a.fail("保存配置失败", err)
 		return
 	}
-	a.configPath.SetText(absPath)
+	a.setCurrentConfigPath(absPath)
 	a.configEdit.SetText(string(pretty))
 	if err := rememberConfigPath(appBaseDir(), absPath); err != nil {
 		a.fail("记住配置文件失败", err)
@@ -641,15 +717,321 @@ func (a *desktopApp) saveConfig() {
 	a.info("配置已保存：\r\n" + absPath)
 }
 
+func (a *desktopApp) onboardingManager() onboarding.Manager {
+	return onboarding.Manager{BaseDir: appBaseDir()}
+}
+
+func (a *desktopApp) createHubOnboarding() {
+	port, err := strconv.Atoi(strings.TrimSpace(a.listenPort.Text()))
+	if err != nil || port <= 0 || port > 65535 {
+		a.fail("启动服务器失败", fmt.Errorf("监听端口无效"))
+		return
+	}
+	result, err := a.onboardingManager().StartServerMode(onboarding.StartServerRequest{
+		ServerAddress: strings.TrimSpace(a.inviteServer.Text()),
+		ListenPort:    port,
+		LongLived:     a.longLivedCode != nil && a.longLivedCode.Checked(),
+	})
+	if err != nil {
+		a.fail("启动服务器失败", err)
+		return
+	}
+	a.setCurrentConfigPath(result.ConfigPath)
+	a.showInvite(result.Invite)
+	if result.Invite.Server != "" {
+		a.inviteServer.SetText(result.Invite.Server)
+	}
+	serviceErr := a.installAndStartAgent(result.ConfigPath)
+	a.loadMeshStatus()
+	if serviceErr != nil {
+		a.onboardingState.SetText("状态：接入码已生成，服务启动失败")
+		a.info("接入信息已生成：\r\n" + formatInviteForDesktop(result.Invite) + "\r\n\r\n服务启动失败：\r\n" + serviceErr.Error())
+		return
+	}
+	a.onboardingState.SetText("状态：服务器运行中")
+	a.serviceStatus()
+	a.info("服务器已启动。\r\n本机地址：" + result.VirtualIP + "\r\n监听地址：" + result.Listen + "\r\n\r\n" + formatInviteForDesktop(result.Invite))
+}
+
+func (a *desktopApp) createInviteOnboarding() {
+	server, err := a.desktopInviteServer()
+	if err != nil {
+		a.fail("重新生成接入码失败", err)
+		return
+	}
+	invite, err := a.onboardingManager().CreateInvite(onboarding.CreateInviteRequest{
+		Server:          server,
+		Protocol:        "tcp_tls_v1",
+		LongLived:       a.longLivedCode != nil && a.longLivedCode.Checked(),
+		ReplaceExisting: true,
+	})
+	if err != nil {
+		a.fail("重新生成接入码失败", err)
+		return
+	}
+	a.showInvite(invite)
+	serviceErr := a.installAndStartAgent(a.currentConfigPath())
+	a.loadMeshStatus()
+	if serviceErr != nil {
+		a.onboardingState.SetText("状态：接入码已生成，服务重启失败")
+		a.info(formatInviteForDesktop(invite) + "\r\n\r\n服务重启失败：\r\n" + serviceErr.Error())
+		return
+	}
+	a.onboardingState.SetText("状态：接入码已生成，服务已重启")
+	a.info(formatInviteForDesktop(invite) + "\r\n\r\n旧接入链接已失效，当前在线连接已断开并等待重新接入。")
+}
+
+func (a *desktopApp) showInvite(invite onboarding.CreateInviteResult) {
+	if a.inviteOutput != nil {
+		a.inviteOutput.SetText(formatInviteForDesktop(invite))
+	}
+}
+
+func formatInviteForDesktop(invite onboarding.CreateInviteResult) string {
+	return formatInviteForDesktopAt(invite, time.Now())
+}
+
+func formatInviteForDesktopAt(invite onboarding.CreateInviteResult, now time.Time) string {
+	expiry := formatTime(invite.ExpiresAt)
+	if invite.LongLived {
+		expiry = "长期有效"
+	} else if !invite.ExpiresAt.IsZero() && now.After(invite.ExpiresAt) {
+		expiry += "（已过期，请重新生成）"
+	}
+	code := strings.TrimSpace(invite.Code)
+	if code == "" {
+		code = "未保存，请重新生成接入码"
+	}
+	return "服务器地址：" + invite.Server +
+		"\r\n接入码：" + code +
+		"\r\n有效期：" + expiry +
+		"\r\n接入链接：\r\n" + invite.Link
+}
+
+type simpleModeSnapshot struct {
+	Mode       string
+	Server     string
+	ListenPort string
+	InviteText string
+}
+
+func loadSimpleModeSnapshot(baseDir, configPath string, now time.Time) (simpleModeSnapshot, error) {
+	cfg, err := config.Load(configPath)
+	if err != nil {
+		return simpleModeSnapshot{}, err
+	}
+	snapshot := simpleModeSnapshot{Mode: cfg.Mode}
+	switch cfg.Mode {
+	case "hub":
+		if _, port, err := net.SplitHostPort(cfg.Listen); err == nil {
+			snapshot.ListenPort = port
+		}
+	case "spoke":
+		snapshot.Server = cfg.Connect
+	}
+	invite, ok, err := (onboarding.Manager{BaseDir: baseDir}).LatestInvite()
+	if err != nil {
+		return snapshot, err
+	}
+	if ok {
+		if invite.Server != "" {
+			snapshot.Server = invite.Server
+		}
+		snapshot.InviteText = formatInviteForDesktopAt(invite, now)
+	}
+	return snapshot, nil
+}
+
+func (a *desktopApp) restoreSimpleModeState() {
+	baseDir := appBaseDir()
+	configPath := a.currentConfigPath()
+	a.setCurrentConfigPath(configPath)
+	snapshot, err := loadSimpleModeSnapshot(baseDir, configPath, time.Now())
+	if err != nil {
+		return
+	}
+	switch snapshot.Mode {
+	case "hub":
+		if a.inviteServer != nil && snapshot.Server != "" {
+			a.inviteServer.SetText(snapshot.Server)
+		}
+		if a.listenPort != nil && snapshot.ListenPort != "" {
+			a.listenPort.SetText(snapshot.ListenPort)
+		}
+		if a.inviteOutput != nil && snapshot.InviteText != "" {
+			a.inviteOutput.SetText(snapshot.InviteText)
+		}
+		if a.onboardingState != nil {
+			a.onboardingState.SetText("状态：已读取当前服务器配置")
+		}
+	case "spoke":
+		if a.onboardingState != nil {
+			a.onboardingState.SetText("状态：已读取当前客户端配置")
+		}
+	}
+}
+
+func (a *desktopApp) desktopInviteServer() (string, error) {
+	server := strings.TrimSpace(a.inviteServer.Text())
+	if server == "" {
+		return "", fmt.Errorf("域名或公网地址为空")
+	}
+	if strings.Contains(server, "://") || strings.Contains(server, ":") {
+		return server, nil
+	}
+	port := strings.TrimSpace(a.listenPort.Text())
+	if port == "" {
+		port = "8443"
+	}
+	return server + ":" + port, nil
+}
+
+func (a *desktopApp) joinOnboarding() {
+	result, err := a.onboardingManager().JoinSpoke(onboarding.JoinSpokeRequest{
+		InviteLink: strings.TrimSpace(a.inviteLink.Text()),
+		Code:       strings.TrimSpace(a.inviteCode.Text()),
+	})
+	if err != nil {
+		a.fail("加入网络失败", err)
+		return
+	}
+	a.setCurrentConfigPath(result.ConfigPath)
+	serviceErr := a.installAndStartAgent(result.ConfigPath)
+	a.loadMeshStatus()
+	if serviceErr != nil {
+		a.onboardingState.SetText("状态：已加入，服务启动失败")
+		a.info("已加入网络：\r\n" + result.ConfigPath + "\r\n\r\n服务启动失败：\r\n" + serviceErr.Error())
+		return
+	}
+	a.onboardingState.SetText("状态：已加入并运行")
+	a.serviceStatus()
+	a.info("已加入网络并启动。\r\n本机地址：" + result.VirtualIP + "\r\n服务器：" + result.Server)
+}
+
+func (a *desktopApp) installAndStartAgent(configPath string) error {
+	name := a.currentServiceName()
+	if strings.TrimSpace(configPath) == "" {
+		configPath = a.currentConfigPath()
+	}
+	absPath, err := filepath.Abs(configPath)
+	if err != nil {
+		return err
+	}
+	a.setCurrentConfigPath(absPath)
+	if status, err := winservice.Status(name); err == nil && status.Installed && shouldStopServiceBeforeStart(status.State) {
+		if err := winservice.Stop(name); err != nil && !isServiceNotRunningError(err) {
+			return fmt.Errorf("停止旧服务失败：%w", err)
+		}
+	}
+	if err := installAgentService(name, absPath); err != nil {
+		return err
+	}
+	startedAt := time.Now()
+	if err := winservice.Start(name); err != nil && !isServiceAlreadyRunningError(err) {
+		return err
+	}
+	return waitForAgentRunningAfterStart(absPath, name, startedAt, 20*time.Second)
+}
+
+func shouldStopServiceBeforeStart(state string) bool {
+	switch strings.ToLower(strings.TrimSpace(state)) {
+	case "", "stopped":
+		return false
+	default:
+		return true
+	}
+}
+
+func isServiceAlreadyRunningError(err error) bool {
+	if err == nil {
+		return false
+	}
+	text := strings.ToLower(err.Error())
+	return strings.Contains(text, "already") || strings.Contains(text, "已启动") || strings.Contains(text, "正在运行")
+}
+
+func isServiceNotRunningError(err error) bool {
+	if err == nil {
+		return false
+	}
+	text := strings.ToLower(err.Error())
+	return strings.Contains(text, "not been started") ||
+		strings.Contains(text, "not started") ||
+		strings.Contains(text, "service is not active") ||
+		strings.Contains(text, "未启动") ||
+		strings.Contains(text, "没有启动")
+}
+
+func waitForAgentRunningAfterStart(configPath, serviceName string, startedAt time.Time, timeout time.Duration) error {
+	if serviceName == "" {
+		serviceName = winservice.DefaultName
+	}
+	statusPath := runner.StatusPath(configPath, serviceName)
+	deadline := time.Now().Add(timeout)
+	var lastErr error
+	var sawStopped bool
+	for {
+		status, err := readRuntimeStatusFile(statusPath)
+		if err != nil {
+			lastErr = err
+		} else if statusIsFromThisStart(status.UpdatedAt, startedAt) {
+			switch strings.ToLower(status.State) {
+			case "running":
+				return nil
+			case "stopped":
+				sawStopped = true
+			}
+		}
+		if time.Now().After(deadline) {
+			if sawStopped {
+				return fmt.Errorf("服务启动后立即停止：%s", agentLogTail(configPath, serviceName))
+			}
+			if lastErr != nil {
+				return fmt.Errorf("等待服务运行状态超时，无法读取状态文件 %s：%w", statusPath, lastErr)
+			}
+			return fmt.Errorf("等待服务运行状态超时：%s", agentLogTail(configPath, serviceName))
+		}
+		time.Sleep(300 * time.Millisecond)
+	}
+}
+
+func readRuntimeStatusFile(path string) (meshagent.RuntimeStatus, error) {
+	var status meshagent.RuntimeStatus
+	b, err := os.ReadFile(path)
+	if err != nil {
+		return status, err
+	}
+	if err := json.Unmarshal(b, &status); err != nil {
+		return status, err
+	}
+	return status, nil
+}
+
+func statusIsFromThisStart(updatedAt, startedAt time.Time) bool {
+	return updatedAt.IsZero() || !updatedAt.Before(startedAt.Add(-1*time.Second))
+}
+
+func agentLogTail(configPath, serviceName string) string {
+	if serviceName == "" {
+		serviceName = winservice.DefaultName
+	}
+	logPath := filepath.Join(filepath.Dir(configPath), "logs", serviceName+".log")
+	text, err := tail(logPath, 8192)
+	if err != nil || strings.TrimSpace(text) == "" {
+		return "请查看日志：" + logPath
+	}
+	return strings.TrimSpace(text)
+}
+
 func (a *desktopApp) serviceAction(action string) {
-	name := strings.TrimSpace(a.serviceName.Text())
-	configPath := strings.TrimSpace(a.configPath.Text())
+	name := a.currentServiceName()
+	configPath := a.currentConfigPath()
 	var err error
 	switch action {
 	case "install":
 		err = installAgentService(name, configPath)
 	case "start":
-		err = winservice.Start(name)
+		err = a.installAndStartAgent(configPath)
 	case "stop":
 		err = winservice.Stop(name)
 	case "uninstall":
@@ -709,21 +1091,36 @@ func findAgentExe() (string, error) {
 }
 
 func (a *desktopApp) serviceStatus() {
-	status, err := winservice.Status(strings.TrimSpace(a.serviceName.Text()))
+	text := a.refreshServiceStatusLabels()
+	a.info(text)
+}
+
+func (a *desktopApp) refreshServiceStatusLabels() string {
+	status, err := winservice.Status(a.currentServiceName())
 	if err != nil {
-		a.fail("读取服务状态失败", err)
-		return
+		return "服务状态：读取失败"
+	}
+	if status.ConfigPath != "" {
+		a.setCurrentConfigPath(status.ConfigPath)
 	}
 	text := "服务状态：未安装"
 	if status.Installed {
 		text = "服务状态：" + serviceStateCN(status.State)
 	}
-	a.serviceState.SetText(text)
-	a.quickState.SetText(strings.TrimPrefix(text, "服务状态："))
-	a.info(text)
+	if a.serviceState != nil {
+		a.serviceState.SetText(text)
+	}
+	if a.quickState != nil {
+		a.quickState.SetText(strings.TrimPrefix(text, "服务状态："))
+	}
+	return text
 }
 
 func (a *desktopApp) createCA() {
+	if a.certOut == nil || a.caName == nil {
+		a.fail("创建 CA 失败", fmt.Errorf("普通模式不支持手动创建 CA"))
+		return
+	}
 	result, err := certutil.InitCA(certutil.CAOptions{
 		OutDir: strings.TrimSpace(a.certOut.Text()),
 		Name:   strings.TrimSpace(a.caName.Text()),
@@ -737,6 +1134,10 @@ func (a *desktopApp) createCA() {
 }
 
 func (a *desktopApp) issueCert() {
+	if a.certOut == nil || a.nodeName == nil || a.dnsSANs == nil || a.ipSANs == nil || a.certDays == nil {
+		a.fail("签发证书失败", fmt.Errorf("普通模式不支持手动签发节点证书"))
+		return
+	}
 	days, _ := strconv.Atoi(strings.TrimSpace(a.certDays.Text()))
 	out := strings.TrimSpace(a.certOut.Text())
 	result, err := certutil.Issue(certutil.IssueOptions{
@@ -756,7 +1157,7 @@ func (a *desktopApp) issueCert() {
 }
 
 func (a *desktopApp) runDiagnostics() {
-	report := diagnose.Run(strings.TrimSpace(a.configPath.Text()), strings.TrimSpace(a.serviceName.Text()))
+	report := diagnose.Run(a.currentConfigPath(), a.currentServiceName())
 	a.info(formatReport(report))
 	if hasFail(report.Checks) {
 		a.quickState.SetText("需要处理")
@@ -766,8 +1167,8 @@ func (a *desktopApp) runDiagnostics() {
 }
 
 func (a *desktopApp) loadLogs() {
-	configPath := strings.TrimSpace(a.configPath.Text())
-	serviceName := strings.TrimSpace(a.serviceName.Text())
+	configPath := a.currentConfigPath()
+	serviceName := a.currentServiceName()
 	if serviceName == "" {
 		serviceName = winservice.DefaultName
 	}
@@ -787,12 +1188,26 @@ func (a *desktopApp) loadMeshStatus() {
 	if a.meshModel == nil || a.meshList == nil || a.meshDetail == nil || a.meshSummary == nil {
 		return
 	}
-	configPath := strings.TrimSpace(a.configPath.Text())
-	serviceName := strings.TrimSpace(a.serviceName.Text())
+	configPath := a.currentConfigPath()
+	serviceName := a.currentServiceName()
 	statusPath := runner.StatusPath(configPath, serviceName)
 	selectedKey := a.currentMeshNodeKey()
 	b, err := os.ReadFile(statusPath)
 	if err != nil {
+		if devices, devicesErr := a.onboardingManager().Devices(serviceName); devicesErr == nil && len(devices.Nodes) > 0 {
+			nodes := buildMeshNodesFromDevices(devices, statusPath)
+			a.meshModel.SetItems(nodes)
+			a.meshSummary.SetText(meshSummaryText(nodes, devices.UpdatedAt))
+			index := findMeshNodeIndex(nodes, selectedKey)
+			if index < 0 && len(nodes) > 0 {
+				index = 0
+			}
+			if index >= 0 {
+				_ = a.meshList.SetCurrentIndex(index)
+				a.showSelectedMeshNode()
+			}
+			return
+		}
 		a.meshModel.SetItems(nil)
 		a.meshSummary.SetText("未读取到状态文件")
 		a.meshDetail.SetText("读取组网状态失败：\r\n" + statusPath + "\r\n\r\n" + err.Error() + "\r\n\r\n请确认服务已经启动。")
@@ -883,12 +1298,20 @@ func (a *desktopApp) startMeshStatusAutoRefresh() chan struct{} {
 }
 
 func (a *desktopApp) checkRDP() {
+	if a.rdpTarget == nil {
+		a.fail("检查 RDP 失败", fmt.Errorf("请先在节点列表选择远程节点"))
+		return
+	}
 	check := diagnose.CheckRDP(strings.TrimSpace(a.rdpTarget.Text()))
 	a.info(formatChecks([]diagnose.Check{check}))
 }
 
 func (a *desktopApp) openRDP() {
-	target := strings.TrimSpace(a.rdpTarget.Text())
+	target := a.currentRDPTarget()
+	if target == "" {
+		a.fail("打开远程桌面失败", fmt.Errorf("请先在节点列表选择远程节点"))
+		return
+	}
 	if err := rdp.Open(target); err != nil {
 		a.fail("打开远程桌面失败", err)
 		return
@@ -896,14 +1319,103 @@ func (a *desktopApp) openRDP() {
 	a.info("已打开远程桌面：" + target)
 }
 
+func (a *desktopApp) currentRDPTarget() string {
+	if a.rdpTarget != nil {
+		if target := strings.TrimSpace(a.rdpTarget.Text()); target != "" {
+			return target
+		}
+	}
+	if a.meshList == nil || a.meshModel == nil {
+		return ""
+	}
+	index := a.meshList.CurrentIndex()
+	if index < 0 || index >= len(a.meshModel.items) {
+		return ""
+	}
+	node := a.meshModel.items[index]
+	if node.Kind == "self" {
+		return ""
+	}
+	return strings.TrimSpace(node.VirtualIP)
+}
+
+func (a *desktopApp) showAboutDialog() {
+	host, port := splitUpdateBaseURL(rememberedUpdateURL(appBaseDir()))
+	var dlg *walk.Dialog
+	var closeButton *walk.PushButton
+	if err := (Dialog{
+		AssignTo:  &dlg,
+		Title:     "关于 Meshlink",
+		MinSize:   Size{520, 430},
+		Size:      Size{560, 460},
+		FixedSize: false,
+		Layout:    VBox{Margins: Margins{Left: 16, Top: 16, Right: 16, Bottom: 16}, Spacing: 12},
+		Children: []Widget{
+			Label{
+				Text:      "Meshlink 远程桌面组网",
+				Font:      Font{Family: "Microsoft YaHei UI", PointSize: 14, Bold: true},
+				TextColor: walk.RGB(24, 36, 52),
+			},
+			Label{Text: "版本：" + version.Display()},
+			Label{Text: "自托管远程桌面组网；仅使用 IPv4 虚拟网段，不做全局代理和公网出口转发。"},
+			GroupBox{
+				Title:  "远程升级",
+				Layout: Grid{Columns: 4, Margins: Margins{Left: 12, Top: 18, Right: 12, Bottom: 12}, Spacing: 8},
+				Children: []Widget{
+					Label{Text: "更新地址"},
+					LineEdit{AssignTo: &a.updateHost, Text: host, ColumnSpan: 3},
+					Label{Text: "更新端口"},
+					LineEdit{AssignTo: &a.updatePort, Text: port, ColumnSpan: 3},
+					PushButton{Text: "检查更新", OnClicked: a.checkUpdate, ColumnSpan: 2},
+					PushButton{Text: "立即更新", OnClicked: a.applyUpdate, ColumnSpan: 2},
+					Label{AssignTo: &a.updateState, Text: "更新状态：未检查", ColumnSpan: 4},
+					TextEdit{AssignTo: &a.updateOutput, ReadOnly: true, MinSize: Size{0, 120}, ColumnSpan: 4},
+				},
+			},
+			Composite{
+				Layout: HBox{MarginsZero: true, Spacing: 8},
+				Children: []Widget{
+					HSpacer{},
+					PushButton{AssignTo: &closeButton, Text: "关闭", OnClicked: func() { dlg.Accept() }},
+				},
+			},
+		},
+		DefaultButton: &closeButton,
+		CancelButton:  &closeButton,
+	}).Create(a.mw); err != nil {
+		a.fail("打开关于窗口失败", err)
+		return
+	}
+	dlg.Run()
+}
+
+func (a *desktopApp) currentUpdateBaseURL() (string, error) {
+	if a.updateHost != nil {
+		port := ""
+		if a.updatePort != nil {
+			port = a.updatePort.Text()
+		}
+		return updateBaseURLFromHostPort(a.updateHost.Text(), port)
+	}
+	if a.updateURL != nil {
+		return meshupdate.NormalizeBaseURL(a.updateURL.Text())
+	}
+	return meshupdate.NormalizeBaseURL(rememberedUpdateURL(appBaseDir()))
+}
+
 func (a *desktopApp) checkUpdate() {
-	updateURL := strings.TrimSpace(a.updateURL.Text())
-	normalized, err := meshupdate.NormalizeBaseURL(updateURL)
+	if a.updateState == nil {
+		a.fail("检查更新失败", fmt.Errorf("普通模式不显示更新设置"))
+		return
+	}
+	normalized, err := a.currentUpdateBaseURL()
 	if err != nil {
 		a.fail("更新地址无效", err)
 		return
 	}
-	a.updateURL.SetText(normalized)
+	if a.updateURL != nil {
+		a.updateURL.SetText(normalized)
+	}
 	if err := rememberUpdateURL(appBaseDir(), normalized); err != nil {
 		a.fail("保存更新地址失败", err)
 		return
@@ -921,15 +1433,19 @@ func (a *desktopApp) checkUpdate() {
 	if result.UpdateAvailable {
 		a.latestUpdate = &result.Manifest
 		a.updateState.SetText("更新状态：发现新版本 " + result.Manifest.Version)
-		a.info(formatUpdateResult(result))
+		a.showUpdateInfo(formatUpdateResult(result))
 		return
 	}
 	a.latestUpdate = nil
 	a.updateState.SetText("更新状态：已是最新版本")
-	a.info(formatUpdateResult(result))
+	a.showUpdateInfo(formatUpdateResult(result))
 }
 
 func (a *desktopApp) applyUpdate() {
+	if a.updateState == nil {
+		a.fail("立即更新失败", fmt.Errorf("普通模式不显示更新设置"))
+		return
+	}
 	if a.latestUpdate == nil {
 		a.checkUpdate()
 		if a.latestUpdate == nil {
@@ -952,7 +1468,11 @@ func (a *desktopApp) applyUpdate() {
 	}
 
 	baseDir := appBaseDir()
-	updateURL := strings.TrimSpace(a.updateURL.Text())
+	updateURL, err := a.currentUpdateBaseURL()
+	if err != nil {
+		a.fail("更新地址无效", err)
+		return
+	}
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
 	defer cancel()
 	packagePath, err := meshupdate.DownloadPackage(ctx, updateURL, manifest, filepath.Join(baseDir, "updates", "downloads"))
@@ -965,7 +1485,7 @@ func (a *desktopApp) applyUpdate() {
 		BaseDir:     baseDir,
 		PackagePath: packagePath,
 		Version:     manifest.Version,
-		ServiceName: strings.TrimSpace(a.serviceName.Text()),
+		ServiceName: a.currentServiceName(),
 		WaitPID:     os.Getpid(),
 	})
 	if err != nil {
@@ -983,13 +1503,31 @@ func (a *desktopApp) applyUpdate() {
 	a.mw.Close()
 }
 
+func (a *desktopApp) showUpdateInfo(text string) {
+	if a.updateOutput != nil {
+		a.updateOutput.SetText(text)
+		return
+	}
+	a.info(text)
+}
+
 func (a *desktopApp) info(text string) {
-	a.output.SetText(text)
+	if a.output != nil {
+		a.output.SetText(text)
+		return
+	}
+	if a.meshDetail != nil {
+		a.meshDetail.SetText(text)
+	}
 }
 
 func (a *desktopApp) fail(title string, err error) {
 	msg := title + "：\r\n" + err.Error()
-	a.output.SetText(msg)
+	if a.output != nil {
+		a.output.SetText(msg)
+	} else if a.meshDetail != nil {
+		a.meshDetail.SetText(msg)
+	}
 	walk.MsgBox(a.mw, title, err.Error(), walk.MsgBoxIconError)
 }
 
@@ -1084,6 +1622,39 @@ func buildMeshNodes(status meshagent.RuntimeStatus, statusPath string) []meshNod
 			UpdatedAt:      status.UpdatedAt,
 			State:          status.State,
 			StatusPath:     statusPath,
+		})
+	}
+	sort.SliceStable(nodes, func(i, j int) bool {
+		ri, rj := meshNodeRank(nodes[i]), meshNodeRank(nodes[j])
+		if ri != rj {
+			return ri < rj
+		}
+		return strings.ToLower(nodes[i].NodeID) < strings.ToLower(nodes[j].NodeID)
+	})
+	return nodes
+}
+
+func buildMeshNodesFromDevices(devices onboarding.DeviceList, statusPath string) []meshNode {
+	nodes := make([]meshNode, 0, len(devices.Nodes))
+	for _, device := range devices.Nodes {
+		nodeID := fallbackText(device.NodeID, device.CommonName)
+		kind := device.Kind
+		if kind == "" {
+			kind = "peer"
+		}
+		nodes = append(nodes, meshNode{
+			Key:         kind + ":" + nodeID,
+			Kind:        kind,
+			Online:      strings.EqualFold(device.Status, "online"),
+			NodeID:      fallbackText(nodeID, "未命名节点"),
+			VirtualIP:   device.VirtualIP,
+			RemoteAddr:  device.RemoteAddr,
+			Fingerprint: device.Fingerprint,
+			CommonName:  device.CommonName,
+			LastSeen:    device.LastSeen,
+			UpdatedAt:   devices.UpdatedAt,
+			State:       device.Status,
+			StatusPath:  statusPath,
 		})
 	}
 	sort.SliceStable(nodes, func(i, j int) bool {
