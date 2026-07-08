@@ -9,6 +9,7 @@ import (
 	"syscall"
 
 	"meshlink/internal/runner"
+	"meshlink/internal/version"
 	"meshlink/internal/winservice"
 )
 
@@ -16,10 +17,17 @@ func main() {
 	var configPath string
 	var serviceAction string
 	var serviceName string
+	var showVersion bool
 	flag.StringVar(&configPath, "config", "", "path to agent JSON config")
 	flag.StringVar(&serviceAction, "service", "", "Windows service action: install, uninstall, start, stop, run")
 	flag.StringVar(&serviceName, "service-name", winservice.DefaultName, "Windows service name")
+	flag.BoolVar(&showVersion, "version", false, "print version and exit")
 	flag.Parse()
+
+	if showVersion {
+		fmt.Println(version.Display())
+		return
+	}
 
 	if serviceAction != "" {
 		if err := runServiceAction(serviceAction, serviceName, configPath); err != nil {

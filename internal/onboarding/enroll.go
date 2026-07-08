@@ -54,6 +54,7 @@ type DeviceRegistry struct {
 
 type RegisteredNode struct {
 	NodeID          string     `json:"node_id"`
+	DisplayName     string     `json:"display_name,omitempty"`
 	VirtualIP       string     `json:"virtual_ip"`
 	SourceAddr      string     `json:"source_addr,omitempty"`
 	CertFingerprint string     `json:"cert_fingerprint"`
@@ -109,6 +110,7 @@ func (m Manager) HandleEnroll(req EnrollRequest) (EnrollResponse, error) {
 	now := m.now()
 	registry.Nodes = append(registry.Nodes, RegisteredNode{
 		NodeID:          req.NodeName,
+		DisplayName:     req.NodeName,
 		VirtualIP:       virtualIP,
 		SourceAddr:      req.SourceAddr,
 		CertFingerprint: certificateFingerprint(issued.CertPEM),
@@ -120,6 +122,16 @@ func (m Manager) HandleEnroll(req EnrollRequest) (EnrollResponse, error) {
 		return EnrollResponse{}, err
 	}
 	if err := m.markInviteUsed(invite.Token, req.SourceAddr); err != nil {
+		return EnrollResponse{}, err
+	}
+	if err := m.writeAudit("enroll_succeeded", map[string]any{
+		"node_id":      req.NodeName,
+		"display_name": req.NodeName,
+		"virtual_ip":   virtualIP,
+		"source_addr":  req.SourceAddr,
+		"fingerprint":  certificateFingerprint(issued.CertPEM),
+		"invite_type":  inviteType(invite),
+	}); err != nil {
 		return EnrollResponse{}, err
 	}
 	return EnrollResponse{
@@ -198,7 +210,7 @@ func (m Manager) validateInvite(req EnrollRequest) (Invite, error) {
 			return Invite{}, fmt.Errorf("invite has expired")
 		}
 		if !verifyInviteCode(invite, req.Code) {
-			_ = m.recordInviteFailure(req.Token)
+			_ = m.recordInviteFailure(req.Token, req.SourceAddr)
 			return Invite{}, fmt.Errorf("verification code is incorrect")
 		}
 		return invite, nil
@@ -206,7 +218,7 @@ func (m Manager) validateInvite(req EnrollRequest) (Invite, error) {
 	return Invite{}, fmt.Errorf("invite token was not found")
 }
 
-func (m Manager) recordInviteFailure(token string) error {
+func (m Manager) recordInviteFailure(token, sourceAddr string) error {
 	store, err := m.loadInviteStore()
 	if err != nil {
 		return err
@@ -214,7 +226,30 @@ func (m Manager) recordInviteFailure(token string) error {
 	for i := range store.Invites {
 		if store.Invites[i].Token == token {
 			store.Invites[i].Failures++
-			return m.saveInviteStore(store)
+			failures := store.Invites[i].Failures
+			maxFailures := store.Invites[i].MaxFailures
+			if maxFailures == 0 {
+				maxFailures = defaultInviteMaxFailures
+				store.Invites[i].MaxFailures = maxFailures
+			}
+			if err := m.saveInviteStore(store); err != nil {
+				return err
+			}
+			if err := m.writeAudit("enroll_verification_failed", map[string]any{
+				"source_addr":  sourceAddr,
+				"failures":     failures,
+				"max_failures": maxFailures,
+			}); err != nil {
+				return err
+			}
+			if failures >= maxFailures {
+				return m.writeAudit("invite_invalidated", map[string]any{
+					"source_addr":  sourceAddr,
+					"failures":     failures,
+					"max_failures": maxFailures,
+				})
+			}
+			return nil
 		}
 	}
 	return nil
@@ -289,4 +324,11 @@ func certificateFingerprint(certPEM []byte) string {
 		parts = append(parts, raw[i:i+2])
 	}
 	return "SHA256:" + strings.Join(parts, ":")
+}
+
+func inviteType(invite Invite) string {
+	if invite.LongLived {
+		return "long_lived"
+	}
+	return "one_time"
 }

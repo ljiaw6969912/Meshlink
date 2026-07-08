@@ -23,6 +23,14 @@ Meshlink 当前已经解决了“有公网 IP 的用户如何自托管远程访�
 - 如果未来做官方 hub，中继流量成本和滥用风险会成为商业化瓶颈。
 - 产品仍需进一步避免被理解为通用 VPN、匿名代理或公网出口工具。
 
+## 项目执行索引
+
+本产品改造按 `docs/superpowers/plans/2026-07-07-product-transformation.md` 中的 Task 0-11 推进。Task 0 只做项目治理与基线冻结，不实现功能代码；后续功能进入 Task 1-11 分阶段交付。
+
+- 总实施计划：[docs/superpowers/plans/2026-07-07-product-transformation.md](docs/superpowers/plans/2026-07-07-product-transformation.md)
+- Task 0 需求追踪矩阵：[docs/qa/product-transformation-requirements.md](docs/qa/product-transformation-requirements.md)
+- Task 0 发布门禁：[docs/qa/release-gates.md](docs/qa/release-gates.md)
+
 ## 3. 产品定位
 
 Meshlink 应被定义为：

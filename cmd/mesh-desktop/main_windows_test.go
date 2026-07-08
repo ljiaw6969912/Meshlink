@@ -9,6 +9,7 @@ import (
 	"testing"
 	"time"
 
+	"meshlink/internal/onboarding"
 	"meshlink/internal/winservice"
 )
 
@@ -28,6 +29,22 @@ func TestDesktopMainWindowOnlyExposesSimpleModeTabs(t *testing.T) {
 		t.Fatal(err)
 	}
 	src := string(b)
+	mainWindowSrc := src
+	if index := strings.Index(src, `func (a *desktopApp) showAdvancedSettingsDialog()`); index >= 0 {
+		mainWindowSrc = src[:index]
+	}
+	for _, want := range []string{
+		`Text: "我有公网 IP，创建服务器"`,
+		`Text: "我没有公网 IP，使用官方 Hub"`,
+		`Text: "我有云服务器，帮我自建中继"`,
+		`Text: "加入已有网络"`,
+		`官方 Hub 尚未开放`,
+		`showSelfRelayWizard`,
+	} {
+		if !strings.Contains(src, want) {
+			t.Fatalf("desktop main window missing entry %s", want)
+		}
+	}
 	for _, hidden := range []string{
 		`Title:  "高级设置"`,
 		`Title:  "诊断和日志"`,
@@ -35,8 +52,60 @@ func TestDesktopMainWindowOnlyExposesSimpleModeTabs(t *testing.T) {
 		`PushButton{Text: "读取日志"`,
 		`Text:          "未诊断"`,
 	} {
-		if strings.Contains(src, hidden) {
+		if strings.Contains(mainWindowSrc, hidden) {
 			t.Fatalf("desktop main window still exposes %s", hidden)
+		}
+	}
+}
+
+func TestDesktopSelfHostedRelayWizardExposesDeploymentFields(t *testing.T) {
+	b, err := os.ReadFile("main_windows.go")
+	if err != nil {
+		t.Fatal(err)
+	}
+	src := string(b)
+	for _, want := range []string{
+		`func (a *desktopApp) showSelfRelayWizard()`,
+		`云服务器地址`,
+		`SSH 端口`,
+		`SSH 用户名`,
+		`SSH 密码`,
+		`私钥内容`,
+		`Meshlink 监听端口`,
+		`服务器公网访问地址`,
+		`检查云服务器`,
+		`部署自建中继`,
+		`buildReq(true)`,
+		`buildReq(false)`,
+		`DeploySelfHostedRelay`,
+		`远程服务状态`,
+		`主机指纹`,
+		`接入链接`,
+		`接入码`,
+		`有效期`,
+	} {
+		if !strings.Contains(src, want) {
+			t.Fatalf("self-hosted relay wizard missing %s", want)
+		}
+	}
+	if strings.Contains(src, `自建中继向导尚未开放`) {
+		t.Fatal("desktop self-hosted relay entry should no longer be a placeholder")
+	}
+}
+
+func TestJoinOnboardingUsesLocalDeviceName(t *testing.T) {
+	b, err := os.ReadFile("main_windows.go")
+	if err != nil {
+		t.Fatal(err)
+	}
+	src := string(b)
+	for _, want := range []string{
+		`Label{Text: "本机名称", TextColor: muted}`,
+		`LineEdit{AssignTo: &a.spokeNodeName`,
+		`NodeName:   strings.TrimSpace(a.spokeNodeName.Text()),`,
+	} {
+		if !strings.Contains(src, want) {
+			t.Fatalf("join flow missing %s", want)
 		}
 	}
 }
@@ -58,6 +127,29 @@ func TestDesktopMainWindowHasAboutUpdateMenu(t *testing.T) {
 	} {
 		if !strings.Contains(src, want) {
 			t.Fatalf("desktop main window missing %s", want)
+		}
+	}
+}
+
+func TestDesktopKeepsAdvancedToolsBehindMenu(t *testing.T) {
+	b, err := os.ReadFile("main_windows.go")
+	if err != nil {
+		t.Fatal(err)
+	}
+	src := string(b)
+	for _, want := range []string{
+		`Text: "工具"`,
+		`Text: "高级设置"`,
+		`showAdvancedSettingsDialog`,
+		`Title:  "服务安装 / 启停"`,
+		`Title:  "JSON 配置"`,
+		`Title:  "证书工具"`,
+		`Title:  "日志和详细诊断"`,
+		`PushButton{Text: "读取日志"`,
+		`PushButton{Text: "开始诊断"`,
+	} {
+		if !strings.Contains(src, want) {
+			t.Fatalf("desktop advanced tools missing %s", want)
 		}
 	}
 }
@@ -104,6 +196,67 @@ func TestRegeneratingInviteReplacesInvitesAndRestartsAgent(t *testing.T) {
 		if !strings.Contains(src, want) {
 			t.Fatalf("regenerate invite flow missing %s", want)
 		}
+	}
+}
+
+func TestDesktopLongLivedInviteShowsRiskAndDeviceLimit(t *testing.T) {
+	text := formatInviteForDesktopAt(onboarding.CreateInviteResult{
+		Server:    "example.com:8443",
+		Code:      "123456",
+		Link:      "meshlink://join?server=example.com:8443&token=tok",
+		LongLived: true,
+		MaxUses:   3,
+	}, time.Date(2026, 7, 8, 8, 0, 0, 0, time.UTC))
+	for _, want := range []string{"长期有效", "设备数限制：3 台", "长期接入码风险"} {
+		if !strings.Contains(text, want) {
+			t.Fatalf("invite text = %q, want %q", text, want)
+		}
+	}
+}
+
+func TestDesktopMainWindowExposesDeviceAdminControlsAndInviteLimit(t *testing.T) {
+	b, err := os.ReadFile("main_windows.go")
+	if err != nil {
+		t.Fatal(err)
+	}
+	src := string(b)
+	for _, want := range []string{
+		`LineEdit{AssignTo: &a.inviteMaxUses`,
+		`Text: "设备数限制"`,
+		`Text: "重命名设备"`,
+		`Text: "禁用设备"`,
+		`Text: "移除设备"`,
+	} {
+		if !strings.Contains(src, want) {
+			t.Fatalf("desktop main window missing %s", want)
+		}
+	}
+}
+
+func TestDesktopDeviceListShowsDisabledAndDisplayName(t *testing.T) {
+	nodes := buildMeshNodesFromDevices(onboarding.DeviceList{
+		Nodes: []onboarding.DeviceSummary{
+			{
+				Kind:        "peer",
+				NodeID:      "laptop",
+				DisplayName: "Alice laptop",
+				Status:      "disabled",
+				VirtualIP:   "10.77.0.2",
+			},
+		},
+	}, `C:\Meshlink\configs\logs\MeshlinkAgent.status.json`)
+	if len(nodes) != 1 {
+		t.Fatalf("nodes = %+v, want one node", nodes)
+	}
+	if nodes[0].DisplayName != "Alice laptop" || nodes[0].NodeID != "laptop" {
+		t.Fatalf("node = %+v, want node_id laptop display Alice laptop", nodes[0])
+	}
+	if got := meshNodeStatusText(nodes[0]); got != "已禁用" {
+		t.Fatalf("meshNodeStatusText() = %q, want 已禁用", got)
+	}
+	detail := formatMeshNodeDetail(nodes[0])
+	if !strings.Contains(detail, "显示名称：Alice laptop") || !strings.Contains(detail, "状态：已禁用") {
+		t.Fatalf("detail = %q, want display name and disabled status", detail)
 	}
 }
 
@@ -249,8 +402,17 @@ func TestPackageIncludesPublishUpdateBat(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !strings.Contains(string(b), `publish-update.bat`) {
-		t.Fatal("package.ps1 should include publish-update.bat in release zip")
+	src := string(b)
+	for _, want := range []string{
+		`publish-update.bat`,
+		`bin\linux\mesh-agent`,
+		`build-linux-agent.ps1`,
+		`linux-systemd.sh`,
+		`self-hosted-relay-runbook.zh-CN.md`,
+	} {
+		if !strings.Contains(src, want) {
+			t.Fatalf("package.ps1 should include %s in release zip", want)
+		}
 	}
 }
 

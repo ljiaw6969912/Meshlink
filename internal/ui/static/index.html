@@ -10,7 +10,7 @@
     <header class="topbar">
       <div>
         <h1>Meshlink</h1>
-        <p>自托管远程桌面组网</p>
+        <p>私有远程桌面组网</p>
       </div>
       <div class="top-actions">
         <span id="serviceState" class="status">未知</span>
@@ -19,14 +19,49 @@
     </header>
 
     <main class="shell">
-      <nav class="modebar" aria-label="模式切换">
-        <button class="mode active" data-view="serverView" type="button">服务器模式</button>
-        <button class="mode" data-view="clientView" type="button">客户端模式</button>
-      </nav>
-
-      <section id="serverView" class="view active">
+      <section id="devicesView" class="node-panel primary-panel">
         <div class="section-head">
-          <h2>服务器模式</h2>
+          <h2>设备列表</h2>
+          <button id="refreshDevices" type="button" class="secondary">刷新列表</button>
+        </div>
+        <div id="deviceList" class="device-list"></div>
+        <div id="deviceDetail" class="device-detail">暂无选中设备。</div>
+        <div class="device-admin">
+          <label>
+            设备显示名称
+            <input id="deviceDisplayName" placeholder="选择设备后可重命名" autocomplete="off">
+          </label>
+          <div class="actions compact">
+            <button id="renameDevice" type="button" class="secondary">重命名</button>
+            <button id="disableDevice" type="button" class="secondary">禁用</button>
+            <button id="removeDevice" type="button" class="danger">移除</button>
+          </div>
+        </div>
+        <div id="rdpDiagnostics" class="checks"></div>
+      </section>
+
+      <section class="entry-panel" aria-label="使用入口">
+        <button class="entry-card" data-view="serverView" type="button">
+          <strong>我有公网 IP，创建服务器</strong>
+          <span>本机生成接入链接和接入码</span>
+        </button>
+        <button class="entry-card muted-card" data-view="officialHubView" type="button">
+          <strong>我没有公网 IP，使用官方 Hub</strong>
+          <span>官方 Hub 尚未开放</span>
+        </button>
+        <button class="entry-card" data-view="relayView" type="button">
+          <strong>我有云服务器，帮我自建中继</strong>
+          <span>SSH 部署公网 Meshlink Hub</span>
+        </button>
+        <button class="entry-card" data-view="clientView" type="button">
+          <strong>加入已有网络</strong>
+          <span>输入接入链接、接入码和本机名称</span>
+        </button>
+      </section>
+
+      <section id="serverView" class="view">
+        <div class="section-head">
+          <h2>创建服务器</h2>
           <span id="serverStatus" class="muted">未启动</span>
         </div>
         <div class="form-grid">
@@ -47,6 +82,16 @@
             <input id="longLivedCode" type="checkbox">
             长期接入码
           </label>
+          <label class="limit-label">
+            设备数限制
+            <input id="inviteMaxUses" value="3" inputmode="numeric">
+          </label>
+        </div>
+        <p class="notice">长期接入码风险较高，请设置设备数限制；达到上限后新设备会被拒绝加入。</p>
+        <div class="result-strip">
+          <span>本机虚拟 IP：<strong id="localVirtualIP">-</strong></span>
+          <span>监听地址：<strong id="serverListen">-</strong></span>
+          <span>服务状态：<strong id="serviceStatusCopy">未知</strong></span>
         </div>
         <div class="access-box">
           <label>
@@ -69,42 +114,189 @@
 
       <section id="clientView" class="view">
         <div class="section-head">
-          <h2>客户端模式</h2>
+          <h2>加入已有网络</h2>
           <span id="clientStatus" class="muted">未加入</span>
         </div>
         <label>
           接入链接
           <input id="inviteLink" placeholder="meshlink://join?server=example.com:8443&token=..." autocomplete="off">
         </label>
-        <label>
-          接入码
-          <input id="inviteCode" inputmode="numeric" maxlength="6" autocomplete="one-time-code">
-        </label>
-        <details class="manual-server">
-          <summary>手动填写服务器地址</summary>
+        <div class="form-grid">
           <label>
-            服务器地址
-            <input id="manualServerAddress" placeholder="example.com:8443" autocomplete="off">
+            接入码
+            <input id="inviteCode" inputmode="numeric" maxlength="6" autocomplete="one-time-code">
           </label>
-        </details>
+          <label>
+            本机名称
+            <input id="joinNodeName" placeholder="例如 office-pc" autocomplete="off">
+          </label>
+        </div>
         <div class="actions">
           <button id="joinNetwork" type="button">加入网络</button>
           <button id="exitNetwork" type="button" class="secondary">退出网络</button>
         </div>
       </section>
 
-      <section id="devicesView" class="node-panel">
+      <section id="officialHubView" class="view placeholder-view">
         <div class="section-head">
-          <h2>组网机群节点列表</h2>
-          <button id="refreshDevices" type="button" class="secondary">刷新列表</button>
+          <h2>官方 Hub 尚未开放</h2>
+          <span class="muted">灰度占位</span>
         </div>
-        <div id="deviceList" class="device-list"></div>
-        <div id="deviceDetail" class="device-detail">点击节点后，这里会显示远程桌面目标和连接信息。</div>
+        <p>当前版本不会连接官方 Hub，也不会收取官方中继费用。</p>
       </section>
 
-      <input id="serviceName" type="hidden" value="MeshlinkAgent">
-      <input id="configPath" type="hidden">
-      <input id="rdpTarget" type="hidden" value="10.77.0.2">
+      <section id="relayView" class="view">
+        <div class="section-head">
+          <h2>自建中继部署</h2>
+          <span id="relayStatus" class="muted">未检查</span>
+        </div>
+        <div class="form-grid">
+          <label>
+            云服务器地址
+            <input id="relayCloudAddress" placeholder="203.0.113.10 或 relay.example.com" autocomplete="off">
+          </label>
+          <label>
+            SSH 端口
+            <input id="relaySSHPort" value="22" inputmode="numeric">
+          </label>
+          <label>
+            SSH 用户名
+            <input id="relaySSHUser" value="root" autocomplete="username">
+          </label>
+          <label>
+            SSH 密码
+            <input id="relaySSHPassword" type="password" autocomplete="current-password">
+          </label>
+          <label class="span-two">
+            私钥内容
+            <textarea id="relaySSHKey" placeholder="-----BEGIN OPENSSH PRIVATE KEY-----"></textarea>
+          </label>
+          <label>
+            Meshlink 监听端口
+            <input id="relayListenPort" value="8443" inputmode="numeric">
+          </label>
+          <label>
+            服务器公网访问地址
+            <input id="relayPublicAddress" placeholder="relay.example.com 或 203.0.113.10" autocomplete="off">
+          </label>
+        </div>
+        <div class="actions">
+          <button id="checkSelfRelay" type="button" class="secondary">检查云服务器</button>
+          <button id="deploySelfRelay" type="button">部署自建中继</button>
+          <label class="check-label">
+            <input id="relayLongLivedCode" type="checkbox" checked>
+            长期接入码
+          </label>
+          <label class="limit-label">
+            设备数限制
+            <input id="relayMaxUses" value="10" inputmode="numeric">
+          </label>
+        </div>
+        <div class="result-strip">
+          <span>远程服务状态：<strong id="relayRemoteService">未知</strong></span>
+          <span>主机指纹：<strong id="relayHostFingerprint">-</strong></span>
+          <span>有效期：<strong id="relayInviteExpiry">-</strong></span>
+        </div>
+        <div class="access-box">
+          <label>
+            接入链接
+            <textarea id="relayAccessLink" readonly placeholder="部署成功后生成"></textarea>
+          </label>
+          <div class="code-row">
+            <div>
+              <span>接入码</span>
+              <strong id="relayAccessCode">------</strong>
+            </div>
+            <span class="muted">家里电脑和外出电脑都作为客户端加入该中继。</span>
+          </div>
+          <div class="actions">
+            <button id="copyRelayInviteLink" type="button">复制链接</button>
+            <button id="copyRelayInviteCode" type="button" class="secondary">复制接入码</button>
+          </div>
+        </div>
+        <div id="relayHealth" class="checks"></div>
+      </section>
+
+      <details id="advancedSettings" class="advanced-settings">
+        <summary>高级设置</summary>
+        <div class="advanced-grid">
+          <section>
+            <h2>服务</h2>
+            <label>
+              服务名
+              <input id="serviceName" value="MeshlinkAgent" autocomplete="off">
+            </label>
+            <label>
+              配置文件路径
+              <input id="configPath" autocomplete="off">
+            </label>
+            <div class="actions compact">
+              <button data-action="install" type="button">安装服务</button>
+              <button data-action="start" type="button">启动服务</button>
+              <button data-action="stop" type="button" class="secondary">停止服务</button>
+              <button data-action="uninstall" type="button" class="secondary">卸载服务</button>
+            </div>
+          </section>
+
+          <section>
+            <h2>证书</h2>
+            <label>
+              CA 输出目录
+              <input id="certOut" autocomplete="off">
+            </label>
+            <label>
+              CA 名称
+              <input id="caName" value="我的组网" autocomplete="off">
+            </label>
+            <div class="actions compact">
+              <button id="initCA" type="button">创建 CA</button>
+            </div>
+            <label>
+              签发节点证书
+              <input id="nodeName" placeholder="节点名称" autocomplete="off">
+            </label>
+            <div class="form-grid">
+              <label>
+                DNS SAN
+                <input id="dnsSans" autocomplete="off">
+              </label>
+              <label>
+                IP SAN
+                <input id="ipSans" autocomplete="off">
+              </label>
+            </div>
+            <label>
+              有效天数
+              <input id="certDays" value="825" inputmode="numeric">
+            </label>
+            <div class="actions compact">
+              <button id="issueCert" type="button">签发证书</button>
+            </div>
+          </section>
+        </div>
+
+        <section>
+          <h2>JSON 配置</h2>
+          <textarea id="configEditor" spellcheck="false"></textarea>
+          <div class="actions compact">
+            <button id="loadConfig" type="button">读取配置</button>
+            <button id="saveConfig" type="button" class="secondary">保存配置</button>
+          </div>
+        </section>
+
+        <section>
+          <h2>日志和详细诊断</h2>
+          <input id="rdpTarget" type="hidden" value="10.77.0.2">
+          <div class="actions compact">
+            <button id="loadLogs" type="button">读取日志</button>
+            <button id="runDiagnostics" type="button" class="secondary">开始诊断</button>
+            <button id="openRdp" type="button" class="secondary">打开远程桌面</button>
+            <button id="checkRdp" type="button" class="secondary">检查 RDP</button>
+          </div>
+          <pre id="logs"></pre>
+          <div id="diagnostics" class="checks"></div>
+        </section>
+      </details>
     </main>
 
     <div id="toast" role="status" aria-live="polite"></div>

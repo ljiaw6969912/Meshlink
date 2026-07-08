@@ -5,6 +5,7 @@ const state = {
   invite: null,
   inviteTimer: null,
   selectedDeviceKey: "",
+  selectedDevice: null,
 };
 
 function setBusy(button, busy) {
@@ -54,6 +55,14 @@ function serviceStateText(status) {
   }
 }
 
+function tunnelStatusText(status, kind) {
+  if (kind === "self") return "本机";
+  if (status === "online") return "online";
+  if (status === "offline") return "offline";
+  if (status === "disabled") return "disabled";
+  return status || "未知";
+}
+
 function actionText(action) {
   return {
     install: "安装",
@@ -95,7 +104,10 @@ async function refreshStatus() {
   const data = await api(`/api/service/status?service_name=${name}`);
   const status = data.status;
   const label = $("serviceState");
-  label.textContent = serviceStateText(status);
+  const text = serviceStateText(status);
+  label.textContent = text;
+  const copy = $("serviceStatusCopy");
+  if (copy) copy.textContent = text;
   label.className = "status";
   if (status.state === "running") label.classList.add("running");
   if (status.state === "stopped" || !status.installed) label.classList.add("stopped");
@@ -177,11 +189,14 @@ async function startServer(button) {
         server_address: $("serverAddress").value.trim(),
         listen_port: Number($("listenPort").value || 8443),
         long_lived: $("longLivedCode").checked,
+        max_uses: inviteMaxUses(),
       }),
     });
     const result = data.result;
     $("configPath").value = result.config_path;
     $("serverStatus").textContent = "配置已生成";
+    $("localVirtualIP").textContent = result.virtual_ip || "-";
+    $("serverListen").textContent = result.listen || "-";
     renderInvite(result.invite);
     if (result.invite?.server) $("serverAddress").value = result.invite.server;
     try {
@@ -220,6 +235,7 @@ async function regenerateInvite(button) {
         server: serverForInvite(),
         protocol: "tcp_tls_v1",
         long_lived: $("longLivedCode").checked,
+        max_uses: inviteMaxUses(),
         replace_existing: true,
       }),
     });
@@ -260,7 +276,8 @@ function updateInviteExpiry() {
     return;
   }
   if (invite.long_lived) {
-    label.textContent = "长期有效";
+    const maxUses = invite.max_uses || inviteMaxUses();
+    label.textContent = `长期有效，设备数限制 ${maxUses} 台。长期接入码风险较高，请妥善保管。`;
     return;
   }
   const expires = new Date(invite.expires_at);
@@ -274,6 +291,92 @@ function updateInviteExpiry() {
   label.textContent = `${String(minutes).padStart(2, "0")}:${String(seconds).padStart(2, "0")} 后过期，使用一次失效`;
 }
 
+function inviteMaxUses() {
+  const input = $("inviteMaxUses");
+  const value = Number(input?.value || 0);
+  if (!Number.isFinite(value) || value <= 0) return 3;
+  return Math.floor(value);
+}
+
+function relayMaxUses() {
+  const input = $("relayMaxUses");
+  const value = Number(input?.value || 0);
+  if (!Number.isFinite(value) || value <= 0) return 10;
+  return Math.floor(value);
+}
+
+function selfRelayRequest(acceptHostKey = false) {
+  return {
+    cloud_server_address: $("relayCloudAddress").value.trim(),
+    ssh_port: Number($("relaySSHPort").value || 22),
+    ssh_username: $("relaySSHUser").value.trim(),
+    ssh_password: $("relaySSHPassword").value,
+    ssh_private_key: $("relaySSHKey").value,
+    listen_port: Number($("relayListenPort").value || 8443),
+    public_address: $("relayPublicAddress").value.trim(),
+    long_lived: $("relayLongLivedCode").checked,
+    max_uses: relayMaxUses(),
+    accept_host_key: acceptHostKey,
+  };
+}
+
+async function checkSelfRelay(button) {
+  setBusy(button, true);
+  $("relayStatus").textContent = "正在检查";
+  try {
+    const data = await api("/api/self-relay/check", {
+      method: "POST",
+      body: JSON.stringify(selfRelayRequest(true)),
+    });
+    renderSelfRelayResult(data.result, null);
+    $("relayStatus").textContent = "检查完成";
+    toast("云服务器检查完成");
+  } catch (err) {
+    $("relayStatus").textContent = "检查失败";
+    toast(err.message, true);
+  } finally {
+    setBusy(button, false);
+  }
+}
+
+async function deploySelfRelay(button) {
+  setBusy(button, true);
+  $("relayStatus").textContent = "正在部署";
+  try {
+    const data = await api("/api/self-relay/deploy", {
+      method: "POST",
+      body: JSON.stringify(selfRelayRequest(false)),
+    });
+    renderSelfRelayResult(data.result, data.result.invite);
+    $("relayStatus").textContent = "部署完成";
+    toast("自建中继已部署，接入码已生成");
+  } catch (err) {
+    $("relayStatus").textContent = "部署失败";
+    toast(err.message, true);
+  } finally {
+    setBusy(button, false);
+  }
+}
+
+function renderSelfRelayResult(result, invite) {
+  if (!result) return;
+  $("relayRemoteService").textContent = result.service_status || "未知";
+  $("relayHostFingerprint").textContent = result.host_fingerprint || result.host_trust?.fingerprint || "-";
+  if (result.health) renderChecks(result.health, $("relayHealth"));
+  if (invite) {
+    $("relayAccessLink").value = invite.link || "";
+    $("relayAccessCode").textContent = invite.code || "------";
+    $("relayInviteExpiry").textContent = invite.long_lived ? "长期有效" : formatInviteExpiry(invite);
+  }
+}
+
+function formatInviteExpiry(invite) {
+  if (!invite?.expires_at) return "-";
+  const date = new Date(invite.expires_at);
+  if (Number.isNaN(date.getTime()) || date.getFullYear() <= 1) return "-";
+  return date.toLocaleString();
+}
+
 async function joinNetwork(button) {
   setBusy(button, true);
   $("clientStatus").textContent = "正在加入";
@@ -283,6 +386,7 @@ async function joinNetwork(button) {
       body: JSON.stringify({
         invite_link: inviteLinkForJoin(),
         code: $("inviteCode").value,
+        node_name: $("joinNodeName").value.trim(),
       }),
     });
     const result = data.result;
@@ -306,12 +410,7 @@ async function joinNetwork(button) {
 }
 
 function inviteLinkForJoin() {
-  const raw = $("inviteLink").value.trim();
-  const manualServer = $("manualServerAddress").value.trim();
-  if (!manualServer) return raw;
-  const link = new URL(raw);
-  link.searchParams.set("server", manualServer);
-  return link.toString();
+  return $("inviteLink").value.trim();
 }
 
 async function exitNetwork(button) {
@@ -333,8 +432,12 @@ async function refreshDevices() {
 function renderDevices(devices) {
   const list = $("deviceList");
   if (!devices.length) {
+    state.selectedDeviceKey = "";
+    state.selectedDevice = null;
     list.replaceChildren(emptyState("暂无节点"));
     $("deviceDetail").textContent = "服务器或客户端启动后，节点会显示在这里。";
+    if ($("deviceDisplayName")) $("deviceDisplayName").value = "";
+    setDeviceAdminEnabled(false);
     return;
   }
   list.replaceChildren(...devices.map((device) => deviceRow(device)));
@@ -349,14 +452,16 @@ function deviceRow(device) {
   row.tabIndex = 0;
 
   const dot = document.createElement("span");
-  dot.className = `dot ${device.status === "online" ? "online" : "offline"}`;
+  dot.className = `dot ${device.status === "online" ? "online" : device.status === "disabled" ? "disabled" : "offline"}`;
 
   const main = document.createElement("div");
   const title = document.createElement("strong");
-  title.textContent = `${device.node_id || "未命名节点"}${device.virtual_ip ? `  ${device.virtual_ip}` : ""}`;
+  const displayName = device.display_name || device.node_id || "未命名节点";
+  title.textContent = `${displayName}${device.virtual_ip ? `  ${device.virtual_ip}` : ""}`;
   const detail = document.createElement("small");
   const parts = [deviceStatusText(device.status, device.kind)];
   if (device.remote_addr) parts.push(`来源 ${sourceIP(device.remote_addr)}`);
+  if (device.last_seen) parts.push(`最近在线 ${formatTime(device.last_seen)}`);
   if (device.fingerprint) parts.push(device.fingerprint);
   detail.textContent = parts.join(" · ");
   main.append(title, detail);
@@ -376,13 +481,23 @@ function deviceRow(device) {
   const rdp = document.createElement("button");
   rdp.type = "button";
   rdp.textContent = "远程桌面";
-  rdp.disabled = !device.virtual_ip || device.kind === "self";
+  rdp.disabled = !device.virtual_ip || device.kind === "self" || device.status === "disabled";
   rdp.addEventListener("click", (event) => {
     event.stopPropagation();
     openRdpTarget(device.virtual_ip);
   });
 
-  actions.append(rdp, copy);
+  const diagnose = document.createElement("button");
+  diagnose.type = "button";
+  diagnose.className = "secondary";
+  diagnose.textContent = "诊断";
+  diagnose.disabled = !device.virtual_ip || device.kind === "self" || device.status === "disabled";
+  diagnose.addEventListener("click", (event) => {
+    event.stopPropagation();
+    checkRdpTarget(device);
+  });
+
+  actions.append(rdp, copy, diagnose);
   row.append(dot, main, actions);
   row.addEventListener("click", () => selectDevice(device));
   row.addEventListener("keydown", (event) => {
@@ -396,12 +511,16 @@ function deviceRow(device) {
 
 function selectDevice(device) {
   state.selectedDeviceKey = deviceKey(device);
+  state.selectedDevice = device;
   document.querySelectorAll(".device-row").forEach((row) => {
     row.classList.toggle("selected", row.dataset.key === state.selectedDeviceKey);
   });
   if (device.virtual_ip) $("rdpTarget").value = device.virtual_ip;
+  if ($("deviceDisplayName")) $("deviceDisplayName").value = device.display_name || device.node_id || "";
+  setDeviceAdminEnabled(canAdminDevice(device));
   const detail = $("deviceDetail");
   const lines = [
+    `显示名称：${device.display_name || device.node_id || "未命名节点"}`,
     `节点名称：${device.node_id || "未命名节点"}`,
     `虚拟 IP：${device.virtual_ip || "-"}`,
     `在线状态：${deviceStatusText(device.status, device.kind)}`,
@@ -410,6 +529,17 @@ function selectDevice(device) {
     `证书指纹：${device.fingerprint || "-"}`,
   ];
   detail.textContent = lines.join("\n");
+}
+
+function canAdminDevice(device) {
+  return !!device && device.kind === "peer" && !!device.node_id;
+}
+
+function setDeviceAdminEnabled(enabled) {
+  for (const id of ["deviceDisplayName", "renameDevice", "disableDevice", "removeDevice"]) {
+    const el = $(id);
+    if (el) el.disabled = !enabled;
+  }
 }
 
 function deviceKey(device) {
@@ -451,8 +581,70 @@ async function openRdpTarget(target) {
 }
 
 async function checkRdpTarget(target) {
-  $("rdpTarget").value = target;
+  const device = typeof target === "object" ? target : { virtual_ip: target };
+  if (device.node_id || device.virtual_ip) selectDevice(device);
+  $("rdpTarget").value = device.virtual_ip || "";
   await checkRdp($("checkRdp"));
+}
+
+async function renameSelectedDevice(button) {
+  const device = selectedDevice();
+  if (!canAdminDevice(device)) return toast("请选择远端设备", true);
+  const displayName = $("deviceDisplayName").value.trim();
+  if (!displayName) return toast("请输入设备显示名称", true);
+  setBusy(button, true);
+  try {
+    await api("/api/onboarding/device/rename", {
+      method: "POST",
+      body: JSON.stringify({ node_id: device.node_id, display_name: displayName }),
+    });
+    toast("设备已重命名");
+    await refreshDevices();
+  } catch (err) {
+    toast(err.message, true);
+  } finally {
+    setBusy(button, false);
+  }
+}
+
+async function disableSelectedDevice(button) {
+  const device = selectedDevice();
+  if (!canAdminDevice(device)) return toast("请选择远端设备", true);
+  if (!window.confirm(`禁用设备 ${device.display_name || device.node_id}？该设备将不能重新连接。`)) return;
+  setBusy(button, true);
+  try {
+    await api("/api/onboarding/device/disable", {
+      method: "POST",
+      body: JSON.stringify({ node_id: device.node_id }),
+    });
+    toast("设备已禁用");
+    await refreshDevices();
+  } catch (err) {
+    toast(err.message, true);
+  } finally {
+    setBusy(button, false);
+  }
+}
+
+async function removeSelectedDevice(button) {
+  const device = selectedDevice();
+  if (!canAdminDevice(device)) return toast("请选择远端设备", true);
+  if (!window.confirm(`移除设备 ${device.display_name || device.node_id}？它将不再作为正常设备显示。`)) return;
+  setBusy(button, true);
+  try {
+    await api("/api/onboarding/device/remove", {
+      method: "POST",
+      body: JSON.stringify({ node_id: device.node_id }),
+    });
+    toast("设备已移除");
+    state.selectedDeviceKey = "";
+    state.selectedDevice = null;
+    await refreshDevices();
+  } catch (err) {
+    toast(err.message, true);
+  } finally {
+    setBusy(button, false);
+  }
 }
 
 async function initCA(button) {
@@ -568,10 +760,17 @@ async function openRdp(button) {
 async function checkRdp(button) {
   setBusy(button, true);
   try {
-    const params = new URLSearchParams({ target: $("rdpTarget").value });
+    const selected = selectedDevice();
+    const params = new URLSearchParams({
+      target: $("rdpTarget").value,
+      target_device: selected?.node_id || "",
+      tunnel_status: selected ? tunnelStatusText(selected.status, selected.kind) : "",
+    });
     const data = await api(`/api/diagnostics/rdp?${params}`);
     const diagnostics = $("diagnostics");
+    const rdpDiagnostics = $("rdpDiagnostics");
     if (diagnostics) renderChecks([data.check], diagnostics);
+    if (rdpDiagnostics) renderChecks([data.check], rdpDiagnostics);
     toast(data.check.status === "ok" ? "RDP 可达" : "RDP 不可达", data.check.status !== "ok");
   } catch (err) {
     toast(err.message, true);
@@ -626,7 +825,11 @@ function renderChecks(checks, container) {
 
 function showView(id) {
   document.querySelectorAll(".view").forEach((view) => view.classList.toggle("active", view.id === id));
-  document.querySelectorAll(".mode").forEach((button) => button.classList.toggle("active", button.dataset.view === id));
+  document.querySelectorAll(".entry-card").forEach((button) => button.classList.toggle("active", button.dataset.view === id));
+}
+
+function selectedDevice() {
+  return state.selectedDevice;
 }
 
 function bindClick(id, handler) {
@@ -643,7 +846,7 @@ document.addEventListener("click", (event) => {
   }
 });
 
-document.querySelectorAll(".mode").forEach((button) => {
+document.querySelectorAll(".entry-card").forEach((button) => {
   button.addEventListener("click", () => showView(button.dataset.view));
 });
 
@@ -651,11 +854,18 @@ bindClick("refreshStatus", () => refreshStatus().catch((err) => toast(err.messag
 bindClick("startServer", (event) => startServer(event.currentTarget));
 bindClick("stopServer", (event) => stopServer(event.currentTarget));
 bindClick("regenerateInvite", (event) => regenerateInvite(event.currentTarget));
+bindClick("checkSelfRelay", (event) => checkSelfRelay(event.currentTarget));
+bindClick("deploySelfRelay", (event) => deploySelfRelay(event.currentTarget));
 bindClick("joinNetwork", (event) => joinNetwork(event.currentTarget));
 bindClick("exitNetwork", (event) => exitNetwork(event.currentTarget));
 bindClick("refreshDevices", () => refreshDevices().catch((err) => toast(err.message, true)));
+bindClick("renameDevice", (event) => renameSelectedDevice(event.currentTarget));
+bindClick("disableDevice", (event) => disableSelectedDevice(event.currentTarget));
+bindClick("removeDevice", (event) => removeSelectedDevice(event.currentTarget));
 bindClick("copyInviteLink", () => copyText($("accessLink").value));
 bindClick("copyInviteCode", () => copyText($("accessCode").textContent));
+bindClick("copyRelayInviteLink", () => copyText($("relayAccessLink").value));
+bindClick("copyRelayInviteCode", () => copyText($("relayAccessCode").textContent));
 bindClick("initCA", (event) => initCA(event.currentTarget));
 bindClick("issueCert", (event) => issueCert(event.currentTarget));
 bindClick("loadConfig", (event) => loadConfig(event.currentTarget));

@@ -18,6 +18,7 @@ type DeviceList struct {
 type DeviceSummary struct {
 	Kind        string    `json:"kind"`
 	NodeID      string    `json:"node_id"`
+	DisplayName string    `json:"display_name,omitempty"`
 	Status      string    `json:"status"`
 	VirtualIP   string    `json:"virtual_ip,omitempty"`
 	RemoteAddr  string    `json:"remote_addr,omitempty"`
@@ -33,7 +34,7 @@ func (m Manager) Devices(serviceName string) (DeviceList, error) {
 		if err := json.Unmarshal(b, &status); err != nil {
 			return DeviceList{}, err
 		}
-		return deviceListFromRuntime(status), nil
+		return m.deviceListFromRuntime(status)
 	}
 	return m.devicesFromRegistry()
 }
@@ -69,7 +70,12 @@ type peerStatus struct {
 	DisconnectedAt *time.Time `json:"disconnected_at,omitempty"`
 }
 
-func deviceListFromRuntime(status runtimeStatus) DeviceList {
+func (m Manager) deviceListFromRuntime(status runtimeStatus) (DeviceList, error) {
+	registry, err := m.loadDeviceRegistry()
+	if err != nil {
+		return DeviceList{}, err
+	}
+	policies := registryPolicies(registry)
 	nodes := []DeviceSummary{
 		{
 			Kind:        "self",
@@ -82,10 +88,23 @@ func deviceListFromRuntime(status runtimeStatus) DeviceList {
 		},
 	}
 	for _, peer := range status.Peers {
+		policy := policies.find(peer.NodeID, peer.Fingerprint)
+		if policy != nil && policy.DeletedAt != nil {
+			continue
+		}
+		peerStatus := peerStatusText(peer)
+		displayName := ""
+		if policy != nil {
+			displayName = policy.DisplayName
+			if policy.Disabled {
+				peerStatus = "disabled"
+			}
+		}
 		nodes = append(nodes, DeviceSummary{
 			Kind:        "peer",
 			NodeID:      peer.NodeID,
-			Status:      peerStatusText(peer),
+			DisplayName: displayName,
+			Status:      peerStatus,
 			VirtualIP:   peer.VirtualIP,
 			RemoteAddr:  peer.RemoteAddr,
 			Fingerprint: peer.Fingerprint,
@@ -93,7 +112,7 @@ func deviceListFromRuntime(status runtimeStatus) DeviceList {
 			LastSeen:    peer.LastSeen,
 		})
 	}
-	return DeviceList{UpdatedAt: status.UpdatedAt, Nodes: nodes}
+	return DeviceList{UpdatedAt: status.UpdatedAt, Nodes: nodes}, nil
 }
 
 func (m Manager) devicesFromRegistry() (DeviceList, error) {
@@ -111,6 +130,9 @@ func (m Manager) devicesFromRegistry() (DeviceList, error) {
 		return DeviceList{}, err
 	}
 	for _, node := range registry.Nodes {
+		if node.DeletedAt != nil {
+			continue
+		}
 		status := node.Status
 		if status == "" {
 			status = "offline"
@@ -121,6 +143,7 @@ func (m Manager) devicesFromRegistry() (DeviceList, error) {
 		nodes = append(nodes, DeviceSummary{
 			Kind:        "peer",
 			NodeID:      node.NodeID,
+			DisplayName: node.DisplayName,
 			Status:      status,
 			VirtualIP:   node.VirtualIP,
 			RemoteAddr:  node.SourceAddr,
@@ -143,6 +166,40 @@ func peerStatusText(peer peerStatus) string {
 		return "online"
 	}
 	return peer.Status
+}
+
+type registryPolicyIndex struct {
+	byNode        map[string]*RegisteredNode
+	byFingerprint map[string]*RegisteredNode
+}
+
+func registryPolicies(registry DeviceRegistry) registryPolicyIndex {
+	index := registryPolicyIndex{
+		byNode:        make(map[string]*RegisteredNode),
+		byFingerprint: make(map[string]*RegisteredNode),
+	}
+	for i := range registry.Nodes {
+		node := &registry.Nodes[i]
+		if node.NodeID != "" {
+			index.byNode[strings.ToLower(node.NodeID)] = node
+		}
+		if node.CertFingerprint != "" {
+			index.byFingerprint[strings.ToLower(node.CertFingerprint)] = node
+		}
+	}
+	return index
+}
+
+func (i registryPolicyIndex) find(nodeID, fingerprint string) *RegisteredNode {
+	if nodeID != "" {
+		if node := i.byNode[strings.ToLower(nodeID)]; node != nil {
+			return node
+		}
+	}
+	if fingerprint != "" {
+		return i.byFingerprint[strings.ToLower(fingerprint)]
+	}
+	return nil
 }
 
 func statusPath(configPath, serviceName string) string {

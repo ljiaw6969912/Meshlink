@@ -7,6 +7,7 @@ import (
 	"net"
 	"net/netip"
 	"os"
+	"strings"
 )
 
 type Config struct {
@@ -107,7 +108,7 @@ func (c *Config) Validate() error {
 		return err
 	}
 	for _, route := range c.Routes {
-		if _, err := parseIPv4Prefix("route", route.CIDR); err != nil {
+		if _, err := validatePrivateMeshRoute("route", route.CIDR); err != nil {
 			return err
 		}
 	}
@@ -131,12 +132,12 @@ func (c *Config) Validate() error {
 			}
 		}
 		for _, route := range c.Setup.Routes {
-			if _, err := parseIPv4Prefix("setup route", route.CIDR); err != nil {
+			if _, err := validatePrivateMeshRoute("setup route", route.CIDR); err != nil {
 				return err
 			}
 		}
 		if c.Setup.NAT.Enabled && c.Setup.NAT.InternalPrefix != "" {
-			if _, err := parseIPv4Prefix("setup.nat.internal_prefix", c.Setup.NAT.InternalPrefix); err != nil {
+			if _, err := validatePrivateMeshRoute("setup.nat.internal_prefix", c.Setup.NAT.InternalPrefix); err != nil {
 				return err
 			}
 		}
@@ -204,6 +205,39 @@ func parseIPv4Prefix(name, raw string) (netip.Prefix, error) {
 		return netip.Prefix{}, fmt.Errorf("%s must be IPv4, got %q", name, raw)
 	}
 	return prefix, nil
+}
+
+func validatePrivateMeshRoute(name, raw string) (netip.Prefix, error) {
+	trimmed := strings.TrimSpace(raw)
+	if trimmed == "0.0.0.0/0" || trimmed == "::/0" {
+		return netip.Prefix{}, routeBoundaryError(name, raw)
+	}
+	prefix, err := parseIPv4Prefix(name, raw)
+	if err != nil {
+		return netip.Prefix{}, err
+	}
+	prefix = prefix.Masked()
+	if prefix.Bits() == 0 || !isAllowedPrivateRoute(prefix) {
+		return netip.Prefix{}, routeBoundaryError(name, raw)
+	}
+	return prefix, nil
+}
+
+func routeBoundaryError(name, raw string) error {
+	return fmt.Errorf("%s %q is not allowed: Meshlink 不做全局代理或公网出口，只允许私有远程桌面组网使用的 RFC1918 内网路由", name, raw)
+}
+
+func isAllowedPrivateRoute(prefix netip.Prefix) bool {
+	for _, allowed := range []netip.Prefix{
+		netip.MustParsePrefix("10.0.0.0/8"),
+		netip.MustParsePrefix("172.16.0.0/12"),
+		netip.MustParsePrefix("192.168.0.0/16"),
+	} {
+		if allowed.Contains(prefix.Addr()) && prefix.Bits() >= allowed.Bits() {
+			return true
+		}
+	}
+	return false
 }
 
 func validateIPv4Endpoint(name, endpoint string, allowEmptyHost bool) error {

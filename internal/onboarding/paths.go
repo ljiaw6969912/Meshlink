@@ -6,14 +6,17 @@ import (
 	"os"
 	"path/filepath"
 	"time"
+
+	"meshlink/internal/deployssh"
 )
 
 type Manager struct {
-	BaseDir     string
-	Now         func() time.Time
-	HTTPClient  *http.Client
-	LocalIPv4   func() (string, error)
-	ResolveHost func(string) ([]net.IP, error)
+	BaseDir           string
+	Now               func() time.Time
+	HTTPClient        *http.Client
+	LocalIPv4         func() (string, error)
+	ResolveHost       func(string) ([]net.IP, error)
+	SelfRelayDeployer deployssh.Deployer
 }
 
 func (m Manager) baseDir() string {

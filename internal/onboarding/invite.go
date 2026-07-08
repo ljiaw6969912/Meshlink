@@ -18,6 +18,7 @@ import (
 const (
 	defaultInviteTTL         = 10 * time.Minute
 	defaultInviteMaxUses     = 1
+	defaultLongLivedMaxUses  = 3
 	defaultInviteMaxFailures = 5
 )
 
@@ -38,6 +39,8 @@ type CreateInviteResult struct {
 	Link      string    `json:"link"`
 	ExpiresAt time.Time `json:"expires_at"`
 	LongLived bool      `json:"long_lived,omitempty"`
+	Uses      int       `json:"uses,omitempty"`
+	MaxUses   int       `json:"max_uses"`
 }
 
 type InviteLink struct {
@@ -79,6 +82,9 @@ func (m Manager) CreateInvite(req CreateInviteRequest) (CreateInviteResult, erro
 	}
 	if req.LongLived {
 		req.TTL = 0
+		if req.MaxUses <= 0 {
+			req.MaxUses = defaultLongLivedMaxUses
+		}
 	} else if req.TTL <= 0 {
 		req.TTL = defaultInviteTTL
 	}
@@ -120,6 +126,15 @@ func (m Manager) CreateInvite(req CreateInviteRequest) (CreateInviteResult, erro
 	if err := m.saveInviteStore(store); err != nil {
 		return CreateInviteResult{}, err
 	}
+	if err := m.writeAudit("invite_created", map[string]any{
+		"server":     invite.Server,
+		"protocol":   invite.Protocol,
+		"long_lived": invite.LongLived,
+		"max_uses":   invite.MaxUses,
+		"expires_at": invite.ExpiresAt,
+	}); err != nil {
+		return CreateInviteResult{}, err
+	}
 	return CreateInviteResult{
 		Token:     token,
 		Code:      code,
@@ -128,6 +143,8 @@ func (m Manager) CreateInvite(req CreateInviteRequest) (CreateInviteResult, erro
 		Link:      buildInviteLink(req.Server, req.Protocol, token),
 		ExpiresAt: invite.ExpiresAt,
 		LongLived: invite.LongLived,
+		Uses:      invite.Uses,
+		MaxUses:   invite.MaxUses,
 	}, nil
 }
 
@@ -152,6 +169,8 @@ func (m Manager) LatestInvite() (CreateInviteResult, bool, error) {
 		Link:      buildInviteLink(latest.Server, protocol, latest.Token),
 		ExpiresAt: latest.ExpiresAt,
 		LongLived: latest.LongLived,
+		Uses:      latest.Uses,
+		MaxUses:   latest.MaxUses,
 	}, true, nil
 }
 

@@ -40,11 +40,18 @@ if (Test-Path $releaseZipPath) {
 }
 
 New-Item -ItemType Directory -Force -Path (Join-Path $packageDir "bin") | Out-Null
+New-Item -ItemType Directory -Force -Path (Join-Path $packageDir "bin\linux") | Out-Null
 New-Item -ItemType Directory -Force -Path (Join-Path $packageDir "configs") | Out-Null
+New-Item -ItemType Directory -Force -Path (Join-Path $packageDir "scripts") | Out-Null
+New-Item -ItemType Directory -Force -Path (Join-Path $packageDir "docs\ops") | Out-Null
 
 Copy-Item -LiteralPath (Join-Path $root "bin\mesh-agent.exe") -Destination (Join-Path $packageDir "bin\mesh-agent.exe")
 Copy-Item -LiteralPath (Join-Path $root "bin\mesh-desktop.exe") -Destination (Join-Path $packageDir "bin\mesh-desktop.exe")
 Copy-Item -LiteralPath (Join-Path $root "bin\meshctl.exe") -Destination (Join-Path $packageDir "bin\meshctl.exe")
+$linuxAgentPath = Join-Path $root "bin\linux\mesh-agent"
+if (Test-Path $linuxAgentPath) {
+  Copy-Item -LiteralPath $linuxAgentPath -Destination (Join-Path $packageDir "bin\linux\mesh-agent")
+}
 $updateServerPath = Join-Path $root "bin\mesh-update-server.exe"
 if (Test-Path $updateServerPath) {
   Copy-Item -LiteralPath $updateServerPath -Destination (Join-Path $packageDir "bin\mesh-update-server.exe")
@@ -73,6 +80,22 @@ if (Test-Path $repairScript) {
 $publishUpdateScript = Join-Path $root "publish-update.bat"
 if (Test-Path $publishUpdateScript) {
   Copy-Item -LiteralPath $publishUpdateScript -Destination (Join-Path $packageDir "publish-update.bat")
+}
+$buildLinuxAgentScript = Join-Path $root "scripts\build-linux-agent.ps1"
+if (Test-Path $buildLinuxAgentScript) {
+  Copy-Item -LiteralPath $buildLinuxAgentScript -Destination (Join-Path $packageDir "scripts\build-linux-agent.ps1")
+}
+$selfRelayE2EScript = Join-Path $root "scripts\e2e-self-relay.ps1"
+if (Test-Path $selfRelayE2EScript) {
+  Copy-Item -LiteralPath $selfRelayE2EScript -Destination (Join-Path $packageDir "scripts\e2e-self-relay.ps1")
+}
+$linuxSystemdScript = Join-Path $root "internal\deployssh\scripts\linux-systemd.sh"
+if (Test-Path $linuxSystemdScript) {
+  Copy-Item -LiteralPath $linuxSystemdScript -Destination (Join-Path $packageDir "scripts\linux-systemd.sh")
+}
+$selfRelayRunbook = Join-Path $root "docs\ops\self-hosted-relay-runbook.zh-CN.md"
+if (Test-Path $selfRelayRunbook) {
+  Copy-Item -LiteralPath $selfRelayRunbook -Destination (Join-Path $packageDir "docs\ops\self-hosted-relay-runbook.zh-CN.md")
 }
 
 Compress-Archive -LiteralPath $packageDir -DestinationPath $zipPath

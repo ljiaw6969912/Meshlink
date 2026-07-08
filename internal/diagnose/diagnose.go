@@ -6,6 +6,7 @@ import (
 	"net"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"time"
 
@@ -25,6 +26,13 @@ type Check struct {
 	Name   string `json:"name"`
 	Status Status `json:"status"`
 	Detail string `json:"detail"`
+}
+
+type RDPCheckRequest struct {
+	Target       string `json:"target"`
+	TargetDevice string `json:"target_device,omitempty"`
+	TunnelStatus string `json:"tunnel_status,omitempty"`
+	Port         int    `json:"port,omitempty"`
 }
 
 type Summary struct {
@@ -121,28 +129,72 @@ func Run(configPath, serviceName string) Report {
 }
 
 func CheckRDP(target string) Check {
-	target = strings.TrimSpace(target)
-	if target == "" {
-		return Check{Name: "RDP 目标", Status: Fail, Detail: "需要目标地址"}
-	}
-	host, port, err := net.SplitHostPort(target)
-	if err != nil {
-		host = target
-		port = "3389"
-	}
+	return CheckRDPTarget(RDPCheckRequest{Target: target})
+}
+
+func CheckRDPTarget(req RDPCheckRequest) Check {
+	target := strings.TrimSpace(req.Target)
+	host, port := rdpHostPort(target, req.Port)
 	if host == "" {
-		return Check{Name: "RDP 目标", Status: Fail, Detail: "目标地址无效"}
+		return Check{
+			Name:   "远程桌面目标",
+			Status: Fail,
+			Detail: rdpDetail("未选择目标设备。", req, "-", port, "请先在设备列表中选择一台远程设备。"),
+		}
 	}
-	addr := net.JoinHostPort(host, port)
+	addr := net.JoinHostPort(host, strconv.Itoa(port))
 	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
 	defer cancel()
 	var dialer net.Dialer
 	conn, err := dialer.DialContext(ctx, "tcp4", addr)
 	if err != nil {
-		return Check{Name: "RDP TCP " + addr, Status: Fail, Detail: "无法连接；请确认远程桌面已开启、目标地址正确、隧道和防火墙可达"}
+		return Check{
+			Name:   "远程桌面可达性",
+			Status: Fail,
+			Detail: rdpDetail("无法连接到目标设备的远程桌面。", req, host, port, "请在目标 Windows 设备开启 Windows 远程桌面，并确认该设备在线、Meshlink 服务运行、防火墙允许 RDP 端口。"),
+		}
 	}
 	_ = conn.Close()
-	return Check{Name: "RDP TCP " + addr, Status: OK, Detail: "可达"}
+	return Check{
+		Name:   "远程桌面可达性",
+		Status: OK,
+		Detail: rdpDetail("目标设备的远程桌面端口可达。", req, host, port, "可以直接打开远程桌面。"),
+	}
+}
+
+func rdpHostPort(target string, defaultPort int) (string, int) {
+	if defaultPort <= 0 {
+		defaultPort = 3389
+	}
+	if target == "" {
+		return "", defaultPort
+	}
+	host, rawPort, err := net.SplitHostPort(target)
+	if err != nil {
+		return strings.Trim(target, "[]"), defaultPort
+	}
+	port, err := strconv.Atoi(rawPort)
+	if err != nil || port <= 0 || port > 65535 {
+		port = defaultPort
+	}
+	return strings.Trim(host, "[]"), port
+}
+
+func rdpDetail(problem string, req RDPCheckRequest, host string, port int, suggestion string) string {
+	device := strings.TrimSpace(req.TargetDevice)
+	if device == "" {
+		device = "未选择"
+	}
+	tunnel := strings.TrimSpace(req.TunnelStatus)
+	if tunnel == "" {
+		tunnel = "未知"
+	}
+	return "发现的问题：" + problem +
+		"\r\n隧道状态：" + tunnel +
+		"\r\n目标设备：" + device +
+		"\r\n目标 IP：" + host +
+		"\r\nRDP 端口：" + strconv.Itoa(port) +
+		"\r\n处理建议：" + suggestion
 }
 
 func (r *Report) checkFile(name, path string) {

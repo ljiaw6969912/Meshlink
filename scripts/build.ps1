@@ -23,6 +23,7 @@ go build -ldflags "$versionFlags" -o .\bin\mesh-agent.exe .\cmd\mesh-agent
 go build -ldflags "$versionFlags" -o .\bin\meshctl.exe .\cmd\meshctl
 go build -ldflags "$versionFlags" -o .\bin\mesh-update-server.exe .\cmd\mesh-update-server
 go build -ldflags "-H windowsgui $versionFlags" -o .\bin\mesh-desktop.exe .\cmd\mesh-desktop
+powershell -ExecutionPolicy Bypass -File .\scripts\build-linux-agent.ps1
 
 if ($Package) {
   powershell -ExecutionPolicy Bypass -File .\scripts\package.ps1

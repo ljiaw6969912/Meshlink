@@ -128,6 +128,96 @@ func TestValidateRejectsIPv6Route(t *testing.T) {
 	}
 }
 
+func TestValidateRejectsFullTunnelRoutesWithProductBoundary(t *testing.T) {
+	tests := []struct {
+		name   string
+		routes []Route
+		setup  []Route
+	}{
+		{name: "top-level IPv4 full tunnel", routes: []Route{{CIDR: "0.0.0.0/0"}}},
+		{name: "setup IPv4 full tunnel", setup: []Route{{CIDR: "0.0.0.0/0"}}},
+		{name: "top-level IPv6 full tunnel", routes: []Route{{CIDR: "::/0"}}},
+		{name: "setup IPv6 full tunnel", setup: []Route{{CIDR: "::/0"}}},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			cfg := baseConfig()
+			cfg.Routes = tt.routes
+			cfg.Setup = SetupConfig{
+				Enabled: true,
+				Address: "10.77.0.2/24",
+				Routes:  tt.setup,
+			}
+			err := cfg.Validate()
+			if err == nil {
+				t.Fatal("expected full tunnel route to be rejected")
+			}
+			if got := err.Error(); !containsAll(got, []string{"Meshlink", "全局代理", "公网出口"}) {
+				t.Fatalf("error = %q, want product boundary explanation", got)
+			}
+		})
+	}
+}
+
+func TestValidateRejectsPublicEgressRoutes(t *testing.T) {
+	tests := []struct {
+		name   string
+		routes []Route
+		setup  []Route
+	}{
+		{name: "top-level public route", routes: []Route{{CIDR: "8.8.8.0/24"}}},
+		{name: "setup public route", setup: []Route{{CIDR: "1.1.1.0/24"}}},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			cfg := baseConfig()
+			cfg.Routes = tt.routes
+			cfg.Setup = SetupConfig{
+				Enabled: true,
+				Address: "10.77.0.2/24",
+				Routes:  tt.setup,
+			}
+			err := cfg.Validate()
+			if err == nil {
+				t.Fatal("expected public egress route to be rejected")
+			}
+			if got := err.Error(); !containsAll(got, []string{"Meshlink", "公网出口"}) {
+				t.Fatalf("error = %q, want public egress explanation", got)
+			}
+		})
+	}
+}
+
+func TestValidateAllowsMeshAndRFC1918Routes(t *testing.T) {
+	for _, cidr := range []string{"10.77.0.0/24", "10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16"} {
+		t.Run(cidr, func(t *testing.T) {
+			cfg := baseConfig()
+			cfg.Routes = []Route{{CIDR: cidr}}
+			cfg.Setup = SetupConfig{
+				Enabled: true,
+				Address: "10.77.0.2/24",
+				Routes:  []Route{{CIDR: cidr}},
+			}
+			if err := cfg.Validate(); err != nil {
+				t.Fatalf("Validate() rejected private route %s: %v", cidr, err)
+			}
+		})
+	}
+}
+
+func containsAll(s string, parts []string) bool {
+	for _, part := range parts {
+		if !contains(s, part) {
+			return false
+		}
+	}
+	return true
+}
+
+func contains(s, part string) bool {
+	return len(part) == 0 || (len(s) >= len(part) && (s == part || contains(s[1:], part) || s[:len(part)] == part))
+}
+
 func baseConfig() Config {
 	return Config{
 		NodeID:    "node-a",

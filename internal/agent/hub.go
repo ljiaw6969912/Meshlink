@@ -160,6 +160,12 @@ func (a *Agent) handleHubConn(ctx context.Context, rt *router, conn net.Conn) {
 		_ = conn.Close()
 		return
 	}
+	commonName, fingerprint := certInfoFromTLS(buffered)
+	if rejected, reason := a.rejectPeerByRegistry(commonName, fingerprint, conn.RemoteAddr().String()); rejected {
+		a.log.Warn("rejecting mesh connection from disabled or removed device", "remote", conn.RemoteAddr(), "node_id", commonName, "fingerprint", fingerprint, "reason", reason)
+		_ = conn.Close()
+		return
+	}
 	a.handlePeer(ctx, rt, buffered)
 }
 
@@ -206,6 +212,10 @@ func (a *Agent) handlePeer(ctx context.Context, rt *router, conn net.Conn) {
 		routes = append(routes, prefix)
 	}
 	commonName, fingerprint := certInfoFromTLS(conn)
+	if rejected, reason := a.rejectPeerByRegistry(hello.NodeID, fingerprint, conn.RemoteAddr().String()); rejected {
+		a.log.Warn("rejecting peer after hello because device is disabled or removed", "remote", conn.RemoteAddr(), "node_id", hello.NodeID, "fingerprint", fingerprint, "reason", reason)
+		return
+	}
 	connectedAt := time.Now()
 
 	p := &peer{
@@ -348,6 +358,25 @@ func hasVerifiedClientCertificate(conn net.Conn) bool {
 	}
 	state := stateProvider.ConnectionState()
 	return len(state.VerifiedChains) > 0
+}
+
+func (a *Agent) rejectPeerByRegistry(nodeID, fingerprint, remoteAddr string) (bool, string) {
+	manager := onboarding.Manager{BaseDir: a.baseDir}
+	rejection, rejected, err := manager.DeviceRejection(nodeID, fingerprint)
+	if err != nil {
+		if a.log != nil {
+			a.log.Warn("failed to check device registry for peer admission", "remote", remoteAddr, "node_id", nodeID, "fingerprint", fingerprint, "err", err)
+		}
+		return true, "device registry unavailable"
+	}
+	if !rejected {
+		return false, ""
+	}
+	reason := rejection.Reason
+	if err := manager.RecordCertificateRejected(rejection.NodeID, rejection.Fingerprint, remoteAddr, reason); err != nil && a.log != nil {
+		a.log.Warn("failed to write certificate rejection audit", "remote", remoteAddr, "node_id", nodeID, "fingerprint", fingerprint, "reason", reason, "err", err)
+	}
+	return true, reason
 }
 
 func (a *Agent) handlePeerFrame(rt *router, p *peer, frame proto.Frame) error {

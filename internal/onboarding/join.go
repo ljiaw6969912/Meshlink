@@ -97,7 +97,7 @@ func (m Manager) JoinSpoke(req JoinSpokeRequest) (JoinSpokeResult, error) {
 		if msg == "" {
 			msg = res.Status
 		}
-		return JoinSpokeResult{}, fmt.Errorf("enroll request failed: %s", msg)
+		return JoinSpokeResult{}, friendlyEnrollError(msg)
 	}
 	var enroll EnrollHTTPResponse
 	if err := json.Unmarshal(resBody, &enroll); err != nil {
@@ -107,7 +107,7 @@ func (m Manager) JoinSpoke(req JoinSpokeRequest) (JoinSpokeResult, error) {
 		if enroll.Error == "" {
 			enroll.Error = "enroll request failed"
 		}
-		return JoinSpokeResult{}, errors.New(enroll.Error)
+		return JoinSpokeResult{}, friendlyEnrollError(enroll.Error)
 	}
 	if enroll.CAPEM == "" || enroll.CertPEM == "" {
 		return JoinSpokeResult{}, fmt.Errorf("enroll response missing certificate material")
@@ -131,6 +131,29 @@ func (m Manager) JoinSpoke(req JoinSpokeRequest) (JoinSpokeResult, error) {
 		Server:     invite.Server,
 		Protocol:   invite.Protocol,
 	}, nil
+}
+
+func friendlyEnrollError(msg string) error {
+	raw := strings.TrimSpace(msg)
+	normalized := strings.ToLower(raw)
+	switch {
+	case strings.Contains(normalized, "verification code is incorrect"):
+		return errors.New("接入码不正确。请重新输入服务器显示的 6 位接入码，注意不要混入空格。")
+	case strings.Contains(normalized, "invite has expired"):
+		return errors.New("接入链接已过期。请在服务器设备上重新生成接入链接和 6 位接入码。")
+	case strings.Contains(normalized, "invite has already been used"):
+		return errors.New("接入链接已被使用。一次性接入链接只能加入一台设备，请在服务器设备上重新生成。")
+	case strings.Contains(normalized, "invite device limit has been reached"):
+		return errors.New("设备数量已达到上限。请让服务器管理员生成新的接入链接，或改用允许更多设备的接入码。")
+	case strings.Contains(normalized, "invite token was not found"):
+		return errors.New("接入链接无效。请从服务器设备重新复制完整接入链接，不要只复制其中一部分。")
+	case strings.Contains(normalized, "invite has been invalidated"):
+		return errors.New("接入码错误次数过多，当前接入链接已失效。请在服务器设备上重新生成接入链接和接入码。")
+	case raw == "":
+		return errors.New("加入网络失败。服务器没有返回具体原因，请确认接入链接和接入码后重试。")
+	default:
+		return fmt.Errorf("加入网络失败：%s", raw)
+	}
 }
 
 func bootstrapHTTPClient() *http.Client {

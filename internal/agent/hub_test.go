@@ -2,13 +2,18 @@ package agent
 
 import (
 	"bufio"
+	"encoding/json"
 	"io"
 	"log/slog"
 	"net"
 	"net/netip"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
+
+	"meshlink/internal/onboarding"
 )
 
 func testPeer(t *testing.T, id, ip string) (*peer, func()) {
@@ -96,4 +101,46 @@ func TestServeEnrollHTTPKeepsSingleConnectionOpenForRequest(t *testing.T) {
 		t.Fatalf("status = %q, want 200 OK", status)
 	}
 	<-done
+}
+
+func TestHubRejectsDisabledPeerByRegistryAndAudits(t *testing.T) {
+	dir := t.TempDir()
+	fingerprint := "SHA256:AA:BB:CC"
+	registry := onboarding.DeviceRegistry{
+		Nodes: []onboarding.RegisteredNode{
+			{
+				NodeID:          "laptop",
+				VirtualIP:       "10.77.0.2",
+				CertFingerprint: fingerprint,
+				Disabled:        true,
+			},
+		},
+	}
+	if err := os.MkdirAll(filepath.Join(dir, "configs"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	b, err := json.Marshal(registry)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, "configs", "devices.json"), b, 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	agent := &Agent{
+		baseDir: dir,
+		log:     slog.New(slog.NewTextHandler(io.Discard, nil)),
+	}
+	rejected, reason := agent.rejectPeerByRegistry("laptop", fingerprint, "203.0.113.10:55123")
+	if !rejected || !strings.Contains(reason, "device disabled") {
+		t.Fatalf("rejectPeerByRegistry rejected=%v reason=%q, want disabled rejection", rejected, reason)
+	}
+
+	audit, err := os.ReadFile(filepath.Join(dir, "logs", "audit.jsonl"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(audit), `"event":"certificate_rejected"`) || !strings.Contains(string(audit), `"reason":"device disabled"`) {
+		t.Fatalf("audit log = %s, want certificate_rejected device disabled", string(audit))
+	}
 }

@@ -36,6 +36,7 @@ type StartServerRequest struct {
 	ServerAddress string `json:"server_address"`
 	ListenPort    int    `json:"listen_port"`
 	LongLived     bool   `json:"long_lived,omitempty"`
+	MaxUses       int    `json:"max_uses,omitempty"`
 }
 
 type StartServerResult struct {
@@ -61,6 +62,7 @@ func (m Manager) StartServerMode(req StartServerRequest) (StartServerResult, err
 		Server:          server,
 		Protocol:        hubReq.Protocol,
 		LongLived:       req.LongLived,
+		MaxUses:         req.MaxUses,
 		ReplaceExisting: true,
 	})
 	if err != nil {

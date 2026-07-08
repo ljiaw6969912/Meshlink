@@ -24,6 +24,7 @@ import (
 	meshagent "meshlink/internal/agent"
 	"meshlink/internal/certutil"
 	"meshlink/internal/config"
+	"meshlink/internal/deployssh"
 	"meshlink/internal/diagnose"
 	"meshlink/internal/onboarding"
 	"meshlink/internal/rdp"
@@ -44,6 +45,7 @@ type desktopApp struct {
 	inviteServer  *walk.LineEdit
 	inviteLink    *walk.LineEdit
 	inviteCode    *walk.LineEdit
+	inviteMaxUses *walk.LineEdit
 	longLivedCode *walk.CheckBox
 	spokeNodeName *walk.LineEdit
 	certOut       *walk.LineEdit
@@ -83,6 +85,7 @@ type meshNode struct {
 	Kind           string
 	Online         bool
 	NodeID         string
+	DisplayName    string
 	Mode           string
 	VirtualIP      string
 	Listen         string
@@ -119,7 +122,7 @@ func (m *meshNodeModel) Value(index int) interface{} {
 	} else if node.Online {
 		status = "在线"
 	}
-	text := status + "  " + node.NodeID
+	text := status + "  " + nodeTitle(node)
 	if node.VirtualIP != "" {
 		text += "  " + node.VirtualIP
 	}
@@ -185,7 +188,7 @@ func (s *meshListStyler) StyleItem(style *walk.ListItemStyle) {
 
 	textLeft := bounds.X + s.scale(36)
 	textWidth := bounds.Width - s.scale(48)
-	title := node.NodeID
+	title := nodeTitle(node)
 	if node.VirtualIP != "" {
 		title += "    " + node.VirtualIP
 	}
@@ -203,6 +206,13 @@ func (s *meshListStyler) StyleItem(style *walk.ListItemStyle) {
 	_ = style.DrawText(title, titleRect, walk.TextSingleLine|walk.TextEndEllipsis)
 	style.TextColor = walk.RGB(100, 116, 139)
 	_ = style.DrawText(subtitle, subtitleRect, walk.TextSingleLine|walk.TextEndEllipsis)
+}
+
+func nodeTitle(node meshNode) string {
+	if strings.TrimSpace(node.DisplayName) != "" {
+		return strings.TrimSpace(node.DisplayName)
+	}
+	return node.NodeID
 }
 
 func (s *meshListStyler) scale(v int) int {
@@ -242,6 +252,12 @@ func (a *desktopApp) run() error {
 		Background: bg,
 		MenuItems: []MenuItem{
 			Menu{
+				Text: "工具",
+				Items: []MenuItem{
+					Action{Text: "高级设置", OnTriggered: a.showAdvancedSettingsDialog},
+				},
+			},
+			Menu{
 				Text: "帮助",
 				Items: []MenuItem{
 					Action{Text: "关于 / 检查更新", OnTriggered: a.showAboutDialog},
@@ -264,7 +280,7 @@ func (a *desktopApp) run() error {
 								Font:      Font{Family: "Microsoft YaHei UI", PointSize: 16, Bold: true},
 							},
 							Label{
-								Text:      "服务器模式 · 客户端模式 · 组网机群节点列表",
+								Text:      "设备列表 · 创建服务器 · 加入已有网络",
 								TextColor: walk.RGB(198, 210, 222),
 							},
 						},
@@ -290,7 +306,18 @@ func (a *desktopApp) run() error {
 						Layout:     VBox{Margins: Margins{Left: 12, Top: 12, Right: 8, Bottom: 12}, Spacing: 8},
 						Children: []Widget{
 							GroupBox{
-								Title:      "服务器模式",
+								Title:      "使用入口",
+								Background: panel,
+								Layout:     Grid{Columns: 2, Margins: Margins{Left: 10, Top: 15, Right: 10, Bottom: 10}, Spacing: 6},
+								Children: []Widget{
+									PushButton{Text: "我有公网 IP，创建服务器", OnClicked: a.focusCreateServer, ColumnSpan: 2},
+									PushButton{Text: "我没有公网 IP，使用官方 Hub", OnClicked: a.showOfficialHubPlaceholder, ColumnSpan: 2},
+									PushButton{Text: "我有云服务器，帮我自建中继", OnClicked: a.showSelfRelayWizard, ColumnSpan: 2},
+									PushButton{Text: "加入已有网络", OnClicked: a.focusJoinNetwork, ColumnSpan: 2},
+								},
+							},
+							GroupBox{
+								Title:      "创建服务器",
 								Background: panel,
 								Layout:     Grid{Columns: 4, Margins: Margins{Left: 10, Top: 15, Right: 10, Bottom: 10}, Spacing: 6},
 								Children: []Widget{
@@ -302,12 +329,14 @@ func (a *desktopApp) run() error {
 									PushButton{Text: "停止服务器", OnClicked: func() { a.serviceAction("stop") }, ColumnSpan: 2},
 									PushButton{Text: "重新生成接入码", OnClicked: a.createInviteOnboarding, ColumnSpan: 2},
 									CheckBox{AssignTo: &a.longLivedCode, Text: "长期接入码", ColumnSpan: 2},
+									Label{Text: "设备数限制", TextColor: muted},
+									LineEdit{AssignTo: &a.inviteMaxUses, Text: "3", ColumnSpan: 3},
 									TextEdit{AssignTo: &a.inviteOutput, ReadOnly: true, MinSize: Size{0, 76}, MaxSize: Size{10000, 96}, ColumnSpan: 4},
 									Label{AssignTo: &a.onboardingState, Text: "状态：服务器未启动", TextColor: muted, ColumnSpan: 4},
 								},
 							},
 							GroupBox{
-								Title:      "客户端模式",
+								Title:      "加入已有网络",
 								Background: panel,
 								Layout:     Grid{Columns: 4, Margins: Margins{Left: 10, Top: 15, Right: 10, Bottom: 10}, Spacing: 6},
 								Children: []Widget{
@@ -315,6 +344,8 @@ func (a *desktopApp) run() error {
 									LineEdit{AssignTo: &a.inviteLink, CueBanner: "meshlink://join?...", ColumnSpan: 3},
 									Label{Text: "验证码", TextColor: muted},
 									LineEdit{AssignTo: &a.inviteCode, ColumnSpan: 3},
+									Label{Text: "本机名称", TextColor: muted},
+									LineEdit{AssignTo: &a.spokeNodeName, Text: defaultNodeName("spoke"), ColumnSpan: 3},
 									PushButton{Text: "加入网络", OnClicked: a.joinOnboarding, ColumnSpan: 2},
 									PushButton{Text: "退出网络", OnClicked: func() { a.serviceAction("stop") }, ColumnSpan: 2},
 								},
@@ -335,6 +366,10 @@ func (a *desktopApp) run() error {
 											Label{Text: "节点列表", TextColor: ink, Font: Font{Family: "Microsoft YaHei UI", PointSize: 11, Bold: true}},
 											Label{AssignTo: &a.meshSummary, Text: "等待刷新", TextColor: muted, StretchFactor: 1},
 											PushButton{Text: "打开远程桌面", OnClicked: a.openRDP},
+											PushButton{Text: "诊断远程桌面", OnClicked: a.checkRDP},
+											PushButton{Text: "重命名设备", OnClicked: a.renameSelectedDevice},
+											PushButton{Text: "禁用设备", OnClicked: a.disableSelectedDevice},
+											PushButton{Text: "移除设备", OnClicked: a.removeSelectedDevice},
 											PushButton{Text: "刷新列表", OnClicked: a.loadMeshStatus},
 										},
 									},
@@ -406,6 +441,10 @@ func defaultNodeName(fallback string) string {
 
 func defaultConfigPath(baseDir string) string {
 	return filepath.Join(baseDir, "configs", "active.json")
+}
+
+func monoFont() Font {
+	return Font{Family: "Consolas", PointSize: 10}
 }
 
 func settingsPath(baseDir string) string {
@@ -721,6 +760,259 @@ func (a *desktopApp) onboardingManager() onboarding.Manager {
 	return onboarding.Manager{BaseDir: appBaseDir()}
 }
 
+func (a *desktopApp) focusCreateServer() {
+	if a.onboardingState != nil {
+		a.onboardingState.SetText("状态：准备创建服务器")
+	}
+	if a.inviteServer != nil {
+		_ = a.inviteServer.SetFocus()
+	}
+}
+
+func (a *desktopApp) focusJoinNetwork() {
+	if a.onboardingState != nil {
+		a.onboardingState.SetText("状态：准备加入已有网络")
+	}
+	if a.inviteLink != nil {
+		_ = a.inviteLink.SetFocus()
+	}
+}
+
+func (a *desktopApp) showOfficialHubPlaceholder() {
+	a.info("官方 Hub 尚未开放。\r\n\r\n当前版本不会连接官方 Hub，也不会产生官方中继费用。请先使用“我有公网 IP，创建服务器”或“加入已有网络”。")
+}
+
+func (a *desktopApp) showSelfRelayWizard() {
+	var cloudAddress, sshPort, sshUser, sshPassword, listenPort, publicAddress, maxUses *walk.LineEdit
+	var sshKey, output *walk.TextEdit
+	var longLived *walk.CheckBox
+	var dlg *walk.Dialog
+	var closeButton *walk.PushButton
+
+	buildReq := func(acceptHostKey bool) onboarding.SelfHostedRelayRequest {
+		return onboarding.SelfHostedRelayRequest{
+			CloudServerAddress: strings.TrimSpace(cloudAddress.Text()),
+			SSHPort:            parseDesktopPort(sshPort.Text(), 22),
+			SSHUsername:        strings.TrimSpace(sshUser.Text()),
+			SSHPassword:        sshPassword.Text(),
+			SSHPrivateKey:      sshKey.Text(),
+			ListenPort:         parseDesktopPort(listenPort.Text(), 8443),
+			PublicAddress:      strings.TrimSpace(publicAddress.Text()),
+			LongLived:          longLived == nil || longLived.Checked(),
+			MaxUses:            parseDesktopPort(maxUses.Text(), 10),
+			AcceptHostKey:      acceptHostKey,
+		}
+	}
+	checkRelay := func() {
+		output.SetText("正在检查云服务器和主机指纹...")
+		result, err := a.onboardingManager().CheckSelfHostedRelay(context.Background(), buildReq(true))
+		if err != nil {
+			output.SetText("检查失败：\r\n" + err.Error())
+			return
+		}
+		output.SetText(formatSelfRelayCheckResult(result))
+	}
+	deployRelay := func() {
+		output.SetText("正在部署自建中继，请保持窗口打开...")
+		result, err := a.onboardingManager().DeploySelfHostedRelay(context.Background(), buildReq(false))
+		if err != nil {
+			output.SetText("部署失败：\r\n" + err.Error())
+			return
+		}
+		output.SetText(formatSelfRelayDeployResult(result))
+	}
+
+	if err := (Dialog{
+		AssignTo:  &dlg,
+		Title:     "自建中继部署",
+		MinSize:   Size{720, 640},
+		Size:      Size{820, 720},
+		FixedSize: false,
+		Layout:    VBox{Margins: Margins{Left: 14, Top: 14, Right: 14, Bottom: 14}, Spacing: 10},
+		Children: []Widget{
+			GroupBox{
+				Title:  "云服务器 SSH",
+				Layout: Grid{Columns: 4, Margins: Margins{Left: 10, Top: 18, Right: 10, Bottom: 10}, Spacing: 7},
+				Children: []Widget{
+					Label{Text: "云服务器地址"},
+					LineEdit{AssignTo: &cloudAddress, CueBanner: "203.0.113.10 或 relay.example.com", ColumnSpan: 3},
+					Label{Text: "SSH 端口"},
+					LineEdit{AssignTo: &sshPort, Text: "22"},
+					Label{Text: "SSH 用户名"},
+					LineEdit{AssignTo: &sshUser, Text: "root"},
+					Label{Text: "SSH 密码"},
+					LineEdit{AssignTo: &sshPassword, PasswordMode: true, ColumnSpan: 3},
+					Label{Text: "私钥内容"},
+					TextEdit{AssignTo: &sshKey, Font: monoFont(), VScroll: true, MinSize: Size{0, 90}, ColumnSpan: 3},
+				},
+			},
+			GroupBox{
+				Title:  "Meshlink Hub",
+				Layout: Grid{Columns: 4, Margins: Margins{Left: 10, Top: 18, Right: 10, Bottom: 10}, Spacing: 7},
+				Children: []Widget{
+					Label{Text: "Meshlink 监听端口"},
+					LineEdit{AssignTo: &listenPort, Text: "8443"},
+					Label{Text: "服务器公网访问地址"},
+					LineEdit{AssignTo: &publicAddress, CueBanner: "relay.example.com 或 203.0.113.10"},
+					CheckBox{AssignTo: &longLived, Text: "长期接入码", Checked: true, ColumnSpan: 2},
+					Label{Text: "设备数限制"},
+					LineEdit{AssignTo: &maxUses, Text: "10"},
+					PushButton{Text: "检查云服务器", OnClicked: checkRelay, ColumnSpan: 2},
+					PushButton{Text: "部署自建中继", OnClicked: deployRelay, ColumnSpan: 2},
+				},
+			},
+			GroupBox{
+				Title:  "远程服务状态 / 主机指纹 / 接入链接 / 接入码 / 有效期",
+				Layout: VBox{Margins: Margins{Left: 10, Top: 18, Right: 10, Bottom: 10}, Spacing: 7},
+				Children: []Widget{
+					TextEdit{AssignTo: &output, ReadOnly: true, Font: monoFont(), VScroll: true, MinSize: Size{0, 220}},
+				},
+			},
+			Composite{
+				Layout: HBox{MarginsZero: true, Spacing: 8},
+				Children: []Widget{
+					HSpacer{},
+					PushButton{AssignTo: &closeButton, Text: "关闭", OnClicked: func() { dlg.Accept() }},
+				},
+			},
+		},
+		DefaultButton: &closeButton,
+		CancelButton:  &closeButton,
+	}).Create(a.mw); err != nil {
+		a.fail("打开自建中继部署失败", err)
+		return
+	}
+	output.SetText("未部署")
+	dlg.Run()
+}
+
+func (a *desktopApp) showAdvancedSettingsDialog() {
+	baseDir := appBaseDir()
+	currentConfig := a.currentConfigPath()
+	currentService := a.currentServiceName()
+	certDir := filepath.Join(baseDir, "certs")
+
+	oldServiceName := a.serviceName
+	oldConfigPath := a.configPath
+	oldCertOut := a.certOut
+	oldCAName := a.caName
+	oldNodeName := a.nodeName
+	oldDNSSANs := a.dnsSANs
+	oldIPSANs := a.ipSANs
+	oldCertDays := a.certDays
+	oldRDPTarget := a.rdpTarget
+	oldConfigEdit := a.configEdit
+	oldOutput := a.output
+	defer func() {
+		a.serviceName = oldServiceName
+		a.configPath = oldConfigPath
+		a.certOut = oldCertOut
+		a.caName = oldCAName
+		a.nodeName = oldNodeName
+		a.dnsSANs = oldDNSSANs
+		a.ipSANs = oldIPSANs
+		a.certDays = oldCertDays
+		a.rdpTarget = oldRDPTarget
+		a.configEdit = oldConfigEdit
+		a.output = oldOutput
+	}()
+
+	var dlg *walk.Dialog
+	var closeButton *walk.PushButton
+	if err := (Dialog{
+		AssignTo:  &dlg,
+		Title:     "Meshlink 高级工具",
+		MinSize:   Size{780, 620},
+		Size:      Size{900, 720},
+		FixedSize: false,
+		Layout:    VBox{Margins: Margins{Left: 14, Top: 14, Right: 14, Bottom: 14}, Spacing: 10},
+		Children: []Widget{
+			Composite{
+				Layout: Grid{Columns: 2, MarginsZero: true, Spacing: 10},
+				Children: []Widget{
+					GroupBox{
+						Title:  "服务安装 / 启停",
+						Layout: Grid{Columns: 4, Margins: Margins{Left: 10, Top: 18, Right: 10, Bottom: 10}, Spacing: 7},
+						Children: []Widget{
+							Label{Text: "服务名"},
+							LineEdit{AssignTo: &a.serviceName, Text: currentService, ColumnSpan: 3},
+							Label{Text: "配置文件路径"},
+							LineEdit{AssignTo: &a.configPath, Text: currentConfig, ColumnSpan: 2},
+							PushButton{Text: "选择", OnClicked: a.chooseConfigFile},
+							PushButton{Text: "安装服务", OnClicked: func() { a.serviceAction("install") }},
+							PushButton{Text: "启动服务", OnClicked: func() { a.serviceAction("start") }},
+							PushButton{Text: "停止服务", OnClicked: func() { a.serviceAction("stop") }},
+							PushButton{Text: "卸载服务", OnClicked: func() { a.serviceAction("uninstall") }},
+						},
+					},
+					GroupBox{
+						Title:  "证书工具",
+						Layout: Grid{Columns: 4, Margins: Margins{Left: 10, Top: 18, Right: 10, Bottom: 10}, Spacing: 7},
+						Children: []Widget{
+							Label{Text: "输出目录"},
+							LineEdit{AssignTo: &a.certOut, Text: certDir, ColumnSpan: 3},
+							Label{Text: "CA 名称"},
+							LineEdit{AssignTo: &a.caName, Text: "我的组网", ColumnSpan: 3},
+							PushButton{Text: "创建 CA", OnClicked: a.createCA, ColumnSpan: 4},
+							Label{Text: "节点名称"},
+							LineEdit{AssignTo: &a.nodeName, Text: defaultNodeName("node"), ColumnSpan: 3},
+							Label{Text: "DNS SAN"},
+							LineEdit{AssignTo: &a.dnsSANs, ColumnSpan: 3},
+							Label{Text: "IP SAN"},
+							LineEdit{AssignTo: &a.ipSANs, ColumnSpan: 3},
+							Label{Text: "有效天数"},
+							LineEdit{AssignTo: &a.certDays, Text: "825", ColumnSpan: 3},
+							PushButton{Text: "签发证书", OnClicked: a.issueCert, ColumnSpan: 4},
+						},
+					},
+				},
+			},
+			GroupBox{
+				Title:  "JSON 配置",
+				Layout: VBox{Margins: Margins{Left: 10, Top: 18, Right: 10, Bottom: 10}, Spacing: 7},
+				Children: []Widget{
+					TextEdit{AssignTo: &a.configEdit, Font: monoFont(), VScroll: true, HScroll: true, MinSize: Size{0, 150}},
+					Composite{
+						Layout: HBox{MarginsZero: true, Spacing: 8},
+						Children: []Widget{
+							PushButton{Text: "读取配置", OnClicked: a.loadConfig},
+							PushButton{Text: "保存配置", OnClicked: a.saveConfig},
+							HSpacer{},
+						},
+					},
+				},
+			},
+			GroupBox{
+				Title:  "日志和详细诊断",
+				Layout: Grid{Columns: 4, Margins: Margins{Left: 10, Top: 18, Right: 10, Bottom: 10}, Spacing: 7},
+				Children: []Widget{
+					Label{Text: "RDP 目标"},
+					LineEdit{AssignTo: &a.rdpTarget, Text: a.currentRDPTarget(), ColumnSpan: 3},
+					PushButton{Text: "读取日志", OnClicked: a.loadLogs},
+					PushButton{Text: "开始诊断", OnClicked: a.runDiagnostics},
+					PushButton{Text: "检查 RDP", OnClicked: a.checkRDP},
+					PushButton{Text: "打开 RDP", OnClicked: a.openRDP},
+					TextEdit{AssignTo: &a.output, ReadOnly: true, Font: monoFont(), VScroll: true, HScroll: true, MinSize: Size{0, 110}, ColumnSpan: 4},
+				},
+			},
+			Composite{
+				Layout: HBox{MarginsZero: true, Spacing: 8},
+				Children: []Widget{
+					HSpacer{},
+					PushButton{AssignTo: &closeButton, Text: "关闭", OnClicked: func() { dlg.Accept() }},
+				},
+			},
+		},
+		DefaultButton: &closeButton,
+		CancelButton:  &closeButton,
+	}).Create(a.mw); err != nil {
+		a.fail("打开高级设置失败", err)
+		return
+	}
+	a.loadConfigSilently()
+	dlg.Run()
+}
+
 func (a *desktopApp) createHubOnboarding() {
 	port, err := strconv.Atoi(strings.TrimSpace(a.listenPort.Text()))
 	if err != nil || port <= 0 || port > 65535 {
@@ -731,6 +1023,7 @@ func (a *desktopApp) createHubOnboarding() {
 		ServerAddress: strings.TrimSpace(a.inviteServer.Text()),
 		ListenPort:    port,
 		LongLived:     a.longLivedCode != nil && a.longLivedCode.Checked(),
+		MaxUses:       a.inviteMaxUsesValue(),
 	})
 	if err != nil {
 		a.fail("启动服务器失败", err)
@@ -763,6 +1056,7 @@ func (a *desktopApp) createInviteOnboarding() {
 		Server:          server,
 		Protocol:        "tcp_tls_v1",
 		LongLived:       a.longLivedCode != nil && a.longLivedCode.Checked(),
+		MaxUses:         a.inviteMaxUsesValue(),
 		ReplaceExisting: true,
 	})
 	if err != nil {
@@ -805,7 +1099,84 @@ func formatInviteForDesktopAt(invite onboarding.CreateInviteResult, now time.Tim
 	return "服务器地址：" + invite.Server +
 		"\r\n接入码：" + code +
 		"\r\n有效期：" + expiry +
+		formatInviteLimitForDesktop(invite) +
 		"\r\n接入链接：\r\n" + invite.Link
+}
+
+func formatInviteLimitForDesktop(invite onboarding.CreateInviteResult) string {
+	if !invite.LongLived {
+		return ""
+	}
+	limit := invite.MaxUses
+	if limit <= 0 {
+		limit = 3
+	}
+	return "\r\n设备数限制：" + strconv.Itoa(limit) + " 台" +
+		"\r\n长期接入码风险较高，请仅发给可信设备；达到设备数限制后会拒绝新设备加入。"
+}
+
+func formatSelfRelayCheckResult(result onboarding.SelfHostedRelayCheckResult) string {
+	var b strings.Builder
+	b.WriteString("远程服务状态：")
+	b.WriteString(fallbackText(result.ServiceStatus, "未知"))
+	b.WriteString("\r\n主机指纹：")
+	b.WriteString(fallbackText(result.HostFingerprint, "-"))
+	b.WriteString("\r\n\r\n")
+	b.WriteString(formatSelfRelayHealth(result.Health))
+	return b.String()
+}
+
+func formatSelfRelayDeployResult(result onboarding.SelfHostedRelayDeployResult) string {
+	var b strings.Builder
+	b.WriteString("远程服务状态：")
+	b.WriteString(fallbackText(result.ServiceStatus, "未知"))
+	b.WriteString("\r\n主机指纹：")
+	b.WriteString(fallbackText(result.HostFingerprint, "-"))
+	b.WriteString("\r\n接入链接：\r\n")
+	b.WriteString(result.Invite.Link)
+	b.WriteString("\r\n接入码：")
+	b.WriteString(fallbackText(result.Invite.Code, "------"))
+	b.WriteString("\r\n有效期：")
+	if result.Invite.LongLived {
+		b.WriteString("长期有效")
+	} else {
+		b.WriteString(formatTime(result.Invite.ExpiresAt))
+	}
+	if result.Invite.MaxUses > 0 {
+		b.WriteString("\r\n设备数限制：")
+		b.WriteString(strconv.Itoa(result.Invite.MaxUses))
+		b.WriteString(" 台")
+	}
+	b.WriteString("\r\n\r\n")
+	b.WriteString(formatSelfRelayHealth(result.Health))
+	return b.String()
+}
+
+func formatSelfRelayHealth(checks []deployssh.HealthCheck) string {
+	if len(checks) == 0 {
+		return "远程健康检查：-"
+	}
+	var b strings.Builder
+	b.WriteString("远程健康检查：")
+	for _, check := range checks {
+		b.WriteString("\r\n[")
+		b.WriteString(check.Status)
+		b.WriteString("] ")
+		b.WriteString(check.Name)
+		if check.Detail != "" {
+			b.WriteString("：")
+			b.WriteString(check.Detail)
+		}
+	}
+	return b.String()
+}
+
+func parseDesktopPort(raw string, fallback int) int {
+	n, err := strconv.Atoi(strings.TrimSpace(raw))
+	if err != nil || n <= 0 || n > 65535 {
+		return fallback
+	}
+	return n
 }
 
 type simpleModeSnapshot struct {
@@ -886,10 +1257,22 @@ func (a *desktopApp) desktopInviteServer() (string, error) {
 	return server + ":" + port, nil
 }
 
+func (a *desktopApp) inviteMaxUsesValue() int {
+	if a.inviteMaxUses == nil {
+		return 3
+	}
+	maxUses, err := strconv.Atoi(strings.TrimSpace(a.inviteMaxUses.Text()))
+	if err != nil || maxUses <= 0 {
+		return 3
+	}
+	return maxUses
+}
+
 func (a *desktopApp) joinOnboarding() {
 	result, err := a.onboardingManager().JoinSpoke(onboarding.JoinSpokeRequest{
 		InviteLink: strings.TrimSpace(a.inviteLink.Text()),
 		Code:       strings.TrimSpace(a.inviteCode.Text()),
+		NodeName:   strings.TrimSpace(a.spokeNodeName.Text()),
 	})
 	if err != nil {
 		a.fail("加入网络失败", err)
@@ -1192,22 +1575,22 @@ func (a *desktopApp) loadMeshStatus() {
 	serviceName := a.currentServiceName()
 	statusPath := runner.StatusPath(configPath, serviceName)
 	selectedKey := a.currentMeshNodeKey()
+	if devices, devicesErr := a.onboardingManager().Devices(serviceName); devicesErr == nil && len(devices.Nodes) > 0 {
+		nodes := buildMeshNodesFromDevices(devices, statusPath)
+		a.meshModel.SetItems(nodes)
+		a.meshSummary.SetText(meshSummaryText(nodes, devices.UpdatedAt))
+		index := findMeshNodeIndex(nodes, selectedKey)
+		if index < 0 && len(nodes) > 0 {
+			index = 0
+		}
+		if index >= 0 {
+			_ = a.meshList.SetCurrentIndex(index)
+			a.showSelectedMeshNode()
+		}
+		return
+	}
 	b, err := os.ReadFile(statusPath)
 	if err != nil {
-		if devices, devicesErr := a.onboardingManager().Devices(serviceName); devicesErr == nil && len(devices.Nodes) > 0 {
-			nodes := buildMeshNodesFromDevices(devices, statusPath)
-			a.meshModel.SetItems(nodes)
-			a.meshSummary.SetText(meshSummaryText(nodes, devices.UpdatedAt))
-			index := findMeshNodeIndex(nodes, selectedKey)
-			if index < 0 && len(nodes) > 0 {
-				index = 0
-			}
-			if index >= 0 {
-				_ = a.meshList.SetCurrentIndex(index)
-				a.showSelectedMeshNode()
-			}
-			return
-		}
 		a.meshModel.SetItems(nil)
 		a.meshSummary.SetText("未读取到状态文件")
 		a.meshDetail.SetText("读取组网状态失败：\r\n" + statusPath + "\r\n\r\n" + err.Error() + "\r\n\r\n请确认服务已经启动。")
@@ -1302,11 +1685,112 @@ func (a *desktopApp) checkRDP() {
 		a.fail("检查 RDP 失败", fmt.Errorf("请先在节点列表选择远程节点"))
 		return
 	}
-	check := diagnose.CheckRDP(strings.TrimSpace(a.rdpTarget.Text()))
+	node, _ := a.currentMeshNode()
+	check := diagnose.CheckRDPTarget(diagnose.RDPCheckRequest{
+		Target:       strings.TrimSpace(a.rdpTarget.Text()),
+		TargetDevice: node.NodeID,
+		TunnelStatus: meshNodeStatusText(node),
+	})
 	a.info(formatChecks([]diagnose.Check{check}))
 }
 
+func (a *desktopApp) renameSelectedDevice() {
+	node, err := a.currentAdminMeshNode()
+	if err != nil {
+		a.fail("重命名设备失败", err)
+		return
+	}
+	var dlg *walk.Dialog
+	var nameEdit *walk.LineEdit
+	var okButton *walk.PushButton
+	var cancelButton *walk.PushButton
+	currentName := fallbackText(node.DisplayName, node.NodeID)
+	if err := (Dialog{
+		AssignTo:  &dlg,
+		Title:     "重命名设备",
+		MinSize:   Size{420, 170},
+		Size:      Size{460, 190},
+		FixedSize: true,
+		Layout:    VBox{Margins: Margins{Left: 14, Top: 14, Right: 14, Bottom: 14}, Spacing: 10},
+		Children: []Widget{
+			Label{Text: "设备显示名称"},
+			LineEdit{AssignTo: &nameEdit, Text: currentName},
+			Composite{
+				Layout: HBox{MarginsZero: true, Spacing: 8},
+				Children: []Widget{
+					HSpacer{},
+					PushButton{AssignTo: &okButton, Text: "保存", OnClicked: func() { dlg.Accept() }},
+					PushButton{AssignTo: &cancelButton, Text: "取消", OnClicked: func() { dlg.Cancel() }},
+				},
+			},
+		},
+		DefaultButton: &okButton,
+		CancelButton:  &cancelButton,
+	}).Create(a.mw); err != nil {
+		a.fail("重命名设备失败", err)
+		return
+	}
+	if dlg.Run() != walk.DlgCmdOK {
+		return
+	}
+	renamed, err := a.onboardingManager().RenameDevice(node.NodeID, strings.TrimSpace(nameEdit.Text()))
+	if err != nil {
+		a.fail("重命名设备失败", err)
+		return
+	}
+	a.loadMeshStatus()
+	a.info("设备已重命名：\r\n" + renamed.NodeID + " -> " + renamed.DisplayName)
+}
+
+func (a *desktopApp) disableSelectedDevice() {
+	node, err := a.currentAdminMeshNode()
+	if err != nil {
+		a.fail("禁用设备失败", err)
+		return
+	}
+	if walk.MsgBox(a.mw, "禁用设备", "禁用设备 "+nodeTitle(node)+"？\r\n\r\n该设备将不能重新连接。", walk.MsgBoxOKCancel|walk.MsgBoxIconInformation) != walk.DlgCmdOK {
+		return
+	}
+	disabled, err := a.onboardingManager().DisableDevice(node.NodeID)
+	if err != nil {
+		a.fail("禁用设备失败", err)
+		return
+	}
+	a.loadMeshStatus()
+	a.info("设备已禁用：\r\n" + fallbackText(disabled.DisplayName, disabled.NodeID))
+}
+
+func (a *desktopApp) removeSelectedDevice() {
+	node, err := a.currentAdminMeshNode()
+	if err != nil {
+		a.fail("移除设备失败", err)
+		return
+	}
+	if walk.MsgBox(a.mw, "移除设备", "移除设备 "+nodeTitle(node)+"？\r\n\r\n它将不再作为正常在线设备展示，并会被拒绝重新连接。", walk.MsgBoxOKCancel|walk.MsgBoxIconInformation) != walk.DlgCmdOK {
+		return
+	}
+	removed, err := a.onboardingManager().RemoveDevice(node.NodeID)
+	if err != nil {
+		a.fail("移除设备失败", err)
+		return
+	}
+	a.loadMeshStatus()
+	a.info("设备已移除：\r\n" + fallbackText(removed.DisplayName, removed.NodeID))
+}
+
+func (a *desktopApp) currentAdminMeshNode() (meshNode, error) {
+	node, ok := a.currentMeshNode()
+	if !ok || node.Kind != "peer" || strings.TrimSpace(node.NodeID) == "" {
+		return meshNode{}, fmt.Errorf("请先在节点列表选择远端设备")
+	}
+	return node, nil
+}
+
 func (a *desktopApp) openRDP() {
+	if node, ok := a.currentMeshNode(); ok && strings.EqualFold(node.State, "disabled") {
+		a.fail("打开远程桌面失败", fmt.Errorf("设备已禁用，不能继续连接"))
+		return
+	}
 	target := a.currentRDPTarget()
 	if target == "" {
 		a.fail("打开远程桌面失败", fmt.Errorf("请先在节点列表选择远程节点"))
@@ -1337,6 +1821,17 @@ func (a *desktopApp) currentRDPTarget() string {
 		return ""
 	}
 	return strings.TrimSpace(node.VirtualIP)
+}
+
+func (a *desktopApp) currentMeshNode() (meshNode, bool) {
+	if a.meshList == nil || a.meshModel == nil {
+		return meshNode{}, false
+	}
+	index := a.meshList.CurrentIndex()
+	if index < 0 || index >= len(a.meshModel.items) {
+		return meshNode{}, false
+	}
+	return a.meshModel.items[index], true
 }
 
 func (a *desktopApp) showAboutDialog() {
@@ -1647,6 +2142,7 @@ func buildMeshNodesFromDevices(devices onboarding.DeviceList, statusPath string)
 			Kind:        kind,
 			Online:      strings.EqualFold(device.Status, "online"),
 			NodeID:      fallbackText(nodeID, "未命名节点"),
+			DisplayName: device.DisplayName,
 			VirtualIP:   device.VirtualIP,
 			RemoteAddr:  device.RemoteAddr,
 			Fingerprint: device.Fingerprint,
@@ -1706,11 +2202,14 @@ func findMeshNodeIndex(nodes []meshNode, key string) int {
 
 func formatMeshNodeDetail(node meshNode) string {
 	var b strings.Builder
-	b.WriteString(node.NodeID)
+	title := nodeTitle(node)
+	b.WriteString(title)
 	b.WriteString("\r\n")
-	b.WriteString(strings.Repeat("=", len([]rune(node.NodeID))))
+	b.WriteString(strings.Repeat("=", len([]rune(title))))
 	b.WriteString("\r\n\r\n")
 	writeDetailLine(&b, "状态", meshNodeStatusText(node))
+	writeDetailLine(&b, "显示名称", node.DisplayName)
+	writeDetailLine(&b, "节点名称", node.NodeID)
 	if node.Kind == "self" {
 		writeDetailLine(&b, "类型", "本机节点")
 		writeDetailLine(&b, "模式", node.Mode)
@@ -1746,6 +2245,9 @@ func meshNodeStatusText(node meshNode) string {
 			return "本机在线"
 		}
 		return "本机离线"
+	}
+	if strings.EqualFold(node.State, "disabled") {
+		return "已禁用"
 	}
 	if node.Online {
 		return "在线"

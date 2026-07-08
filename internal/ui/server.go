@@ -46,6 +46,11 @@ func NewServerWithBaseDir(logger *slog.Logger, baseDir string) http.Handler {
 	mux.HandleFunc("POST /api/onboarding/invite", server.handleOnboardingInvite)
 	mux.HandleFunc("POST /api/onboarding/join", server.handleOnboardingJoin)
 	mux.HandleFunc("GET /api/onboarding/devices", server.handleOnboardingDevices)
+	mux.HandleFunc("POST /api/onboarding/device/rename", server.handleOnboardingDeviceRename)
+	mux.HandleFunc("POST /api/onboarding/device/disable", server.handleOnboardingDeviceDisable)
+	mux.HandleFunc("POST /api/onboarding/device/remove", server.handleOnboardingDeviceRemove)
+	mux.HandleFunc("POST /api/self-relay/check", server.handleSelfRelayCheck)
+	mux.HandleFunc("POST /api/self-relay/deploy", server.handleSelfRelayDeploy)
 	mux.HandleFunc("GET /api/service/status", server.handleServiceStatus)
 	mux.HandleFunc("POST /api/service", server.handleServiceAction)
 	mux.HandleFunc("POST /api/certs/init-ca", server.handleInitCA)
@@ -156,6 +161,78 @@ func (s *Server) handleOnboardingDevices(w http.ResponseWriter, r *http.Request)
 		return
 	}
 	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "devices": devices})
+}
+
+func (s *Server) handleOnboardingDeviceRename(w http.ResponseWriter, r *http.Request) {
+	var req struct {
+		NodeID      string `json:"node_id"`
+		DisplayName string `json:"display_name"`
+	}
+	if !decodeJSON(w, r, &req) {
+		return
+	}
+	node, err := s.onboardingManager().RenameDevice(req.NodeID, req.DisplayName)
+	if err != nil {
+		writeError(w, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "device": node})
+}
+
+func (s *Server) handleOnboardingDeviceDisable(w http.ResponseWriter, r *http.Request) {
+	var req struct {
+		NodeID string `json:"node_id"`
+	}
+	if !decodeJSON(w, r, &req) {
+		return
+	}
+	node, err := s.onboardingManager().DisableDevice(req.NodeID)
+	if err != nil {
+		writeError(w, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "device": node})
+}
+
+func (s *Server) handleOnboardingDeviceRemove(w http.ResponseWriter, r *http.Request) {
+	var req struct {
+		NodeID string `json:"node_id"`
+	}
+	if !decodeJSON(w, r, &req) {
+		return
+	}
+	node, err := s.onboardingManager().RemoveDevice(req.NodeID)
+	if err != nil {
+		writeError(w, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "device": node})
+}
+
+func (s *Server) handleSelfRelayCheck(w http.ResponseWriter, r *http.Request) {
+	var req onboarding.SelfHostedRelayRequest
+	if !decodeJSON(w, r, &req) {
+		return
+	}
+	result, err := s.onboardingManager().CheckSelfHostedRelay(r.Context(), req)
+	if err != nil {
+		writeError(w, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "result": result})
+}
+
+func (s *Server) handleSelfRelayDeploy(w http.ResponseWriter, r *http.Request) {
+	var req onboarding.SelfHostedRelayRequest
+	if !decodeJSON(w, r, &req) {
+		return
+	}
+	result, err := s.onboardingManager().DeploySelfHostedRelay(r.Context(), req)
+	if err != nil {
+		writeError(w, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "result": result})
 }
 
 func (s *Server) handleServiceStatus(w http.ResponseWriter, r *http.Request) {
@@ -347,7 +424,13 @@ func (s *Server) handleDiagnostics(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) handleRDPDiagnostics(w http.ResponseWriter, r *http.Request) {
-	check := diagnose.CheckRDP(r.URL.Query().Get("target"))
+	port, _ := strconv.Atoi(r.URL.Query().Get("port"))
+	check := diagnose.CheckRDPTarget(diagnose.RDPCheckRequest{
+		Target:       r.URL.Query().Get("target"),
+		TargetDevice: r.URL.Query().Get("target_device"),
+		TunnelStatus: r.URL.Query().Get("tunnel_status"),
+		Port:         port,
+	})
 	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "check": check})
 }
 
