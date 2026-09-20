@@ -1,6 +1,8 @@
 package onboarding
 
 import (
+	"crypto/tls"
+	"crypto/x509"
 	"encoding/json"
 	"fmt"
 	"net"
@@ -9,6 +11,7 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"time"
 
 	"meshlink/internal/certutil"
 	"meshlink/internal/config"
@@ -48,6 +51,9 @@ type StartServerResult struct {
 }
 
 func (m Manager) StartServerMode(req StartServerRequest) (StartServerResult, error) {
+	if existing, err := config.Load(m.activeConfigPath()); err == nil && existing.Mode == "hub" && existing.NetworkCIDR != "" && existing.NetworkCIDR != "10.77.0.0/24" {
+		return StartServerResult{}, fmt.Errorf("现有服务器使用自定义网段 %s，已保留原配置；当前简化组网模式需要 10.77.0.0/24", existing.NetworkCIDR)
+	}
 	hubReq := defaultCreateHubRequest(CreateHubRequest{ListenPort: req.ListenPort})
 	if hubReq.ListenPort <= 0 || hubReq.ListenPort > 65535 {
 		return StartServerResult{}, fmt.Errorf("listen_port must be between 1 and 65535")
@@ -58,13 +64,37 @@ func (m Manager) StartServerMode(req StartServerRequest) (StartServerResult, err
 	if err != nil {
 		return StartServerResult{}, err
 	}
-	invite, err := m.CreateInvite(CreateInviteRequest{
-		Server:          server,
-		Protocol:        hubReq.Protocol,
-		LongLived:       req.LongLived,
-		MaxUses:         req.MaxUses,
-		ReplaceExisting: true,
-	})
+	if err := m.EnsureServerNode(server); err != nil {
+		return StartServerResult{}, err
+	}
+	invite, reusable, err := m.LatestInvite()
+	if err != nil {
+		return StartServerResult{}, err
+	}
+	maxUses := req.MaxUses
+	if req.LongLived {
+		if maxUses == 0 || maxUses < -1 {
+			maxUses = defaultLongLivedMaxUses
+		}
+	} else if maxUses <= 0 {
+		maxUses = defaultInviteMaxUses
+	}
+	if reusable && (invite.Server != server || invite.Protocol != hubReq.Protocol || invite.Code == "" || invite.LongLived != req.LongLived || invite.MaxUses != maxUses) {
+		reusable = false
+	}
+	if reusable {
+		_, err = m.validateInvite(EnrollRequest{Token: invite.Token, Code: invite.Code})
+		reusable = err == nil
+	}
+	if !reusable {
+		invite, err = m.CreateInvite(CreateInviteRequest{
+			Server:          server,
+			Protocol:        hubReq.Protocol,
+			LongLived:       req.LongLived,
+			MaxUses:         req.MaxUses,
+			ReplaceExisting: true,
+		})
+	}
 	if err != nil {
 		return StartServerResult{}, err
 	}
@@ -79,20 +109,30 @@ func (m Manager) StartServerMode(req StartServerRequest) (StartServerResult, err
 
 func (m Manager) CreateHub(req CreateHubRequest) (CreateHubResult, error) {
 	req = defaultCreateHubRequest(req)
+	var existing *config.Config
+	if _, err := os.Stat(m.activeConfigPath()); err == nil {
+		loaded, err := config.Load(m.activeConfigPath())
+		if err != nil {
+			return CreateHubResult{}, fmt.Errorf("existing config is invalid; preserve and repair it: %w", err)
+		}
+		if loaded.Mode == "hub" {
+			existing = loaded
+		}
+	}
 	if err := os.MkdirAll(m.configsDir(), 0o700); err != nil {
 		return CreateHubResult{}, err
 	}
 	if err := os.MkdirAll(m.certsDir(), 0o700); err != nil {
 		return CreateHubResult{}, err
 	}
-	if _, err := certutil.InitCA(certutil.CAOptions{
+	if err := m.ensureHubCA(certutil.CAOptions{
 		OutDir: m.certsDir(),
 		Name:   req.NetworkName,
 		Days:   3650,
 	}); err != nil {
 		return CreateHubResult{}, err
 	}
-	if _, err := certutil.Issue(certutil.IssueOptions{
+	if err := m.ensureHubCertificate(certutil.IssueOptions{
 		OutDir:    m.certsDir(),
 		Name:      req.NodeName,
 		CAPath:    filepath.Join(m.certsDir(), "ca.pem"),
@@ -110,28 +150,22 @@ func (m Manager) CreateHub(req CreateHubRequest) (CreateHubResult, error) {
 	}
 	listen := net.JoinHostPort(listenHost, strconv.Itoa(req.ListenPort))
 	cfg := config.Config{
-		NodeID: req.NodeName,
-		Mode:   "hub",
+		Version: config.ConfigVersion,
+		NodeID:  req.NodeName,
+		Mode:    "hub",
 		Transport: config.TransportConfig{
-			Protocol: req.Protocol,
+			Protocol: config.ControlProtocolV2,
 			Listen:   listen,
 		},
-		Listen:    listen,
-		CAFile:    "../certs/ca.pem",
-		CertFile:  "../certs/" + req.NodeName + ".pem",
-		KeyFile:   "../certs/" + req.NodeName + "-key.pem",
-		VirtualIP: req.VirtualIP,
-		MTU:       1280,
-		Device: config.DeviceConfig{
-			Type: "tun",
-			Name: "meshlink0",
-		},
-		Setup: config.SetupConfig{
-			Enabled:    true,
-			Address:    req.VirtualIP + "/24",
-			Routes:     []config.Route{},
-			Forwarding: true,
-		},
+		Listen:      listen,
+		CAFile:      "../certs/ca.pem",
+		CertFile:    "../certs/" + req.NodeName + ".pem",
+		KeyFile:     "../certs/" + req.NodeName + "-key.pem",
+		NetworkCIDR: req.VirtualCIDR,
+	}
+	if existing != nil {
+		cfg.ServerNodeConfig = existing.ServerNodeConfig
+		cfg.ServerPublicEndpoint = existing.ServerPublicEndpoint
 	}
 	if err := cfg.Validate(); err != nil {
 		return CreateHubResult{}, err
@@ -145,6 +179,85 @@ func (m Manager) CreateHub(req CreateHubRequest) (CreateHubResult, error) {
 		Listen:     listen,
 		State:      "created",
 	}, nil
+}
+
+func (m Manager) ensureHubCertificate(opts certutil.IssueOptions) error {
+	certPath := filepath.Join(opts.OutDir, opts.Name+".pem")
+	keyPath := filepath.Join(opts.OutDir, opts.Name+"-key.pem")
+	_, certErr := os.Stat(certPath)
+	_, keyErr := os.Stat(keyPath)
+	if os.IsNotExist(certErr) && os.IsNotExist(keyErr) {
+		_, err := certutil.Issue(opts)
+		return err
+	}
+	pair, err := tls.LoadX509KeyPair(certPath, keyPath)
+	if err != nil {
+		return fmt.Errorf("existing coordinator certificate or key is damaged; restore its identity: %w", err)
+	}
+	cert, err := x509.ParseCertificate(pair.Certificate[0])
+	if err != nil {
+		return err
+	}
+	ca, err := os.ReadFile(opts.CAPath)
+	if err != nil {
+		return err
+	}
+	roots := x509.NewCertPool()
+	if !roots.AppendCertsFromPEM(ca) {
+		return fmt.Errorf("invalid coordinator CA")
+	}
+	if _, err = cert.Verify(x509.VerifyOptions{Roots: roots}); err == nil && cert.Subject.CommonName == opts.Name {
+		validNames := true
+		for _, name := range append(append([]string(nil), opts.DNSNames...), opts.IPAddrs...) {
+			if cert.VerifyHostname(name) != nil {
+				validNames = false
+				break
+			}
+		}
+		if validNames {
+			return nil
+		}
+	}
+	// A changed public hostname or expired leaf can be reissued under the same
+	// preserved CA. Unchanged starts retain the existing certificate and key.
+	_, err = certutil.Issue(opts)
+	return err
+}
+
+// Restarting a network must preserve the trust root used by enrolled clients.
+func (m Manager) ensureHubCA(opts certutil.CAOptions) error {
+	certPath := filepath.Join(opts.OutDir, "ca.pem")
+	keyPath := filepath.Join(opts.OutDir, "ca-key.pem")
+	_, certErr := os.Stat(certPath)
+	_, keyErr := os.Stat(keyPath)
+	if os.IsNotExist(certErr) && os.IsNotExist(keyErr) {
+		for _, path := range []string{m.activeConfigPath(), m.deviceRegistryPath(), m.inviteStorePath()} {
+			if _, err := os.Stat(path); !os.IsNotExist(err) {
+				return fmt.Errorf("existing network CA is missing; restore its backup before starting (identity was preserved)")
+			}
+		}
+		entries, err := os.ReadDir(opts.OutDir)
+		if err != nil {
+			return err
+		}
+		if len(entries) != 0 {
+			return fmt.Errorf("existing certificate directory has no CA; restore its backup before starting (identity was preserved)")
+		}
+		_, err = certutil.InitCA(opts)
+		return err
+	}
+	pair, err := tls.LoadX509KeyPair(certPath, keyPath)
+	if err != nil {
+		return fmt.Errorf("existing network CA is missing, damaged or mismatched; restore its backup (identity was preserved): %w", err)
+	}
+	ca, err := x509.ParseCertificate(pair.Certificate[0])
+	if err != nil {
+		return err
+	}
+	if !ca.IsCA || ca.KeyUsage&x509.KeyUsageCertSign == 0 || time.Now().Before(ca.NotBefore) || time.Now().After(ca.NotAfter) {
+		return fmt.Errorf("existing network CA is invalid or expired; repair its certificate (identity was preserved)")
+	}
+	return nil
 }
 
 func defaultCreateHubRequest(req CreateHubRequest) CreateHubRequest {
@@ -230,7 +343,7 @@ func (m Manager) localListenIPv4() (string, error) {
 		}
 		return strings.TrimSpace(ip), nil
 	}
-	return firstIntranetIPv4()
+	return "0.0.0.0", nil
 }
 
 func firstIntranetIPv4() (string, error) {
@@ -306,6 +419,9 @@ func isRFC1918IPv4(ip net.IP) bool {
 }
 
 func writePrettyJSON(path string, v any) error {
+	if cfg, ok := v.(config.Config); ok {
+		return config.Write(path, cfg)
+	}
 	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
 		return err
 	}
@@ -313,5 +429,25 @@ func writePrettyJSON(path string, v any) error {
 	if err != nil {
 		return err
 	}
-	return os.WriteFile(path, append(b, '\n'), 0o600)
+	tmp, err := os.CreateTemp(filepath.Dir(path), "."+filepath.Base(path)+".tmp-*")
+	if err != nil {
+		return err
+	}
+	defer os.Remove(tmp.Name())
+	if err := tmp.Chmod(0o600); err != nil {
+		_ = tmp.Close()
+		return err
+	}
+	if _, err := tmp.Write(append(b, '\n')); err != nil {
+		_ = tmp.Close()
+		return err
+	}
+	if err := tmp.Sync(); err != nil {
+		_ = tmp.Close()
+		return err
+	}
+	if err := tmp.Close(); err != nil {
+		return err
+	}
+	return replaceJSONFile(tmp.Name(), path)
 }

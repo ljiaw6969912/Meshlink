@@ -31,6 +31,8 @@ type Check struct {
 type RDPCheckRequest struct {
 	Target       string `json:"target"`
 	TargetDevice string `json:"target_device,omitempty"`
+	NetworkState string `json:"network_state,omitempty"`
+	TargetStatus string `json:"target_status,omitempty"`
 	TunnelStatus string `json:"tunnel_status,omitempty"`
 	Port         int    `json:"port,omitempty"`
 }
@@ -132,6 +134,11 @@ func CheckRDP(target string) Check {
 	return CheckRDPTarget(RDPCheckRequest{Target: target})
 }
 
+var dialRDP = func(ctx context.Context, network, address string) (net.Conn, error) {
+	var dialer net.Dialer
+	return dialer.DialContext(ctx, network, address)
+}
+
 func CheckRDPTarget(req RDPCheckRequest) Check {
 	target := strings.TrimSpace(req.Target)
 	host, port := rdpHostPort(target, req.Port)
@@ -142,11 +149,31 @@ func CheckRDPTarget(req RDPCheckRequest) Check {
 			Detail: rdpDetail("未选择目标设备。", req, "-", port, "请先在设备列表中选择一台远程设备。"),
 		}
 	}
+	if rdpNetworkUnavailable(req.NetworkState) || (strings.TrimSpace(req.NetworkState) == "" && legacyRDPLocalNetworkUnavailable(req.TunnelStatus)) {
+		return Check{
+			Name:   "远程桌面可达性",
+			Status: Fail,
+			Detail: rdpDetail("网络未连接。", req, host, port, "请先重新连接 Meshlink 网络，确认目标设备在线后再试。"),
+		}
+	}
+	if rdpTargetOffline(req.TargetStatus) || (strings.TrimSpace(req.TargetStatus) == "" && strings.TrimSpace(req.TargetDevice) != "" && rdpTargetOffline(req.TunnelStatus)) {
+		return Check{
+			Name:   "远程桌面可达性",
+			Status: Fail,
+			Detail: rdpDetail("目标设备离线。目标设备的 Meshlink 网络未连接。", req, host, port, "请确认目标设备已开机并保持 Meshlink 正在运行，设备上线后再试。"),
+		}
+	}
+	if strings.TrimSpace(req.NetworkState) == "" && strings.TrimSpace(req.TargetDevice) == "" && rdpTargetOffline(req.TunnelStatus) {
+		return Check{
+			Name:   "远程桌面可达性",
+			Status: Fail,
+			Detail: rdpDetail("网络未连接。", req, host, port, "请先重新连接 Meshlink 网络，确认目标设备在线后再试。"),
+		}
+	}
 	addr := net.JoinHostPort(host, strconv.Itoa(port))
 	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
 	defer cancel()
-	var dialer net.Dialer
-	conn, err := dialer.DialContext(ctx, "tcp4", addr)
+	conn, err := dialRDP(ctx, "tcp4", addr)
 	if err != nil {
 		return Check{
 			Name:   "远程桌面可达性",
@@ -160,6 +187,28 @@ func CheckRDPTarget(req RDPCheckRequest) Check {
 		Status: OK,
 		Detail: rdpDetail("目标设备的远程桌面端口可达。", req, host, port, "可以直接打开远程桌面。"),
 	}
+}
+
+func rdpNetworkUnavailable(status string) bool {
+	switch strings.ToLower(strings.TrimSpace(status)) {
+	case "not_joined", "disconnected", "connecting", "reconnecting", "offline", "stopped", "本机离线":
+		return true
+	default:
+		return false
+	}
+}
+
+func rdpTargetOffline(status string) bool {
+	switch strings.ToLower(strings.TrimSpace(status)) {
+	case "offline", "离线":
+		return true
+	default:
+		return false
+	}
+}
+
+func legacyRDPLocalNetworkUnavailable(status string) bool {
+	return rdpNetworkUnavailable(status) && !rdpTargetOffline(status)
 }
 
 func rdpHostPort(target string, defaultPort int) (string, int) {
@@ -185,16 +234,36 @@ func rdpDetail(problem string, req RDPCheckRequest, host string, port int, sugge
 	if device == "" {
 		device = "未选择"
 	}
-	tunnel := strings.TrimSpace(req.TunnelStatus)
-	if tunnel == "" {
-		tunnel = "未知"
+	networkState, targetStatus := effectiveRDPDetailStates(req)
+	if networkState == "" {
+		networkState = "未知"
+	}
+	if targetStatus == "" {
+		targetStatus = "未知"
 	}
 	return "发现的问题：" + problem +
-		"\r\n隧道状态：" + tunnel +
+		"\r\n本机网络状态：" + networkState +
+		"\r\n目标设备状态：" + targetStatus +
 		"\r\n目标设备：" + device +
 		"\r\n目标 IP：" + host +
 		"\r\nRDP 端口：" + strconv.Itoa(port) +
 		"\r\n处理建议：" + suggestion
+}
+
+func effectiveRDPDetailStates(req RDPCheckRequest) (string, string) {
+	networkState := strings.TrimSpace(req.NetworkState)
+	targetStatus := strings.TrimSpace(req.TargetStatus)
+	legacy := strings.TrimSpace(req.TunnelStatus)
+	if networkState == "" && legacyRDPLocalNetworkUnavailable(legacy) {
+		networkState = legacy
+	}
+	if targetStatus == "" && strings.TrimSpace(req.TargetDevice) != "" && !legacyRDPLocalNetworkUnavailable(legacy) {
+		targetStatus = legacy
+	}
+	if networkState == "" && strings.TrimSpace(req.TargetDevice) == "" {
+		networkState = legacy
+	}
+	return networkState, targetStatus
 }
 
 func (r *Report) checkFile(name, path string) {

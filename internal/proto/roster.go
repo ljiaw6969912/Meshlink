@@ -2,6 +2,7 @@ package proto
 
 import (
 	"encoding/json"
+	"strings"
 	"time"
 )
 
@@ -35,4 +36,13 @@ func ParseRoster(payload []byte) (Roster, error) {
 		return Roster{}, err
 	}
 	return r, nil
+}
+
+func IsInfrastructureMode(mode string) bool {
+	switch strings.ToLower(strings.TrimSpace(mode)) {
+	case "hub", "relay", "control":
+		return true
+	default:
+		return false
+	}
 }

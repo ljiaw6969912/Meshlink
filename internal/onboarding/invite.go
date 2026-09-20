@@ -82,7 +82,7 @@ func (m Manager) CreateInvite(req CreateInviteRequest) (CreateInviteResult, erro
 	}
 	if req.LongLived {
 		req.TTL = 0
-		if req.MaxUses <= 0 {
+		if req.MaxUses == 0 || req.MaxUses < -1 {
 			req.MaxUses = defaultLongLivedMaxUses
 		}
 	} else if req.TTL <= 0 {
@@ -207,7 +207,7 @@ func buildInviteLink(server, protocol, token string) string {
 }
 
 func (m Manager) loadInviteStore() (InviteStore, error) {
-	b, err := os.ReadFile(m.inviteStorePath())
+	b, err := readJSONFile(m.inviteStorePath())
 	if err != nil {
 		if os.IsNotExist(err) {
 			return InviteStore{}, nil

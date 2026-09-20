@@ -16,6 +16,8 @@ import (
 	"golang.org/x/sys/windows/svc"
 	"golang.org/x/sys/windows/svc/mgr"
 
+	"meshlink/internal/config"
+	"meshlink/internal/netsetup"
 	"meshlink/internal/runner"
 )
 
@@ -46,12 +48,19 @@ func Install(name, configPath string) error {
 	if err != nil {
 		return err
 	}
+	agentConfig, err := config.Load(configPath)
+	if err != nil {
+		return fmt.Errorf("load service configuration: %w", err)
+	}
 
 	m, err := mgr.Connect()
 	if err != nil {
 		return err
 	}
 	defer m.Disconnect()
+	if err := netsetup.ConfigureServiceFirewall(name, exePath, agentConfig); err != nil {
+		return err
+	}
 
 	if existing, err := m.OpenService(name); err == nil {
 		defer existing.Close()

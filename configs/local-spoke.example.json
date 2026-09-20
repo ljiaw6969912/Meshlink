@@ -1,6 +1,12 @@
 {
+  "version": 2,
   "node_id": "local-spoke",
   "mode": "spoke",
+  "transport": {
+    "protocol": "tcp_tls_control_v2",
+    "connect": "127.0.0.1:18443",
+    "server_name": "localhost"
+  },
   "connect": "127.0.0.1:18443",
   "server_name": "localhost",
   "ca_file": "../certs/ca.pem",
@@ -15,5 +21,9 @@
   },
   "setup": {
     "enabled": false
+  },
+  "p2p": {
+    "protocol": "quic_udp_v1",
+    "listen": "0.0.0.0:0"
   }
 }

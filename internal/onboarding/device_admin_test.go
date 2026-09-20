@@ -8,7 +8,51 @@ import (
 	"testing"
 
 	"meshlink/internal/certutil"
+	"meshlink/internal/config"
+	"meshlink/internal/networkstate"
+	"meshlink/internal/p2p"
 )
+
+func TestDevicesHideInfrastructureAndRespectReconnectState(t *testing.T) {
+	dir := t.TempDir()
+	writeSpokeConfigForDeviceTest(t, dir, "desk")
+	writeRuntimeStatusForDeviceTest(t, dir, `{
+  "state":"running",
+  "network_state":"reconnecting",
+  "self":{"node_id":"desk","mode":"spoke","virtual_ip":"10.77.0.2"},
+  "peers":[
+    {"node_id":"hub","mode":"hub","status":"online"},
+    {"node_id":"office","mode":"spoke","status":"offline","virtual_ip":"10.77.0.3"},
+    {"node_id":"studio","mode":"spoke","status":"online","virtual_ip":"10.77.0.4"}
+  ]
+}`)
+	devices, err := (Manager{BaseDir: dir}).Devices("mesh-agent")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if devices.NetworkState != networkstate.Reconnecting {
+		t.Fatalf("network state = %q", devices.NetworkState)
+	}
+	if findDeviceSummary(devices, "hub") != nil {
+		t.Fatal("hub must be hidden")
+	}
+	if peer := findDeviceSummary(devices, "office"); peer == nil || peer.Status != "offline" {
+		t.Fatalf("office = %+v, want offline", peer)
+	}
+	if peer := findDeviceSummary(devices, "studio"); peer == nil || peer.Status != "offline" {
+		t.Fatalf("studio = %+v, want reconnecting state to force offline", peer)
+	}
+}
+
+func TestDevicesWithoutActiveConfigAreNotJoinedAndEmpty(t *testing.T) {
+	devices, err := (Manager{BaseDir: t.TempDir()}).Devices("mesh-agent")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if devices.NetworkState != networkstate.NotJoined || len(devices.Nodes) != 0 {
+		t.Fatalf("devices = %+v", devices)
+	}
+}
 
 func TestDeviceAdminRenameDisableRemoveAndAudit(t *testing.T) {
 	dir := t.TempDir()
@@ -125,6 +169,145 @@ func TestDeviceRegistryPolicyAppliesToRuntimeDeviceList(t *testing.T) {
 	}
 }
 
+func TestDevicesReadsRuntimeConnectionPathQualityFields(t *testing.T) {
+	dir := t.TempDir()
+	mgr := testManager(dir)
+	enrolled := enrollDeviceForAdminTest(t, mgr, "laptop")
+	statusDir := filepath.Join(dir, "configs", "logs")
+	if err := os.MkdirAll(statusDir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	statusPath := filepath.Join(statusDir, "mesh-agent.status.json")
+	if err := os.WriteFile(statusPath, []byte(`{
+  "updated_at": "2026-07-09T08:00:00Z",
+  "state": "running",
+  "self": {"node_id": "hub", "mode": "hub", "virtual_ip": "10.77.0.1"},
+  "peers": [{
+    "node_id": "laptop",
+    "status": "online",
+    "virtual_ip": "10.77.0.2",
+    "fingerprint": "`+enrolled.CertFingerprint+`",
+    "path_type": "relay",
+    "path_state": "fallback_relay",
+    "latency_ms": 88,
+    "relay_bytes_in": 64,
+    "relay_bytes_out": 96,
+    "switch_count": 1,
+    "switch_reasons": ["direct_quality_degraded", "token should not leak"],
+    "switch_from_path": "lan_direct",
+    "switch_to_path": "relay",
+    "switch_score_delta": 31,
+    "auto_switched": true,
+    "last_error": "password should not leak",
+    "last_seen": "2026-07-09T08:00:00Z"
+  }]
+}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	devices, err := mgr.Devices("mesh-agent")
+	if err != nil {
+		t.Fatal(err)
+	}
+	peer := findDeviceSummary(devices, "laptop")
+	if peer == nil {
+		t.Fatalf("runtime peer missing from device list: %+v", devices.Nodes)
+	}
+	if peer.PathType != p2p.PathTypeRelay || peer.PathState != p2p.PathStateFallbackRelay {
+		t.Fatalf("peer path = %+v, want relay fallback", peer.ConnectionStatus)
+	}
+	if peer.LatencyMS != 88 || peer.RelayBytesIn != 64 || peer.RelayBytesOut != 96 || peer.QualityScore == 0 {
+		t.Fatalf("peer quality = %+v, want runtime latency, relay bytes, and score", peer.ConnectionStatus)
+	}
+	if peer.SwitchCount != 2 || len(peer.SwitchReasons) != 2 || peer.SwitchReasons[1] != "redacted" || peer.LastError != "redacted" {
+		t.Fatalf("peer sanitized fields = %+v, want sensitive switch reason and last_error redacted", peer.ConnectionStatus)
+	}
+	if peer.SwitchFromPath != p2p.PathTypeLANDirect || peer.SwitchToPath != p2p.PathTypeRelay || peer.SwitchScoreDelta != 31 || !peer.AutoSwitched {
+		t.Fatalf("peer switch summary = %+v, want Task 7E fields", peer.ConnectionStatus)
+	}
+}
+
+func TestDevicesDefaultsOldRuntimeStatusConnectionFields(t *testing.T) {
+	dir := t.TempDir()
+	mgr := testManager(dir)
+	enrolled := enrollDeviceForAdminTest(t, mgr, "laptop")
+	writeSpokeConfigForDeviceTest(t, dir, "desk")
+	statusDir := filepath.Join(dir, "configs", "logs")
+	if err := os.MkdirAll(statusDir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	statusPath := filepath.Join(statusDir, "mesh-agent.status.json")
+	if err := os.WriteFile(statusPath, []byte(`{
+  "updated_at": "2026-07-09T08:00:00Z",
+  "state": "running",
+  "self": {"node_id": "desk", "mode": "spoke", "virtual_ip": "10.77.0.2"},
+  "peers": [{
+    "node_id": "laptop",
+    "status": "online",
+    "virtual_ip": "10.77.0.2",
+    "fingerprint": "`+enrolled.CertFingerprint+`",
+    "last_seen": "2026-07-09T08:00:00Z"
+  }]
+}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	devices, err := mgr.Devices("mesh-agent")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if devices.NetworkState != networkstate.Connected {
+		t.Fatalf("network state = %q, want connected for legacy running status", devices.NetworkState)
+	}
+	self := findDeviceSummary(devices, "desk")
+	if self == nil {
+		t.Fatalf("self missing from device list: %+v", devices.Nodes)
+	}
+	if self.PathType != "" || self.PathState != p2p.PathStateIdle {
+		t.Fatalf("self path = %+v, legacy process presence must not invent direct", self.ConnectionStatus)
+	}
+	peer := findDeviceSummary(devices, "laptop")
+	if peer == nil {
+		t.Fatalf("runtime peer missing from device list: %+v", devices.Nodes)
+	}
+	if peer.PathType != "" || peer.PathState != p2p.PathStateIdle {
+		t.Fatalf("peer path = %+v, legacy presence must not invent direct", peer.ConnectionStatus)
+	}
+	if peer.LatencyMS != 0 || peer.RelayBytesIn != 0 || peer.RelayBytesOut != 0 || peer.LastError != "" || peer.QualityScore != 0 {
+		t.Fatalf("peer defaults = %+v, want conservative zero metrics until handshake", peer.ConnectionStatus)
+	}
+}
+
+func TestDevicesOmitHubSelfAndRetainSpokePeers(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "configs", "active.json")
+	cfg := config.Config{
+		NodeID: "hub", Mode: "hub", Listen: ":8443", VirtualIP: "10.77.0.1",
+		CAFile: "../certs/ca.pem", CertFile: "../certs/hub.pem",
+		KeyFile: "../certs/hub-key.pem", Device: config.DeviceConfig{Type: "null"},
+	}
+	if err := writePrettyJSON(path, cfg); err != nil {
+		t.Fatal(err)
+	}
+	writeRuntimeStatusForDeviceTest(t, dir, `{
+  "state":"running",
+  "network_state":"connected",
+  "self":{"node_id":"hub","mode":"hub","virtual_ip":"10.77.0.1"},
+  "peers":[{"node_id":"desk","mode":"spoke","status":"online","virtual_ip":"10.77.0.2"}]
+}`)
+
+	devices, err := (Manager{BaseDir: dir}).Devices("mesh-agent")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if findDeviceSummary(devices, "hub") != nil {
+		t.Fatal("hub self must be hidden")
+	}
+	if peer := findDeviceSummary(devices, "desk"); peer == nil || peer.Status != "online" {
+		t.Fatalf("desk = %+v, want online spoke", peer)
+	}
+}
+
 func TestInviteFailureAuditInvalidationAndPrivateMaterialRedaction(t *testing.T) {
 	dir := t.TempDir()
 	mgr := testManager(dir)
@@ -230,6 +413,40 @@ func TestLongLivedInviteDefaultsToLimitedDeviceCount(t *testing.T) {
 	}
 }
 
+func TestLookupDeviceUsesExactPersistedIdentityAndIncludesRevocation(t *testing.T) {
+	mgr := testManager(t.TempDir())
+	enrolled := enrollDeviceForAdminTest(t, mgr, "laptop")
+	lookup, ok := any(mgr).(interface {
+		LookupDevice(string) (RegisteredNode, error)
+	})
+	if !ok {
+		t.Fatal("Manager is missing persisted exact LookupDevice")
+	}
+	for _, id := range []string{"LAPTOP", " laptop ", "missing", ""} {
+		if _, err := lookup.LookupDevice(id); err == nil {
+			t.Fatalf("lookup accepted non-exact identity %q", id)
+		}
+	}
+	node, err := lookup.LookupDevice("laptop")
+	if err != nil || node.CertFingerprint != enrolled.CertFingerprint || node.VirtualIP != enrolled.VirtualIP {
+		t.Fatalf("lookup: %+v %v", node, err)
+	}
+	if _, err = mgr.DisableDevice("laptop"); err != nil {
+		t.Fatal(err)
+	}
+	node, err = lookup.LookupDevice("laptop")
+	if err != nil || !node.Disabled {
+		t.Fatalf("lookup did not reread disable: %+v %v", node, err)
+	}
+	if _, err = mgr.RemoveDevice("laptop"); err != nil {
+		t.Fatal(err)
+	}
+	node, err = lookup.LookupDevice("laptop")
+	if err != nil || node.DeletedAt == nil {
+		t.Fatalf("lookup did not reread deletion: %+v %v", node, err)
+	}
+}
+
 func enrollDeviceForAdminTest(t *testing.T, mgr Manager, nodeID string) RegisteredNode {
 	t.Helper()
 	if _, err := mgr.CreateHub(CreateHubRequest{NetworkName: "mesh", NodeName: "hub", ListenPort: 8443}); err != nil {
@@ -267,6 +484,31 @@ func findDeviceSummary(devices DeviceList, nodeID string) *DeviceSummary {
 		}
 	}
 	return nil
+}
+
+func writeSpokeConfigForDeviceTest(t *testing.T, dir, nodeID string) {
+	t.Helper()
+	path := filepath.Join(dir, "configs", "active.json")
+	cfg := config.Config{
+		NodeID: nodeID, Mode: "spoke", Connect: "example.com:8443",
+		CAFile: "../certs/ca.pem", CertFile: "../certs/" + nodeID + ".pem",
+		KeyFile: "../certs/" + nodeID + "-key.pem", VirtualIP: "10.77.0.2",
+		Device: config.DeviceConfig{Type: "null"},
+	}
+	if err := writePrettyJSON(path, cfg); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func writeRuntimeStatusForDeviceTest(t *testing.T, dir, body string) {
+	t.Helper()
+	path := filepath.Join(dir, "configs", "logs", "mesh-agent.status.json")
+	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(path, []byte(body), 0o600); err != nil {
+		t.Fatal(err)
+	}
 }
 
 func readAuditEvents(t *testing.T, baseDir string) []map[string]any {

@@ -22,10 +22,18 @@
       <section id="devicesView" class="node-panel primary-panel">
         <div class="section-head">
           <h2>设备列表</h2>
-          <button id="refreshDevices" type="button" class="secondary">刷新列表</button>
+          <div class="actions compact">
+            <button id="runOneClickDiagnostics" type="button">一键诊断</button>
+            <button id="refreshDevices" type="button" class="secondary">刷新列表</button>
+          </div>
+        </div>
+        <div class="connection-dimensions" aria-label="连接状态">
+          <span>协调服务器：<strong id="coordinatorState">已断开</strong></span>
+          <span>对端路径：<strong id="p2pPathState">离线或未知</strong></span>
         </div>
         <div id="deviceList" class="device-list"></div>
         <div id="deviceDetail" class="device-detail">暂无选中设备。</div>
+        <div id="diagnosticReport" class="diagnostic-report"></div>
         <div class="device-admin">
           <label>
             设备显示名称
@@ -45,13 +53,9 @@
           <strong>我有公网 IP，创建服务器</strong>
           <span>本机生成接入链接和接入码</span>
         </button>
-        <button class="entry-card muted-card" data-view="officialHubView" type="button">
+        <button class="entry-card" data-view="officialHubView" data-official-hub hidden type="button">
           <strong>我没有公网 IP，使用官方 Hub</strong>
-          <span>官方 Hub 尚未开放</span>
-        </button>
-        <button class="entry-card" data-view="relayView" type="button">
-          <strong>我有云服务器，帮我自建中继</strong>
-          <span>SSH 部署公网 Meshlink Hub</span>
+          <span>官方 Hub MVP/内测控制面</span>
         </button>
         <button class="entry-card" data-view="clientView" type="button">
           <strong>加入已有网络</strong>
@@ -78,16 +82,8 @@
           <button id="startServer" type="button">启动服务器</button>
           <button id="stopServer" type="button" class="secondary">停止服务器</button>
           <button id="regenerateInvite" type="button" class="secondary">重新生成接入码</button>
-          <label class="check-label">
-            <input id="longLivedCode" type="checkbox">
-            长期接入码
-          </label>
-          <label class="limit-label">
-            设备数限制
-            <input id="inviteMaxUses" value="3" inputmode="numeric">
-          </label>
         </div>
-        <p class="notice">长期接入码风险较高，请设置设备数限制；达到上限后新设备会被拒绝加入。</p>
+        <p class="notice">接入码可供多台设备连接；重新生成后旧接入码失效。</p>
         <div class="result-strip">
           <span>本机虚拟 IP：<strong id="localVirtualIP">-</strong></span>
           <span>监听地址：<strong id="serverListen">-</strong></span>
@@ -103,7 +99,7 @@
               <span>接入码</span>
               <strong id="accessCode">------</strong>
             </div>
-            <span id="inviteExpiry" class="muted">默认 10 分钟有效，使用一次失效</span>
+            <span id="inviteExpiry" class="muted">服务器启动后生成接入码</span>
           </div>
           <div class="actions">
             <button id="copyInviteLink" type="button">复制链接</button>
@@ -119,7 +115,7 @@
         </div>
         <label>
           接入链接
-          <input id="inviteLink" placeholder="meshlink://join?server=example.com:8443&token=..." autocomplete="off">
+          <input id="inviteLink" placeholder="粘贴完整接入链接" autocomplete="off">
         </label>
         <div class="form-grid">
           <label>
@@ -132,171 +128,245 @@
           </label>
         </div>
         <div class="actions">
-          <button id="joinNetwork" type="button">加入网络</button>
-          <button id="exitNetwork" type="button" class="secondary">退出网络</button>
+          <button id="joinNetwork" type="button">连接</button>
+          <button id="disconnectNetwork" type="button" class="secondary">断开连接</button>
+          <button id="exitNetwork" type="button" class="danger">退出网络</button>
         </div>
       </section>
 
-      <section id="officialHubView" class="view placeholder-view">
+      <section id="officialHubView" class="view" data-official-hub hidden>
         <div class="section-head">
-          <h2>官方 Hub 尚未开放</h2>
-          <span class="muted">灰度占位</span>
+          <h2>官方 Hub MVP/内测</h2>
+          <span id="officialHubStatus" class="muted">未连接</span>
         </div>
-        <p>当前版本不会连接官方 Hub，也不会收取官方中继费用。</p>
-      </section>
-
-      <section id="relayView" class="view">
-        <div class="section-head">
-          <h2>自建中继部署</h2>
-          <span id="relayStatus" class="muted">未检查</span>
+        <p class="notice">当前是官方 Hub 控制面 MVP/内测能力，尚未接入真实订阅和 Relay 数据面，不代表 Relay/P2P 已完成。</p>
+        <div id="subscriptionPanel" class="subscription-panel">
+          <div class="section-head compact-head">
+            <div>
+              <h3>当前套餐</h3>
+              <p id="subscriptionStatusMessage" class="muted">正在读取官方 Hub 套餐状态。</p>
+            </div>
+            <button id="viewPlans" type="button" class="secondary">查看套餐/了解升级</button>
+          </div>
+          <div class="result-strip">
+            <span>套餐：<strong id="currentPlanName">-</strong></span>
+            <span>状态：<strong id="subscriptionStateLabel">-</strong></span>
+            <span>有效期：<strong id="subscriptionEffectiveUntil">-</strong></span>
+          </div>
+          <p id="selfHostedContinuity" class="notice">自建服务器、自建 Relay 和基础设备互联可继续使用。</p>
+          <div id="quotaIssueList" class="quota-issues"></div>
+          <div id="quotaList" class="quota-grid"></div>
+          <div id="planComparisonSection" class="plan-comparison" hidden>
+            <p id="upgradePlaceholder" class="muted">这里只展示本地套餐差异，不跳转外部页面，也不承诺购买结果。</p>
+            <div class="plan-table-wrap">
+              <table>
+                <thead>
+                  <tr>
+                    <th>套餐</th>
+                    <th>设备</th>
+                    <th>同时在线</th>
+                    <th>官方 Relay</th>
+                    <th>自建能力</th>
+                  </tr>
+                </thead>
+                <tbody id="planComparison"></tbody>
+              </table>
+            </div>
+          </div>
         </div>
         <div class="form-grid">
           <label>
-            云服务器地址
-            <input id="relayCloudAddress" placeholder="203.0.113.10 或 relay.example.com" autocomplete="off">
+            Hub API 地址
+            <input id="officialHubAPIURL" value="http://127.0.0.1:18080" autocomplete="off">
           </label>
           <label>
-            SSH 端口
-            <input id="relaySSHPort" value="22" inputmode="numeric">
+            账号邮箱
+            <input id="officialAccountEmail" placeholder="owner@example.com" autocomplete="email">
           </label>
           <label>
-            SSH 用户名
-            <input id="relaySSHUser" value="root" autocomplete="username">
+            账号名称
+            <input id="officialAccountName" placeholder="例如 我的账号" autocomplete="name">
           </label>
           <label>
-            SSH 密码
-            <input id="relaySSHPassword" type="password" autocomplete="current-password">
-          </label>
-          <label class="span-two">
-            私钥内容
-            <textarea id="relaySSHKey" placeholder="-----BEGIN OPENSSH PRIVATE KEY-----"></textarea>
+            网络名称
+            <input id="officialNetworkName" value="我的官方网络" autocomplete="off">
           </label>
           <label>
-            Meshlink 监听端口
-            <input id="relayListenPort" value="8443" inputmode="numeric">
-          </label>
-          <label>
-            服务器公网访问地址
-            <input id="relayPublicAddress" placeholder="relay.example.com 或 203.0.113.10" autocomplete="off">
+            本机设备名称
+            <input id="officialDeviceName" placeholder="例如 office-pc" autocomplete="off">
           </label>
         </div>
         <div class="actions">
-          <button id="checkSelfRelay" type="button" class="secondary">检查云服务器</button>
-          <button id="deploySelfRelay" type="button">部署自建中继</button>
-          <label class="check-label">
-            <input id="relayLongLivedCode" type="checkbox" checked>
-            长期接入码
-          </label>
-          <label class="limit-label">
-            设备数限制
-            <input id="relayMaxUses" value="10" inputmode="numeric">
-          </label>
+          <button id="officialCreateAccount" type="button">创建测试账号</button>
+          <button id="officialCreateNetwork" type="button" class="secondary">创建官方网络</button>
+          <button id="officialCreateInvite" type="button" class="secondary">生成官方邀请</button>
+          <button id="officialJoinDevice" type="button">加入当前设备</button>
+          <button id="officialHeartbeat" type="button" class="secondary">发送 heartbeat</button>
+          <button id="officialRefreshDevices" type="button" class="secondary">刷新官方设备</button>
         </div>
         <div class="result-strip">
-          <span>远程服务状态：<strong id="relayRemoteService">未知</strong></span>
-          <span>主机指纹：<strong id="relayHostFingerprint">-</strong></span>
-          <span>有效期：<strong id="relayInviteExpiry">-</strong></span>
+          <span>账号：<strong id="officialAccountID">-</strong></span>
+          <span>网络：<strong id="officialNetworkID">-</strong></span>
+          <span>当前设备：<strong id="officialDeviceID">-</strong></span>
         </div>
         <div class="access-box">
-          <label>
-            接入链接
-            <textarea id="relayAccessLink" readonly placeholder="部署成功后生成"></textarea>
-          </label>
           <div class="code-row">
             <div>
-              <span>接入码</span>
-              <strong id="relayAccessCode">------</strong>
+              <span>官方邀请接入码</span>
+              <strong id="officialInviteCode">------</strong>
             </div>
-            <span class="muted">家里电脑和外出电脑都作为客户端加入该中继。</span>
-          </div>
-          <div class="actions">
-            <button id="copyRelayInviteLink" type="button">复制链接</button>
-            <button id="copyRelayInviteCode" type="button" class="secondary">复制接入码</button>
+            <span id="officialInviteExpiry" class="muted">生成官方邀请后，可将当前设备加入该官方网络。</span>
           </div>
         </div>
-        <div id="relayHealth" class="checks"></div>
+        <div id="officialRelayReminder" class="relay-reminder" hidden></div>
+        <div id="officialDeviceList" class="device-list"></div>
+        <section id="officialTeamPanel" class="team-management" aria-labelledby="officialTeamTitle">
+          <div class="section-head compact-head">
+            <div>
+              <h3 id="officialTeamTitle">团队权限与连接授权</h3>
+              <p class="muted">管理成员角色、设备分组和 connect 授权；所有操作由 Hub RBAC 再次校验。</p>
+            </div>
+            <button id="officialRefreshTeam" type="button" class="secondary">刷新团队</button>
+          </div>
+          <p id="officialTeamMessage" class="team-message" role="status">尚未创建或选择组织。</p>
+          <div class="result-strip">
+            <span>组织：<strong id="officialOrganizationID">-</strong></span>
+            <span>组织状态：<strong id="officialOrganizationStatus">-</strong></span>
+          </div>
+          <div class="team-grid">
+            <article class="team-card">
+              <h3>组织</h3>
+              <label>组织名称<input id="officialOrganizationName" placeholder="例如 Example Team" autocomplete="organization"></label>
+              <button id="officialCreateOrganization" type="button">创建组织</button>
+            </article>
+            <article class="team-card">
+              <h3>成员角色</h3>
+              <label>成员账号 ID<input id="officialMemberAccountID" autocomplete="off"></label>
+              <label>角色<select id="officialMemberRole"><option value="admin">admin</option><option value="operator">operator</option><option value="member">member</option></select></label>
+              <button id="officialChangeMemberRole" type="button">调整角色</button>
+            </article>
+            <article class="team-card">
+              <h3>设备分组</h3>
+              <label>分组名称<input id="officialGroupName" placeholder="例如 Production" autocomplete="off"></label>
+              <label>分组 ID<input id="officialGroupID" autocomplete="off"></label>
+              <div class="actions compact"><button id="officialCreateGroup" type="button">创建</button><button id="officialRenameGroup" type="button" class="secondary">重命名</button><button id="officialDeleteGroup" type="button" class="danger">删除</button></div>
+            </article>
+            <article class="team-card">
+              <h3>设备纳管与分组</h3>
+              <label>设备 ID<input id="officialTeamDeviceID" autocomplete="off"></label>
+              <label>分组 ID<input id="officialTeamDeviceGroupID" autocomplete="off"></label>
+              <div class="actions compact"><button id="officialEnrollTeamDevice" type="button">纳入组织</button><button id="officialAddTeamDeviceGroup" type="button" class="secondary">加入分组</button><button id="officialRemoveTeamDeviceGroup" type="button" class="secondary">移出分组</button></div>
+            </article>
+            <article class="team-card">
+              <h3>连接授权</h3>
+              <label>成员账号 ID<input id="officialGrantMemberID" autocomplete="off"></label>
+              <label>授权范围<select id="officialGrantScope"><option value="device">设备</option><option value="group">分组</option></select></label>
+              <label>设备或分组 ID<input id="officialGrantTargetID" autocomplete="off"></label>
+              <button id="officialGrantConnection" type="button">授予 connect</button>
+            </article>
+          </div>
+          <div class="team-lists">
+            <div><h3>成员</h3><div id="officialTeamMembers" class="team-list"></div></div>
+            <div><h3>分组</h3><div id="officialTeamGroups" class="team-list"></div></div>
+            <div><h3>组织设备</h3><div id="officialTeamDevices" class="team-list"></div></div>
+            <div><h3>连接授权</h3><div id="officialTeamGrants" class="team-list"></div></div>
+          </div>
+          <section id="officialDeploymentPanel" class="deployment-management" aria-labelledby="officialDeploymentTitle">
+            <div class="section-head compact-head">
+              <div>
+                <h3 id="officialDeploymentTitle">批量部署与版本 rollout</h3>
+                <p class="muted">仅 active owner/admin 可操作。部署凭据只在生成响应显示一次，并受组织/分组、平台、有效期和次数约束。</p>
+              </div>
+              <button id="officialRefreshDeployments" type="button" class="secondary">刷新部署状态</button>
+            </div>
+            <p id="officialDeploymentMessage" class="team-message" role="status">固定模板不接受自定义命令、下载 URL 或环境变量名。</p>
+            <div class="deployment-grid">
+              <article class="team-card">
+                <h3>生成预配置部署包</h3>
+                <label>目标分组 ID（可选）<input id="officialDeploymentGroupID" autocomplete="off"></label>
+                <label>平台<select id="officialDeploymentPlatform"><option value="windows">Windows</option><option value="linux">Linux</option></select></label>
+                <label>架构<select id="officialDeploymentArchitecture"><option value="amd64">amd64</option></select></label>
+                <label>有效分钟<input id="officialDeploymentTTLMinutes" type="number" min="1" max="1440" value="15" inputmode="numeric"></label>
+                <label>最大兑换次数<input id="officialDeploymentMaxUses" type="number" min="1" max="1000" value="10" inputmode="numeric"></label>
+                <button id="officialCreateDeploymentBundle" type="button">生成固定模板</button>
+                <p class="muted">一次显示的引导凭据：</p>
+                <code id="officialDeploymentCredential" class="one-time-secret">尚未生成</code>
+                <div id="officialDeploymentArtifacts" class="deployment-artifacts"><p class="empty">生成后可下载固定脚本、配置与 manifest</p></div>
+                <label>凭据 ID<input id="officialDeploymentCredentialID" autocomplete="off"></label>
+                <button id="officialRevokeDeploymentCredential" type="button" class="danger">撤销凭据</button>
+              </article>
+              <article class="team-card">
+                <h3>创建版本 rollout</h3>
+                <label>目标分组 ID（留空表示组织设备）<input id="officialRolloutGroupID" autocomplete="off"></label>
+                <label>设备 ID（可选，逗号分隔）<input id="officialRolloutDeviceIDs" autocomplete="off"></label>
+                <label>受控目标版本<input id="officialRolloutTargetVersion" value="0.1.0-dev" autocomplete="off"></label>
+                <button id="officialCreateRollout" type="button">创建 rollout</button>
+                <label>Rollout ID<input id="officialRolloutID" autocomplete="off"></label>
+                <div class="actions compact"><button id="officialViewRollout" type="button" class="secondary">查看</button><button id="officialCancelRollout" type="button" class="danger">取消未开始设备</button></div>
+                <p class="muted">失败设备可单独重试；成功设备和其他设备不会重复升级。</p>
+              </article>
+            </div>
+            <div class="team-lists deployment-lists">
+              <div><h3>部署包</h3><div id="officialDeploymentBundleList" class="team-list"></div></div>
+              <div><h3>Rollouts</h3><div id="officialRolloutList" class="team-list"></div></div>
+            </div>
+            <div><h3>逐设备状态</h3><div id="officialRolloutTargets" class="rollout-target-list"><p class="empty">尚未选择 rollout</p></div></div>
+          </section>
+          <section id="officialPrivateLicensePanel" class="private-license-management" aria-labelledby="officialPrivateLicenseTitle">
+            <div class="section-head compact-head">
+              <div>
+                <h3 id="officialPrivateLicenseTitle">企业私有部署授权</h3>
+                <p class="muted">仅 active owner/admin 可查看或导入。Hub 会重新校验签名、organization 与 deployment 绑定。</p>
+              </div>
+              <button id="officialRefreshPrivateLicense" type="button" class="secondary">刷新授权摘要</button>
+            </div>
+            <label>已签名授权文件内容
+              <textarea id="officialPrivateLicenseDocument" spellcheck="false" placeholder="粘贴完整的已签名授权 JSON；不要粘贴任何私钥"></textarea>
+            </label>
+            <div class="actions compact"><button id="officialImportPrivateLicense" type="button">导入并原子替换</button></div>
+            <p id="officialPrivateLicenseMessage" class="team-message" role="status">尚未读取私有部署授权。</p>
+            <pre id="officialPrivateLicenseSummary" class="private-license-summary">授权摘要尚未加载</pre>
+            <div id="officialPrivateLicenseSupport" class="support-boundary">
+              <strong>合同支持入口</strong>
+              <p>不会自动上传用户内容、远程桌面、文件、剪贴板、日志或原始授权。需要支持时，仅人工提供授权 ID、deployment ID、版本、错误类别与时间；诊断导出前请自行复核。</p>
+            </div>
+          </section>
+          <section id="officialAuditPanel" class="audit-management" aria-labelledby="officialAuditTitle">
+            <div class="section-head compact-head">
+              <div>
+                <h3 id="officialAuditTitle">组织审计</h3>
+                <p class="muted">仅 active owner/admin 可查看或清理；结果受组织 owner 当前有效套餐保留期约束。</p>
+              </div>
+              <button id="officialAuditQuery" type="button" class="secondary">查询审计</button>
+            </div>
+            <div class="audit-filters">
+              <label>成员账号 ID<input id="officialAuditMemberID" autocomplete="off"></label>
+              <label>源设备 ID<input id="officialAuditSourceDeviceID" autocomplete="off"></label>
+              <label>目标设备 ID<input id="officialAuditTargetDeviceID" autocomplete="off"></label>
+              <label>开始时间<input id="officialAuditStartTime" type="datetime-local"></label>
+              <label>结束时间<input id="officialAuditEndTime" type="datetime-local"></label>
+              <label>连接方式<select id="officialAuditConnectionMethod"><option value="">全部</option><option value="lan_direct">LAN 直连</option><option value="public_direct">公网直连</option><option value="relay">Relay</option></select></label>
+              <label>Relay 最小字节<input id="officialAuditMinRelayBytes" type="number" min="0" value="0" inputmode="numeric"></label>
+              <label>每页条数<select id="officialAuditPageSize"><option value="20">20</option><option value="50">50</option><option value="100">100</option></select></label>
+              <label class="checkbox-row"><input id="officialAuditRelayOnly" type="checkbox">仅看有 Relay 流量的记录</label>
+            </div>
+            <p id="officialAuditMessage" class="team-message" role="status">设置筛选条件后查询组织审计。</p>
+            <p id="officialAuditRetention" class="audit-retention">尚未解析审计保留期。</p>
+            <div id="officialAuditList" class="audit-list"><p class="empty">暂无符合条件的审计记录</p></div>
+            <div class="actions compact audit-pagination">
+              <button id="officialAuditPrevious" type="button" class="secondary" disabled>上一页</button>
+              <button id="officialAuditNext" type="button" class="secondary" disabled>下一页</button>
+            </div>
+            <div class="audit-cleanup">
+              <label>单批清理上限<input id="officialAuditCleanupBatchSize" type="number" min="1" max="1000" value="100" inputmode="numeric"></label>
+              <button id="officialAuditCleanup" type="button" class="danger">清理过期记录</button>
+              <p id="officialAuditCleanupResult" class="muted">尚未执行清理。</p>
+            </div>
+          </section>
+        </section>
       </section>
 
-      <details id="advancedSettings" class="advanced-settings">
-        <summary>高级设置</summary>
-        <div class="advanced-grid">
-          <section>
-            <h2>服务</h2>
-            <label>
-              服务名
-              <input id="serviceName" value="MeshlinkAgent" autocomplete="off">
-            </label>
-            <label>
-              配置文件路径
-              <input id="configPath" autocomplete="off">
-            </label>
-            <div class="actions compact">
-              <button data-action="install" type="button">安装服务</button>
-              <button data-action="start" type="button">启动服务</button>
-              <button data-action="stop" type="button" class="secondary">停止服务</button>
-              <button data-action="uninstall" type="button" class="secondary">卸载服务</button>
-            </div>
-          </section>
-
-          <section>
-            <h2>证书</h2>
-            <label>
-              CA 输出目录
-              <input id="certOut" autocomplete="off">
-            </label>
-            <label>
-              CA 名称
-              <input id="caName" value="我的组网" autocomplete="off">
-            </label>
-            <div class="actions compact">
-              <button id="initCA" type="button">创建 CA</button>
-            </div>
-            <label>
-              签发节点证书
-              <input id="nodeName" placeholder="节点名称" autocomplete="off">
-            </label>
-            <div class="form-grid">
-              <label>
-                DNS SAN
-                <input id="dnsSans" autocomplete="off">
-              </label>
-              <label>
-                IP SAN
-                <input id="ipSans" autocomplete="off">
-              </label>
-            </div>
-            <label>
-              有效天数
-              <input id="certDays" value="825" inputmode="numeric">
-            </label>
-            <div class="actions compact">
-              <button id="issueCert" type="button">签发证书</button>
-            </div>
-          </section>
-        </div>
-
-        <section>
-          <h2>JSON 配置</h2>
-          <textarea id="configEditor" spellcheck="false"></textarea>
-          <div class="actions compact">
-            <button id="loadConfig" type="button">读取配置</button>
-            <button id="saveConfig" type="button" class="secondary">保存配置</button>
-          </div>
-        </section>
-
-        <section>
-          <h2>日志和详细诊断</h2>
-          <input id="rdpTarget" type="hidden" value="10.77.0.2">
-          <div class="actions compact">
-            <button id="loadLogs" type="button">读取日志</button>
-            <button id="runDiagnostics" type="button" class="secondary">开始诊断</button>
-            <button id="openRdp" type="button" class="secondary">打开远程桌面</button>
-            <button id="checkRdp" type="button" class="secondary">检查 RDP</button>
-          </div>
-          <pre id="logs"></pre>
-          <div id="diagnostics" class="checks"></div>
-        </section>
-      </details>
+      <input id="serviceName" type="hidden" value="MeshlinkAgent"><input id="configPath" type="hidden"><input id="rdpTarget" type="hidden" value="10.77.0.2">
     </main>
 
     <div id="toast" role="status" aria-live="polite"></div>

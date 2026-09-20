@@ -1,6 +1,6 @@
 # Third-Party Notices
 
-本文件列出 Meshlink 随包引用、依赖或分发的主要第三方组件。第三方组件的版权、商标和许可条款归其各自权利人所有。Meshlink 的原创代码和随附文档采用 MIT License，详见 [LICENSE](LICENSE)。第三方组件继续按各自许可证授权，其原有权利和义务不因 Meshlink 的授权方式变更而改变。
+本文件列出 Meshlink 随包引用、依赖或分发的主要第三方组件。第三方组件的版权、商标和许可条款归其各自权利人所有。本项目的专有许可证仅适用于 Meshlink 项目自身拥有权利的代码、文档、配置、界面和相关资源，不改变第三方组件原有许可证授予的权利或限制。
 
 ## Wintun
 
@@ -30,3 +30,7 @@ Meshlink 仅按原样随包分发官方预编译的 `wintun.dll`，用于实现 
 ## Go Dependencies
 
 Meshlink 还可能依赖 Go 模块、系统库和其他运行时组件。相关组件的具体版本以 `go.mod`、`go.sum` 和实际构建产物为准。各依赖组件的版权和许可条款归其各自权利人所有，并按其原始许可证执行。
+
+### quic-go
+
+Meshlink 使用 `github.com/quic-go/quic-go` v0.61.0，在同一个 UDP socket 上提供 QUIC 监听、拨号、非 QUIC 会合包分流以及后续的数据报传输能力。quic-go 由 quic-go authors 与 Google, Inc. 版权所有，并依据 MIT License 发布。许可证与源码见 `https://github.com/quic-go/quic-go`。

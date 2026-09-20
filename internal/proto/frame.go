@@ -8,12 +8,13 @@ import (
 )
 
 const (
-	TypeHello  byte = 1
-	TypePacket byte = 2
-	TypePing   byte = 3
-	TypePong   byte = 4
-	TypeError  byte = 5
-	TypeRoster byte = 6
+	TypeHello   byte = 1
+	TypePacket  byte = 2
+	TypePing    byte = 3
+	TypePong    byte = 4
+	TypeError   byte = 5
+	TypeRoster  byte = 6
+	TypeControl byte = 7
 
 	MaxPayload = 1 << 20
 )

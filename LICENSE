@@ -1,21 +1,15 @@
-MIT License
+Proprietary License
 
-Copyright (c) 2026 Jiawei Lin
+Copyright (c) 2026 Meshlink Project Owner. All Rights Reserved.
 
-Permission is hereby granted, free of charge, to any person obtaining a copy
-of this software and associated documentation files (the "Software"), to deal
-in the Software without restriction, including without limitation the rights
-to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
-copies of the Software, and to permit persons to whom the Software is
-furnished to do so, subject to the following conditions:
+本项目为专有软件。未经版权所有者事先明确书面许可，任何个人、组织或实体不得使用、复制、修改、改编、翻译、合并、分发、发布、转载、镜像、再授权、出售、出租、转让、商业部署、二次开发，或基于本项目创建任何衍生作品、服务、产品或数据集。
 
-The above copyright notice and this permission notice shall be included in all
-copies or substantial portions of the Software.
+本项目及其源代码、文档、界面、配置文件、构建脚本、二进制文件及相关资源，仅可在版权所有者明确授权的范围内使用。任何未经授权的使用、传播、修改、二次开发或商业利用行为，均可能构成侵权，版权所有者保留依法追究责任的权利。
 
-THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
-IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
-FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
-AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
-LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
-OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
-SOFTWARE.
+如果本项目以公开仓库形式托管在 GitHub 上，访问者可以按照 GitHub 平台功能查看仓库内容。GitHub 平台可能允许用户在 GitHub 服务范围内 fork 公开仓库，但这不代表版权所有者授予任何额外的软件使用权、修改权、分发权、商业使用权或二次开发权。
+
+本项目可能引用、依赖或随包分发第三方开源组件、系统组件或运行库，包括但不限于 Windows 版本中用于 TUN 虚拟网卡功能的 `wintun.dll`。第三方组件的版权和许可条款归其各自权利人所有，并按照其原始许可证执行。本许可证不适用于第三方组件，也不改变第三方组件原有许可证授予的权利或限制。关于第三方组件的更多信息见 `THIRD_PARTY_NOTICES.md`。
+
+本项目仅用于合法、自有或已获授权的设备之间进行远程访问、网络连接和运维管理。严禁将本项目用于未经授权的网络访问、入侵、攻击、扫描、数据窃取、绕过访问控制、规避监管或其他违法违规用途。
+
+本项目按“现状”提供，不作任何明示或暗示的保证，包括但不限于适销性、特定用途适用性、稳定性、安全性、兼容性、持续可用性或无错误保证。使用者应自行承担安装、配置、运行、部署和使用本项目所产生的全部风险。因使用、误用或无法使用本项目而产生的任何直接或间接损失，版权所有者不承担责任，法律另有强制规定的除外。

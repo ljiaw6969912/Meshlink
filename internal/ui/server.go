@@ -13,13 +13,19 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"runtime"
 	"strconv"
 	"strings"
+	"time"
 
 	"meshlink/internal/certutil"
+	"meshlink/internal/cloudhub"
 	"meshlink/internal/config"
 	"meshlink/internal/diagnose"
+	"meshlink/internal/networklifecycle"
 	"meshlink/internal/onboarding"
+	"meshlink/internal/p2p"
+	"meshlink/internal/productflags"
 	"meshlink/internal/rdp"
 	"meshlink/internal/winservice"
 )
@@ -45,12 +51,43 @@ func NewServerWithBaseDir(logger *slog.Logger, baseDir string) http.Handler {
 	mux.HandleFunc("POST /api/onboarding/create-hub", server.handleOnboardingCreateHub)
 	mux.HandleFunc("POST /api/onboarding/invite", server.handleOnboardingInvite)
 	mux.HandleFunc("POST /api/onboarding/join", server.handleOnboardingJoin)
+	mux.HandleFunc("POST /api/onboarding/leave", server.handleOnboardingLeave)
 	mux.HandleFunc("GET /api/onboarding/devices", server.handleOnboardingDevices)
 	mux.HandleFunc("POST /api/onboarding/device/rename", server.handleOnboardingDeviceRename)
 	mux.HandleFunc("POST /api/onboarding/device/disable", server.handleOnboardingDeviceDisable)
 	mux.HandleFunc("POST /api/onboarding/device/remove", server.handleOnboardingDeviceRemove)
 	mux.HandleFunc("POST /api/self-relay/check", server.handleSelfRelayCheck)
 	mux.HandleFunc("POST /api/self-relay/deploy", server.handleSelfRelayDeploy)
+	mux.HandleFunc("GET /api/official-hub/state", server.handleOfficialHubState)
+	mux.HandleFunc("POST /api/official-hub/account", server.handleOfficialHubAccount)
+	mux.HandleFunc("POST /api/official-hub/network", server.handleOfficialHubNetwork)
+	mux.HandleFunc("POST /api/official-hub/invite", server.handleOfficialHubInvite)
+	mux.HandleFunc("POST /api/official-hub/join-device", server.handleOfficialHubJoinDevice)
+	mux.HandleFunc("POST /api/official-hub/heartbeat", server.handleOfficialHubHeartbeat)
+	mux.HandleFunc("GET /api/official-hub/devices", server.handleOfficialHubDevices)
+	mux.HandleFunc("GET /api/official-hub/subscription-experience", server.handleOfficialHubSubscriptionExperience)
+	mux.HandleFunc("POST /api/official-hub/organization", server.handleOfficialHubOrganization)
+	mux.HandleFunc("GET /api/official-hub/team", server.handleOfficialHubTeam)
+	mux.HandleFunc("POST /api/official-hub/team/member-role", server.handleOfficialHubMemberRole)
+	mux.HandleFunc("POST /api/official-hub/team/group", server.handleOfficialHubGroup)
+	mux.HandleFunc("POST /api/official-hub/team/group/rename", server.handleOfficialHubGroupRename)
+	mux.HandleFunc("POST /api/official-hub/team/group/delete", server.handleOfficialHubGroupDelete)
+	mux.HandleFunc("POST /api/official-hub/team/device/enroll", server.handleOfficialHubTeamDeviceEnroll)
+	mux.HandleFunc("POST /api/official-hub/team/device/group", server.handleOfficialHubTeamDeviceGroup)
+	mux.HandleFunc("POST /api/official-hub/team/grant", server.handleOfficialHubConnectionGrant)
+	mux.HandleFunc("POST /api/official-hub/team/grant/revoke", server.handleOfficialHubConnectionGrantRevoke)
+	mux.HandleFunc("GET /api/official-hub/team/audit", server.handleOfficialHubAudit)
+	mux.HandleFunc("POST /api/official-hub/team/audit/cleanup", server.handleOfficialHubAuditCleanup)
+	mux.HandleFunc("POST /api/official-hub/team/deployment-bundle", server.handleOfficialHubDeploymentBundle)
+	mux.HandleFunc("GET /api/official-hub/team/deployment-bundles", server.handleOfficialHubDeploymentBundles)
+	mux.HandleFunc("POST /api/official-hub/team/bootstrap-credential/revoke", server.handleOfficialHubBootstrapCredentialRevoke)
+	mux.HandleFunc("POST /api/official-hub/team/rollout", server.handleOfficialHubRolloutCreate)
+	mux.HandleFunc("GET /api/official-hub/team/rollouts", server.handleOfficialHubRollouts)
+	mux.HandleFunc("GET /api/official-hub/team/rollout", server.handleOfficialHubRollout)
+	mux.HandleFunc("POST /api/official-hub/team/rollout/cancel", server.handleOfficialHubRolloutCancel)
+	mux.HandleFunc("POST /api/official-hub/team/rollout/retry", server.handleOfficialHubRolloutRetry)
+	mux.HandleFunc("GET /api/official-hub/team/private-license", server.handleOfficialHubPrivateLicense)
+	mux.HandleFunc("POST /api/official-hub/team/private-license", server.handleOfficialHubPrivateLicenseImport)
 	mux.HandleFunc("GET /api/service/status", server.handleServiceStatus)
 	mux.HandleFunc("POST /api/service", server.handleServiceAction)
 	mux.HandleFunc("POST /api/certs/init-ca", server.handleInitCA)
@@ -60,6 +97,7 @@ func NewServerWithBaseDir(logger *slog.Logger, baseDir string) http.Handler {
 	mux.HandleFunc("GET /api/logs", server.handleLogs)
 	mux.HandleFunc("POST /api/rdp/open", server.handleOpenRDP)
 	mux.HandleFunc("GET /api/diagnostics", server.handleDiagnostics)
+	mux.HandleFunc("GET /api/diagnostics/report", server.handleOneClickDiagnostics)
 	mux.HandleFunc("GET /api/diagnostics/rdp", server.handleRDPDiagnostics)
 
 	sub, err := fs.Sub(staticFS, "static")
@@ -86,6 +124,9 @@ func (s *Server) handleInfo(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, map[string]any{
 		"ok":  true,
 		"cwd": cwd,
+		"features": map[string]bool{
+			"official_hub_mvp": productflags.OfficialHubMVPEnabled(),
+		},
 	})
 }
 
@@ -107,7 +148,16 @@ func (s *Server) handleOnboardingStartServer(w http.ResponseWriter, r *http.Requ
 	if !decodeJSON(w, r, &req) {
 		return
 	}
-	result, err := s.onboardingManager().StartServerMode(req)
+	if strings.TrimSpace(req.ServerAddress) == "" {
+		writeError(w, fmt.Errorf("请填写其他设备能够访问的域名或公网地址"))
+		return
+	}
+	manager, err := onboarding.SelectRole(s.effectiveBaseDir(), "hub")
+	if err != nil {
+		writeError(w, err)
+		return
+	}
+	result, err := manager.StartServerMode(req)
 	if err != nil {
 		writeError(w, err)
 		return
@@ -133,7 +183,7 @@ func (s *Server) handleOnboardingInvite(w http.ResponseWriter, r *http.Request) 
 	if !decodeJSON(w, r, &req) {
 		return
 	}
-	invite, err := s.onboardingManager().CreateInvite(req)
+	invite, err := s.onboardingManager().CreateServerInvite(req)
 	if err != nil {
 		writeError(w, err)
 		return
@@ -146,7 +196,25 @@ func (s *Server) handleOnboardingJoin(w http.ResponseWriter, r *http.Request) {
 	if !decodeJSON(w, r, &req) {
 		return
 	}
-	result, err := s.onboardingManager().JoinSpoke(req)
+	if s.onboardingManager().IsOwnServerInvite(req.InviteLink) {
+		writeError(w, fmt.Errorf("本机就是此网络的服务器，本机节点会自动连接，请使用启动服务器"))
+		return
+	}
+	manager, err := onboarding.SelectRole(s.effectiveBaseDir(), "spoke")
+	if err != nil {
+		writeError(w, err)
+		return
+	}
+	installed, _ := winservice.Status(winservice.DefaultName)
+	imported, err := manager.ImportInstalledSpoke(installed.ConfigPath, req.InviteLink)
+	if err != nil {
+		writeError(w, err)
+		return
+	}
+	if imported {
+		req.NodeName = ""
+	}
+	result, err := manager.JoinSpoke(req)
 	if err != nil {
 		writeError(w, err)
 		return
@@ -156,6 +224,30 @@ func (s *Server) handleOnboardingJoin(w http.ResponseWriter, r *http.Request) {
 
 func (s *Server) handleOnboardingDevices(w http.ResponseWriter, r *http.Request) {
 	devices, err := s.onboardingManager().Devices(r.URL.Query().Get("service_name"))
+	if err != nil {
+		writeError(w, err)
+		return
+	}
+	if runtime.GOOS == "windows" {
+		service, err := winservice.Status(r.URL.Query().Get("service_name"))
+		devices = onboarding.WithServiceRunning(devices, err == nil && service.Installed && service.State == "running")
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "devices": devices})
+}
+
+func (s *Server) handleOnboardingLeave(w http.ResponseWriter, r *http.Request) {
+	var req struct {
+		ServiceName string `json:"service_name"`
+	}
+	if !decodeJSON(w, r, &req) {
+		return
+	}
+	manager := s.onboardingManager()
+	if err := networklifecycle.Leave(manager, req.ServiceName); err != nil {
+		writeError(w, err)
+		return
+	}
+	devices, err := manager.Devices(req.ServiceName)
 	if err != nil {
 		writeError(w, err)
 		return
@@ -233,6 +325,459 @@ func (s *Server) handleSelfRelayDeploy(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "result": result})
+}
+
+func (s *Server) handleOfficialHubState(w http.ResponseWriter, _ *http.Request) {
+	state, err := s.onboardingManager().OfficialHubState()
+	if err != nil {
+		writeError(w, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "state": state})
+}
+
+func (s *Server) handleOfficialHubAccount(w http.ResponseWriter, r *http.Request) {
+	var req onboarding.OfficialHubAccountRequest
+	if !decodeJSON(w, r, &req) {
+		return
+	}
+	result, err := s.onboardingManager().CreateOfficialHubAccount(r.Context(), req)
+	if err != nil {
+		writeError(w, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{
+		"ok":      true,
+		"account": result.Account,
+		"state":   result.State,
+	})
+}
+
+func (s *Server) handleOfficialHubNetwork(w http.ResponseWriter, r *http.Request) {
+	var req onboarding.OfficialHubNetworkRequest
+	if !decodeJSON(w, r, &req) {
+		return
+	}
+	result, err := s.onboardingManager().CreateOfficialHubNetwork(r.Context(), req)
+	if err != nil {
+		writeError(w, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{
+		"ok":      true,
+		"network": result.Network,
+		"state":   result.State,
+	})
+}
+
+func (s *Server) handleOfficialHubInvite(w http.ResponseWriter, r *http.Request) {
+	var req onboarding.OfficialHubInviteRequest
+	if !decodeJSON(w, r, &req) {
+		return
+	}
+	result, err := s.onboardingManager().CreateOfficialHubInvite(r.Context(), req)
+	if err != nil {
+		writeError(w, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{
+		"ok":     true,
+		"invite": result.Invite,
+		"state":  result.State,
+	})
+}
+
+func (s *Server) handleOfficialHubJoinDevice(w http.ResponseWriter, r *http.Request) {
+	var req onboarding.OfficialHubJoinDeviceRequest
+	if !decodeJSON(w, r, &req) {
+		return
+	}
+	result, err := s.onboardingManager().JoinOfficialHubDevice(r.Context(), req)
+	if err != nil {
+		writeError(w, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{
+		"ok":     true,
+		"device": result.Device,
+		"state":  result.State,
+	})
+}
+
+func (s *Server) handleOfficialHubHeartbeat(w http.ResponseWriter, r *http.Request) {
+	var req onboarding.OfficialHubHeartbeatRequest
+	if !decodeJSON(w, r, &req) {
+		return
+	}
+	result, err := s.onboardingManager().HeartbeatOfficialHubDevice(r.Context(), req)
+	if err != nil {
+		writeError(w, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{
+		"ok":     true,
+		"device": result.Device,
+		"state":  result.State,
+	})
+}
+
+func (s *Server) handleOfficialHubDevices(w http.ResponseWriter, r *http.Request) {
+	result, err := s.onboardingManager().ListOfficialHubDevices(r.Context(), onboarding.OfficialHubDevicesRequest{
+		HubAPIURL: r.URL.Query().Get("hub_api_url"),
+		NetworkID: r.URL.Query().Get("network_id"),
+	})
+	if err != nil {
+		writeError(w, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{
+		"ok":                   true,
+		"devices":              result.Devices,
+		"state":                result.State,
+		"relay_usage_reminder": result.RelayUsageReminder,
+	})
+}
+
+func (s *Server) handleOfficialHubSubscriptionExperience(w http.ResponseWriter, r *http.Request) {
+	experience, err := s.onboardingManager().OfficialHubSubscriptionExperience(r.Context(), onboarding.OfficialHubSubscriptionExperienceRequest{
+		HubAPIURL: r.URL.Query().Get("hub_api_url"),
+	})
+	if err != nil {
+		writeError(w, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{
+		"ok":         true,
+		"experience": experience,
+	})
+}
+
+func (s *Server) handleOfficialHubOrganization(w http.ResponseWriter, r *http.Request) {
+	var req onboarding.OfficialHubOrganizationRequest
+	if !decodeJSON(w, r, &req) {
+		return
+	}
+	organization, state, err := s.onboardingManager().CreateOfficialHubOrganization(r.Context(), req)
+	if err != nil {
+		writeError(w, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "organization": organization, "state": state})
+}
+
+func (s *Server) handleOfficialHubTeam(w http.ResponseWriter, r *http.Request) {
+	result, err := s.onboardingManager().OfficialHubTeam(r.Context(), onboarding.OfficialHubTeamRequest{
+		HubAPIURL: r.URL.Query().Get("hub_api_url"), OrganizationID: r.URL.Query().Get("organization_id"),
+	})
+	if err != nil {
+		writeError(w, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{
+		"ok": true, "organization": result.Organization, "members": result.Members,
+		"groups": result.Groups, "devices": result.Devices, "grants": result.Grants, "state": result.State,
+	})
+}
+
+func (s *Server) handleOfficialHubPrivateLicense(w http.ResponseWriter, r *http.Request) {
+	license, err := s.onboardingManager().GetOfficialHubPrivateLicense(r.Context(), onboarding.OfficialHubTeamRequest{
+		HubAPIURL: r.URL.Query().Get("hub_api_url"), OrganizationID: r.URL.Query().Get("organization_id"),
+	})
+	if err != nil {
+		writeError(w, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "license": license})
+}
+
+func (s *Server) handleOfficialHubPrivateLicenseImport(w http.ResponseWriter, r *http.Request) {
+	var req onboarding.OfficialHubPrivateLicenseRequest
+	if !decodeJSON(w, r, &req) {
+		return
+	}
+	license, err := s.onboardingManager().ImportOfficialHubPrivateLicense(r.Context(), req)
+	if err != nil {
+		writeError(w, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "license": license})
+}
+
+func (s *Server) handleOfficialHubMemberRole(w http.ResponseWriter, r *http.Request) {
+	var req onboarding.OfficialHubMemberRoleRequest
+	if !decodeJSON(w, r, &req) {
+		return
+	}
+	member, err := s.onboardingManager().ChangeOfficialHubMemberRole(r.Context(), req)
+	if err != nil {
+		writeError(w, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "member": member})
+}
+
+func (s *Server) handleOfficialHubGroup(w http.ResponseWriter, r *http.Request) {
+	var req onboarding.OfficialHubGroupRequest
+	if !decodeJSON(w, r, &req) {
+		return
+	}
+	group, err := s.onboardingManager().CreateOfficialHubGroup(r.Context(), req)
+	if err != nil {
+		writeError(w, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "group": group})
+}
+
+func (s *Server) handleOfficialHubGroupRename(w http.ResponseWriter, r *http.Request) {
+	var req onboarding.OfficialHubGroupRequest
+	if !decodeJSON(w, r, &req) {
+		return
+	}
+	group, err := s.onboardingManager().RenameOfficialHubGroup(r.Context(), req)
+	if err != nil {
+		writeError(w, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "group": group})
+}
+
+func (s *Server) handleOfficialHubGroupDelete(w http.ResponseWriter, r *http.Request) {
+	var req onboarding.OfficialHubGroupRequest
+	if !decodeJSON(w, r, &req) {
+		return
+	}
+	group, err := s.onboardingManager().DeleteOfficialHubGroup(r.Context(), req)
+	if err != nil {
+		writeError(w, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "group": group})
+}
+
+func (s *Server) handleOfficialHubTeamDeviceEnroll(w http.ResponseWriter, r *http.Request) {
+	var req onboarding.OfficialHubTeamDeviceRequest
+	if !decodeJSON(w, r, &req) {
+		return
+	}
+	device, err := s.onboardingManager().EnrollOfficialHubTeamDevice(r.Context(), req)
+	if err != nil {
+		writeError(w, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "device": device})
+}
+
+func (s *Server) handleOfficialHubTeamDeviceGroup(w http.ResponseWriter, r *http.Request) {
+	var req onboarding.OfficialHubTeamDeviceRequest
+	if !decodeJSON(w, r, &req) {
+		return
+	}
+	device, err := s.onboardingManager().ChangeOfficialHubTeamDeviceGroup(r.Context(), req)
+	if err != nil {
+		writeError(w, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "device": device})
+}
+
+func (s *Server) handleOfficialHubConnectionGrant(w http.ResponseWriter, r *http.Request) {
+	var req onboarding.OfficialHubConnectionGrantRequest
+	if !decodeJSON(w, r, &req) {
+		return
+	}
+	grant, err := s.onboardingManager().GrantOfficialHubConnection(r.Context(), req)
+	if err != nil {
+		writeError(w, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "grant": grant})
+}
+
+func (s *Server) handleOfficialHubConnectionGrantRevoke(w http.ResponseWriter, r *http.Request) {
+	var req onboarding.OfficialHubConnectionGrantRequest
+	if !decodeJSON(w, r, &req) {
+		return
+	}
+	grant, err := s.onboardingManager().RevokeOfficialHubConnection(r.Context(), req)
+	if err != nil {
+		writeError(w, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "grant": grant})
+}
+
+func (s *Server) handleOfficialHubAudit(w http.ResponseWriter, r *http.Request) {
+	values := r.URL.Query()
+	start, err := parseOfficialHubAuditTime(values.Get("start_time"), "start_time")
+	if err != nil {
+		writeError(w, err)
+		return
+	}
+	end, err := parseOfficialHubAuditTime(values.Get("end_time"), "end_time")
+	if err != nil {
+		writeError(w, err)
+		return
+	}
+	relayOnly := false
+	if raw := strings.TrimSpace(values.Get("relay_only")); raw != "" {
+		relayOnly, err = strconv.ParseBool(raw)
+		if err != nil {
+			writeError(w, fmt.Errorf("relay_only is invalid"))
+			return
+		}
+	}
+	minRelayBytes := int64(0)
+	if raw := strings.TrimSpace(values.Get("min_relay_bytes")); raw != "" {
+		minRelayBytes, err = strconv.ParseInt(raw, 10, 64)
+		if err != nil {
+			writeError(w, fmt.Errorf("min_relay_bytes is invalid"))
+			return
+		}
+	}
+	pageSize := 0
+	if raw := strings.TrimSpace(values.Get("page_size")); raw != "" {
+		pageSize, err = strconv.Atoi(raw)
+		if err != nil {
+			writeError(w, fmt.Errorf("page_size is invalid"))
+			return
+		}
+	}
+	page, err := s.onboardingManager().QueryOfficialHubAudit(r.Context(), onboarding.OfficialHubAuditRequest{
+		HubAPIURL: values.Get("hub_api_url"), OrganizationID: values.Get("organization_id"),
+		MemberAccountID: values.Get("member_account_id"), SourceDeviceID: values.Get("source_device_id"), TargetDeviceID: values.Get("target_device_id"),
+		StartTime: start, EndTime: end, ConnectionMethod: values.Get("connection_method"), RelayOnly: relayOnly,
+		MinRelayBytes: minRelayBytes, PageSize: pageSize, Cursor: values.Get("cursor"),
+	})
+	if err != nil {
+		writeError(w, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "page": page})
+}
+
+func (s *Server) handleOfficialHubAuditCleanup(w http.ResponseWriter, r *http.Request) {
+	var req onboarding.OfficialHubAuditCleanupRequest
+	if !decodeJSON(w, r, &req) {
+		return
+	}
+	result, err := s.onboardingManager().CleanupOfficialHubAudit(r.Context(), req)
+	if err != nil {
+		writeError(w, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "result": result})
+}
+
+func (s *Server) handleOfficialHubDeploymentBundle(w http.ResponseWriter, r *http.Request) {
+	var req onboarding.OfficialHubDeploymentBundleRequest
+	if !decodeJSON(w, r, &req) {
+		return
+	}
+	result, err := s.onboardingManager().CreateOfficialHubDeploymentBundle(r.Context(), req)
+	if err != nil {
+		writeError(w, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "result": result})
+}
+
+func (s *Server) handleOfficialHubDeploymentBundles(w http.ResponseWriter, r *http.Request) {
+	bundles, err := s.onboardingManager().ListOfficialHubDeploymentBundles(r.Context(), onboarding.OfficialHubTeamRequest{
+		HubAPIURL: r.URL.Query().Get("hub_api_url"), OrganizationID: r.URL.Query().Get("organization_id"),
+	})
+	if err != nil {
+		writeError(w, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "bundles": bundles})
+}
+
+func (s *Server) handleOfficialHubBootstrapCredentialRevoke(w http.ResponseWriter, r *http.Request) {
+	var req onboarding.OfficialHubDeploymentCredentialRequest
+	if !decodeJSON(w, r, &req) {
+		return
+	}
+	credential, err := s.onboardingManager().RevokeOfficialHubBootstrapCredential(r.Context(), req)
+	if err != nil {
+		writeError(w, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "credential": credential})
+}
+
+func (s *Server) handleOfficialHubRolloutCreate(w http.ResponseWriter, r *http.Request) {
+	var req onboarding.OfficialHubRolloutRequest
+	if !decodeJSON(w, r, &req) {
+		return
+	}
+	result, err := s.onboardingManager().CreateOfficialHubRollout(r.Context(), req)
+	if err != nil {
+		writeError(w, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "result": result})
+}
+
+func (s *Server) handleOfficialHubRollouts(w http.ResponseWriter, r *http.Request) {
+	rollouts, err := s.onboardingManager().ListOfficialHubRollouts(r.Context(), onboarding.OfficialHubTeamRequest{
+		HubAPIURL: r.URL.Query().Get("hub_api_url"), OrganizationID: r.URL.Query().Get("organization_id"),
+	})
+	if err != nil {
+		writeError(w, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "rollouts": rollouts})
+}
+
+func (s *Server) handleOfficialHubRollout(w http.ResponseWriter, r *http.Request) {
+	result, err := s.onboardingManager().GetOfficialHubRollout(r.Context(), onboarding.OfficialHubRolloutRequest{
+		HubAPIURL: r.URL.Query().Get("hub_api_url"), OrganizationID: r.URL.Query().Get("organization_id"), RolloutID: r.URL.Query().Get("rollout_id"),
+	})
+	if err != nil {
+		writeError(w, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "result": result})
+}
+
+func (s *Server) handleOfficialHubRolloutCancel(w http.ResponseWriter, r *http.Request) {
+	var req onboarding.OfficialHubRolloutRequest
+	if !decodeJSON(w, r, &req) {
+		return
+	}
+	result, err := s.onboardingManager().CancelOfficialHubRollout(r.Context(), req)
+	if err != nil {
+		writeError(w, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "result": result})
+}
+
+func (s *Server) handleOfficialHubRolloutRetry(w http.ResponseWriter, r *http.Request) {
+	var req onboarding.OfficialHubRolloutRequest
+	if !decodeJSON(w, r, &req) {
+		return
+	}
+	target, err := s.onboardingManager().RetryOfficialHubRolloutTarget(r.Context(), req)
+	if err != nil {
+		writeError(w, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "target": target})
+}
+
+func parseOfficialHubAuditTime(raw, field string) (*time.Time, error) {
+	raw = strings.TrimSpace(raw)
+	if raw == "" {
+		return nil, nil
+	}
+	value, err := time.Parse(time.RFC3339Nano, raw)
+	if err != nil {
+		return nil, fmt.Errorf("%s must be RFC3339", field)
+	}
+	value = value.UTC()
+	return &value, nil
 }
 
 func (s *Server) handleServiceStatus(w http.ResponseWriter, r *http.Request) {
@@ -423,11 +968,42 @@ func (s *Server) handleDiagnostics(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "report": report})
 }
 
+func (s *Server) handleOneClickDiagnostics(w http.ResponseWriter, r *http.Request) {
+	query := r.URL.Query()
+	port, _ := strconv.Atoi(query.Get("port"))
+	qualityScore, _ := strconv.Atoi(query.Get("quality_score"))
+	latencyMS, _ := strconv.ParseInt(query.Get("latency_ms"), 10, 64)
+	switchCount, _ := strconv.Atoi(query.Get("switch_count"))
+	report := diagnose.RunOneClick(diagnose.OneClickRequest{
+		ConfigPath:   query.Get("config_path"),
+		ServiceName:  query.Get("service_name"),
+		Target:       query.Get("target"),
+		TargetDevice: query.Get("target_device"),
+		NetworkState: query.Get("network_state"),
+		TargetStatus: query.Get("target_status"),
+		TunnelStatus: query.Get("tunnel_status"),
+		Port:         port,
+		DeviceStatus: query.Get("device_status"),
+		ConnectionStatus: p2p.ConnectionStatus{
+			PathType:     p2p.PathType(query.Get("path_type")),
+			PathState:    p2p.PathState(query.Get("path_state")),
+			QualityScore: qualityScore,
+			LatencyMS:    latencyMS,
+			SwitchCount:  switchCount,
+			LastError:    query.Get("last_error"),
+		},
+		IncludeRDP: query.Get("include_rdp") == "1" || strings.EqualFold(query.Get("include_rdp"), "true"),
+	})
+	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "report": report})
+}
+
 func (s *Server) handleRDPDiagnostics(w http.ResponseWriter, r *http.Request) {
 	port, _ := strconv.Atoi(r.URL.Query().Get("port"))
 	check := diagnose.CheckRDPTarget(diagnose.RDPCheckRequest{
 		Target:       r.URL.Query().Get("target"),
 		TargetDevice: r.URL.Query().Get("target_device"),
+		NetworkState: r.URL.Query().Get("network_state"),
+		TargetStatus: r.URL.Query().Get("target_status"),
 		TunnelStatus: r.URL.Query().Get("tunnel_status"),
 		Port:         port,
 	})
@@ -513,7 +1089,8 @@ func (s *Server) effectiveBaseDir() string {
 }
 
 func (s *Server) onboardingManager() onboarding.Manager {
-	return onboarding.Manager{BaseDir: s.effectiveBaseDir()}
+	status, _ := winservice.Status(winservice.DefaultName)
+	return onboarding.ManagerForConfig(s.effectiveBaseDir(), status.ConfigPath)
 }
 
 func decodeJSON(w http.ResponseWriter, r *http.Request, v any) bool {
@@ -532,10 +1109,15 @@ func decodeJSON(w http.ResponseWriter, r *http.Request, v any) bool {
 }
 
 func writeError(w http.ResponseWriter, err error) {
-	writeJSON(w, http.StatusBadRequest, map[string]any{
+	body := map[string]any{
 		"ok":    false,
 		"error": err.Error(),
-	})
+	}
+	var apiErr *cloudhub.APIError
+	if errors.As(err, &apiErr) && apiErr.Quota != nil {
+		body["quota"] = apiErr.Quota
+	}
+	writeJSON(w, http.StatusBadRequest, body)
 }
 
 func writeJSON(w http.ResponseWriter, status int, v any) {

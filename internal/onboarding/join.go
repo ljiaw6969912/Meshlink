@@ -2,7 +2,10 @@ package onboarding
 
 import (
 	"bytes"
+	"crypto/rand"
 	"crypto/tls"
+	"crypto/x509"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -15,6 +18,7 @@ import (
 	"time"
 
 	"meshlink/internal/certutil"
+	"meshlink/internal/config"
 )
 
 type JoinSpokeRequest struct {
@@ -31,11 +35,19 @@ type JoinSpokeResult struct {
 }
 
 func (m Manager) JoinSpoke(req JoinSpokeRequest) (JoinSpokeResult, error) {
+	var invite InviteLink
+	if req.InviteLink != "" {
+		var err error
+		invite, err = ParseInviteLink(req.InviteLink)
+		if err != nil {
+			return JoinSpokeResult{}, err
+		}
+	}
+	if result, joined, err := m.resumeJoinedSpoke(req.NodeName, invite); joined || err != nil {
+		return result, err
+	}
 	if req.InviteLink == "" {
 		return JoinSpokeResult{}, fmt.Errorf("invite_link is required")
-	}
-	if req.Code == "" {
-		return JoinSpokeResult{}, fmt.Errorf("code is required")
 	}
 	if req.NodeName == "" {
 		if host, err := os.Hostname(); err == nil && host != "" {
@@ -44,22 +56,45 @@ func (m Manager) JoinSpoke(req JoinSpokeRequest) (JoinSpokeResult, error) {
 			req.NodeName = "spoke"
 		}
 	}
-	invite, err := ParseInviteLink(req.InviteLink)
-	if err != nil {
+	if err := validateEnrollmentNodeName(req.NodeName); err != nil {
 		return JoinSpokeResult{}, err
+	}
+	if req.Code == "" {
+		return JoinSpokeResult{}, fmt.Errorf("code is required")
 	}
 	if err := m.validateInviteServerResolution(invite.Server); err != nil {
 		return JoinSpokeResult{}, err
 	}
+	result, err := m.enrollSpoke(req, invite, req.NodeName)
+	if !errors.Is(err, errNodeNameRegistered) {
+		return result, err
+	}
+	// A fresh installation has its own key even if another device has the
+	// same Windows hostname. Never replace that device's registered identity.
+	var suffix [6]byte
+	if _, err := rand.Read(suffix[:]); err != nil {
+		return JoinSpokeResult{}, err
+	}
+	return m.enrollSpoke(req, invite, req.NodeName+"-"+hex.EncodeToString(suffix[:]))
+}
+
+var errNodeNameRegistered = errors.New("node name already registered")
+
+func (m Manager) enrollSpoke(req JoinSpokeRequest, invite InviteLink, nodeID string) (JoinSpokeResult, error) {
 	if err := os.MkdirAll(m.configsDir(), 0o700); err != nil {
 		return JoinSpokeResult{}, err
 	}
 	if err := os.MkdirAll(m.certsDir(), 0o700); err != nil {
 		return JoinSpokeResult{}, err
 	}
+	pendingDir, err := os.MkdirTemp(m.certsDir(), ".join-")
+	if err != nil {
+		return JoinSpokeResult{}, err
+	}
+	defer os.RemoveAll(pendingDir)
 	csr, err := certutil.CreateCSR(certutil.CSROptions{
-		OutDir: m.certsDir(),
-		Name:   req.NodeName,
+		OutDir: pendingDir,
+		Name:   nodeID,
 	})
 	if err != nil {
 		return JoinSpokeResult{}, err
@@ -67,7 +102,7 @@ func (m Manager) JoinSpoke(req JoinSpokeRequest) (JoinSpokeResult, error) {
 	body, err := json.Marshal(EnrollHTTPRequest{
 		Token:    invite.Token,
 		Code:     req.Code,
-		NodeName: req.NodeName,
+		NodeName: nodeID,
 		CSRPEM:   string(csr.CSRPEM),
 	})
 	if err != nil {
@@ -112,14 +147,33 @@ func (m Manager) JoinSpoke(req JoinSpokeRequest) (JoinSpokeResult, error) {
 	if enroll.CAPEM == "" || enroll.CertPEM == "" {
 		return JoinSpokeResult{}, fmt.Errorf("enroll response missing certificate material")
 	}
+	cfg := enroll.Config
+	if cfg.Mode != "spoke" || cfg.NodeID != nodeID {
+		return JoinSpokeResult{}, fmt.Errorf("服务器返回的客户端身份不匹配")
+	}
+	cfg.DisplayName = req.NodeName
+	if err := cfg.Validate(); err != nil {
+		return JoinSpokeResult{}, err
+	}
+	keyPEM, err := os.ReadFile(csr.KeyPath)
+	if err != nil {
+		return JoinSpokeResult{}, err
+	}
+	pair, err := tls.X509KeyPair([]byte(enroll.CertPEM), keyPEM)
+	if err != nil {
+		return JoinSpokeResult{}, fmt.Errorf("enrollment certificate does not match the requested key: %w", err)
+	}
+	leaf, err := x509.ParseCertificate(pair.Certificate[0])
+	if err != nil || leaf.Subject.CommonName != nodeID {
+		return JoinSpokeResult{}, fmt.Errorf("服务器返回的证书身份不匹配")
+	}
 	if err := os.WriteFile(filepath.Join(m.certsDir(), "ca.pem"), []byte(enroll.CAPEM), 0o600); err != nil {
 		return JoinSpokeResult{}, err
 	}
-	if err := os.WriteFile(filepath.Join(m.certsDir(), req.NodeName+".pem"), []byte(enroll.CertPEM), 0o600); err != nil {
+	if err := os.WriteFile(filepath.Join(m.certsDir(), nodeID+".pem"), []byte(enroll.CertPEM), 0o600); err != nil {
 		return JoinSpokeResult{}, err
 	}
-	cfg := enroll.Config
-	if err := cfg.Validate(); err != nil {
+	if err := os.WriteFile(filepath.Join(m.certsDir(), nodeID+"-key.pem"), keyPEM, 0o600); err != nil {
 		return JoinSpokeResult{}, err
 	}
 	if err := writePrettyJSON(m.activeConfigPath(), cfg); err != nil {
@@ -133,10 +187,51 @@ func (m Manager) JoinSpoke(req JoinSpokeRequest) (JoinSpokeResult, error) {
 	}, nil
 }
 
+// Reusing the installed identity makes joining an already joined network follow
+// the same service-start path as reconnecting, without issuing another CSR.
+func (m Manager) resumeJoinedSpoke(nodeName string, invite InviteLink) (JoinSpokeResult, bool, error) {
+	cfg, err := config.Load(m.activeConfigPath())
+	if os.IsNotExist(err) {
+		return JoinSpokeResult{}, false, nil
+	}
+	if err != nil {
+		return JoinSpokeResult{}, false, fmt.Errorf("已有网络配置无法读取，已保留原有身份：%w", err)
+	}
+	if cfg.Mode != "spoke" || (nodeName != "" && !sameNodeID(cfg.NodeID, nodeName) && !sameNodeID(cfg.DisplayName, nodeName)) ||
+		(invite.Server != "" && !strings.EqualFold(cfg.Connect, meshConnectAddress(invite.Server))) {
+		return JoinSpokeResult{}, false, fmt.Errorf("此目录已有其他网络或身份的配置；切换网络或身份前请先退出原网络")
+	}
+	pair, err := tls.LoadX509KeyPair(resolveConfigPath(m.configsDir(), cfg.CertFile), resolveConfigPath(m.configsDir(), cfg.KeyFile))
+	if err != nil {
+		return JoinSpokeResult{}, false, fmt.Errorf("已有证书或私钥不可用，请修复后重新连接（未重新注册）：%w", err)
+	}
+	leaf, err := x509.ParseCertificate(pair.Certificate[0])
+	if err != nil {
+		return JoinSpokeResult{}, false, err
+	}
+	if leaf.Subject.CommonName != cfg.NodeID {
+		return JoinSpokeResult{}, false, fmt.Errorf("已有证书身份与本机名称不一致，未重新注册")
+	}
+	ca, err := os.ReadFile(resolveConfigPath(m.configsDir(), cfg.CAFile))
+	if err != nil {
+		return JoinSpokeResult{}, false, err
+	}
+	roots := x509.NewCertPool()
+	if !roots.AppendCertsFromPEM(ca) {
+		return JoinSpokeResult{}, false, fmt.Errorf("已有 CA 证书无效，未重新注册")
+	}
+	if _, err := leaf.Verify(x509.VerifyOptions{Roots: roots, KeyUsages: []x509.ExtKeyUsage{x509.ExtKeyUsageClientAuth}}); err != nil {
+		return JoinSpokeResult{}, false, fmt.Errorf("已有证书验证失败，未重新注册：%w", err)
+	}
+	return JoinSpokeResult{ConfigPath: m.activeConfigPath(), VirtualIP: cfg.VirtualIP, Server: cfg.Connect, Protocol: cfg.Transport.Protocol}, true, nil
+}
+
 func friendlyEnrollError(msg string) error {
 	raw := strings.TrimSpace(msg)
 	normalized := strings.ToLower(raw)
 	switch {
+	case strings.Contains(normalized, "node name already registered"):
+		return errNodeNameRegistered
 	case strings.Contains(normalized, "verification code is incorrect"):
 		return errors.New("接入码不正确。请重新输入服务器显示的 6 位接入码，注意不要混入空格。")
 	case strings.Contains(normalized, "invite has expired"):

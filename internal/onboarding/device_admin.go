@@ -1,15 +1,63 @@
 package onboarding
 
 import (
+	"errors"
 	"fmt"
+	"os"
 	"strings"
 	"time"
+)
+
+var (
+	ErrDeviceRegistryUnavailable = errors.New("device registry unavailable")
+	ErrDeviceNotFound            = errors.New("device not found in registry")
+	ErrDeviceIdentityAmbiguous   = errors.New("ambiguous device registry identity")
 )
 
 type DeviceRejection struct {
 	NodeID      string `json:"node_id,omitempty"`
 	Fingerprint string `json:"fingerprint,omitempty"`
 	Reason      string `json:"reason"`
+}
+
+// LoadRegisteredNodes returns one consistent persisted-registry snapshot.
+// Unlike the enrollment loader, a missing or malformed registry is an outage:
+// admission callers must not reinterpret it as an empty authoritative set.
+func (m Manager) LoadRegisteredNodes() ([]RegisteredNode, error) {
+	// The enrollment/admin loader intentionally treats a missing file as a new
+	// empty registry. Admission must distinguish that outage from member removal.
+	data, err := os.ReadFile(m.deviceRegistryPath())
+	if err != nil {
+		return nil, fmt.Errorf("%w: %w", ErrDeviceRegistryUnavailable, err)
+	}
+	var registry DeviceRegistry
+	if err := jsonUnmarshalStrict(data, &registry); err != nil {
+		return nil, fmt.Errorf("%w: %w", ErrDeviceRegistryUnavailable, err)
+	}
+	return registry.Nodes, nil
+}
+
+// LookupDevice reads the persisted registry on every call. Control admission
+// requires exact identity; the permissive legacy admin matching is not used.
+// Revoked entries are returned so callers can distinguish and reconcile them.
+func (m Manager) LookupDevice(nodeID string) (RegisteredNode, error) {
+	nodes, err := m.LoadRegisteredNodes()
+	if err != nil {
+		return RegisteredNode{}, err
+	}
+	var found *RegisteredNode
+	for i := range nodes {
+		if nodeID != "" && nodes[i].NodeID == nodeID {
+			if found != nil {
+				return RegisteredNode{}, fmt.Errorf("%w: %q", ErrDeviceIdentityAmbiguous, nodeID)
+			}
+			found = &nodes[i]
+		}
+	}
+	if found == nil {
+		return RegisteredNode{}, fmt.Errorf("%w: %q", ErrDeviceNotFound, nodeID)
+	}
+	return *found, nil
 }
 
 func (m Manager) RenameDevice(nodeID, displayName string) (RegisteredNode, error) {

@@ -30,6 +30,7 @@ Meshlink 当前已经解决了“有公网 IP 的用户如何自托管远程访�
 - 总实施计划：[docs/superpowers/plans/2026-07-07-product-transformation.md](docs/superpowers/plans/2026-07-07-product-transformation.md)
 - Task 0 需求追踪矩阵：[docs/qa/product-transformation-requirements.md](docs/qa/product-transformation-requirements.md)
 - Task 0 发布门禁：[docs/qa/release-gates.md](docs/qa/release-gates.md)
+- 最终发布门禁与闭环审计：[docs/qa/product-transformation-final-acceptance-2026-07-15.md](docs/qa/product-transformation-final-acceptance-2026-07-15.md)
 
 ## 3. 产品定位
 

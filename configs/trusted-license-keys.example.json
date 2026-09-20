@@ -1,0 +1,8 @@
+{
+  "keys": [
+    {
+      "key_id": "replace-with-contract-key-id",
+      "public_key": "replace-with-base64url-ed25519-public-key"
+    }
+  ]
+}

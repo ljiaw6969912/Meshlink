@@ -12,6 +12,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"time"
 
 	"meshlink/internal/certutil"
@@ -56,6 +57,7 @@ type RegisteredNode struct {
 	NodeID          string     `json:"node_id"`
 	DisplayName     string     `json:"display_name,omitempty"`
 	VirtualIP       string     `json:"virtual_ip"`
+	Routes          []string   `json:"routes,omitempty"`
 	SourceAddr      string     `json:"source_addr,omitempty"`
 	CertFingerprint string     `json:"cert_fingerprint"`
 	CreatedAt       time.Time  `json:"created_at"`
@@ -65,19 +67,34 @@ type RegisteredNode struct {
 	DeletedAt       *time.Time `json:"deleted_at,omitempty"`
 }
 
+// Enrollment requests share the registry and invitation quota. Serialize the
+// name check and write so simultaneous requests cannot admit duplicate names.
+var enrollmentMu sync.Mutex
+
 func (m Manager) HandleEnroll(req EnrollRequest) (EnrollResponse, error) {
 	if req.Token == "" || req.Code == "" {
 		return EnrollResponse{}, fmt.Errorf("token and code are required")
 	}
-	if req.NodeName == "" {
-		return EnrollResponse{}, fmt.Errorf("node_name is required")
+	if err := validateEnrollmentNodeName(req.NodeName); err != nil {
+		return EnrollResponse{}, err
 	}
 	if len(req.CSRPEM) == 0 {
 		return EnrollResponse{}, fmt.Errorf("csr_pem is required")
 	}
+	enrollmentMu.Lock()
+	defer enrollmentMu.Unlock()
 	invite, err := m.validateInvite(req)
 	if err != nil {
 		return EnrollResponse{}, err
+	}
+	registry, err := m.loadDeviceRegistry()
+	if err != nil {
+		return EnrollResponse{}, err
+	}
+	for _, node := range registry.Nodes {
+		if sameNodeID(node.NodeID, req.NodeName) {
+			return EnrollResponse{}, fmt.Errorf("node name already registered: %s", req.NodeName)
+		}
 	}
 	caPath := filepath.Join(m.certsDir(), "ca.pem")
 	caKeyPath := filepath.Join(m.certsDir(), "ca-key.pem")
@@ -92,10 +109,6 @@ func (m Manager) HandleEnroll(req EnrollRequest) (EnrollResponse, error) {
 		return EnrollResponse{}, err
 	}
 	caPEM, err := os.ReadFile(caPath)
-	if err != nil {
-		return EnrollResponse{}, err
-	}
-	registry, err := m.loadDeviceRegistry()
 	if err != nil {
 		return EnrollResponse{}, err
 	}
@@ -141,6 +154,13 @@ func (m Manager) HandleEnroll(req EnrollRequest) (EnrollResponse, error) {
 	}, nil
 }
 
+func validateEnrollmentNodeName(name string) error {
+	if strings.TrimSpace(name) == "" || name != strings.TrimSpace(name) || name == "." || name == ".." || strings.ContainsAny(name, "/\\:\x00\r\n\t") {
+		return fmt.Errorf("本机名称不能为空或包含路径分隔符、冒号及控制字符")
+	}
+	return nil
+}
+
 func spokeConfig(nodeName, virtualIP string, invite Invite) config.Config {
 	connect := meshConnectAddress(invite.Server)
 	host, _, err := net.SplitHostPort(connect)
@@ -149,10 +169,11 @@ func spokeConfig(nodeName, virtualIP string, invite Invite) config.Config {
 		serverName = connect
 	}
 	return config.Config{
-		NodeID: nodeName,
-		Mode:   "spoke",
+		Version: config.ConfigVersion,
+		NodeID:  nodeName,
+		Mode:    "spoke",
 		Transport: config.TransportConfig{
-			Protocol:   invite.Protocol,
+			Protocol:   config.ControlProtocolV2,
 			Connect:    connect,
 			ServerName: serverName,
 		},
@@ -172,6 +193,10 @@ func spokeConfig(nodeName, virtualIP string, invite Invite) config.Config {
 			Enabled: true,
 			Address: virtualIP + "/24",
 			Routes:  []config.Route{},
+		},
+		P2P: config.P2PConfig{
+			Protocol: config.P2PProtocolQUICUDPv1,
+			Listen:   "0.0.0.0:0",
 		},
 	}
 }
@@ -273,7 +298,7 @@ func (m Manager) markInviteUsed(token, sourceAddr string) error {
 }
 
 func (m Manager) loadDeviceRegistry() (DeviceRegistry, error) {
-	b, err := os.ReadFile(m.deviceRegistryPath())
+	b, err := readJSONFile(m.deviceRegistryPath())
 	if err != nil {
 		if os.IsNotExist(err) {
 			return DeviceRegistry{}, nil

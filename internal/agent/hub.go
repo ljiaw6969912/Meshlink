@@ -6,91 +6,30 @@ import (
 	"crypto/tls"
 	"errors"
 	"fmt"
-	"io"
-	"log/slog"
 	"net"
 	"net/http"
 	"net/netip"
 	"sync"
 	"time"
 
+	"meshlink/internal/networkstate"
 	"meshlink/internal/onboarding"
 	"meshlink/internal/proto"
 	"meshlink/internal/tlsutil"
 )
-
-type peer struct {
-	id        string
-	virtualIP netip.Addr
-	routes    []netip.Prefix
-	conn      net.Conn
-	sendMu    sync.Mutex
-	log       *slog.Logger
-}
 
 const (
 	peerHelloTimeout       = 20 * time.Second
 	peerHeartbeatInterval  = 30 * time.Second
 	peerReadTimeout        = 95 * time.Second
 	peerWriteTimeout       = 10 * time.Second
-	spokeReconnectMinDelay = 1 * time.Second
+	spokeReconnectMinDelay = time.Second
 	spokeReconnectMaxDelay = 60 * time.Second
 	spokeStableResetAfter  = 2 * time.Minute
 )
 
-type router struct {
-	mu    sync.RWMutex
-	peers map[string]*peer
-}
-
-func newRouter() *router {
-	return &router{peers: make(map[string]*peer)}
-}
-
-func (r *router) add(p *peer) *peer {
-	r.mu.Lock()
-	defer r.mu.Unlock()
-	old := r.peers[p.id]
-	r.peers[p.id] = p
-	return old
-}
-
-func (r *router) removeIf(id string, p *peer) bool {
-	r.mu.Lock()
-	defer r.mu.Unlock()
-	if r.peers[id] != p {
-		return false
-	}
-	delete(r.peers, id)
-	return true
-}
-
-func (r *router) list() []*peer {
-	r.mu.RLock()
-	defer r.mu.RUnlock()
-	peers := make([]*peer, 0, len(r.peers))
-	for _, p := range r.peers {
-		peers = append(peers, p)
-	}
-	return peers
-}
-
-func (r *router) find(dst netip.Addr) *peer {
-	r.mu.RLock()
-	defer r.mu.RUnlock()
-	for _, p := range r.peers {
-		if p.virtualIP == dst {
-			return p
-		}
-		for _, route := range p.routes {
-			if route.Contains(dst) {
-				return p
-			}
-		}
-	}
-	return nil
-}
-
+// The coordinator owns only control. An optional, independently authenticated
+// local node owns host packets and shares the coordinator's UDP socket.
 func (a *Agent) runHub(ctx context.Context) error {
 	tlsCfg, err := tlsutil.ServerConfigWithClientAuth(a.cfg.CAFile, a.cfg.CertFile, a.cfg.KeyFile, tls.VerifyClientCertIfGiven)
 	if err != nil {
@@ -101,53 +40,106 @@ func (a *Agent) runHub(ctx context.Context) error {
 		return err
 	}
 	defer listener.Close()
+	if a.serverNode != nil {
+		public, err := net.ResolveUDPAddr("udp4", a.cfg.ServerPublicEndpoint)
+		if err != nil {
+			return fmt.Errorf("resolve server public endpoint: %w", err)
+		}
+		if public.Port <= 0 || public.IP.IsUnspecified() {
+			return fmt.Errorf("server public endpoint is not usable")
+		}
+		if netip.MustParsePrefix("198.18.0.0/15").Contains(public.AddrPort().Addr().Unmap()) {
+			return fmt.Errorf("服务器地址 %s 被解析为代理 fake-IP %s；请让该域名使用真实 DNS 解析，或填写真实公网 IPv4 地址", a.cfg.ServerPublicEndpoint, public.IP)
+		}
+		a.serverPublicAddress = public.AddrPort()
+		a.serverNode.cfg.P2P.Listen = listener.Addr().String()
+		host, port, err := net.SplitHostPort(listener.Addr().String())
+		if err != nil {
+			return err
+		}
+		if host == "" || host == "0.0.0.0" {
+			host = "127.0.0.1"
+		}
+		a.serverNode.cfg.Connect = net.JoinHostPort(host, port)
+		a.serverNode.cfg.Transport.Connect = a.serverNode.cfg.Connect
+		runtime, err := newPeerRuntime(a.serverNode)
+		if err != nil {
+			return fmt.Errorf("start server mesh node: %w", err)
+		}
+		defer runtime.Close()
+		return a.runHubSockets(ctx, listener, sharedProbeSocket{runtime.candidates}, runtime)
+	}
+	udpAddr, err := net.ResolveUDPAddr("udp4", listener.Addr().String())
+	if err != nil {
+		return err
+	}
+	udp, err := net.ListenUDP("udp4", udpAddr)
+	if err != nil {
+		return err
+	}
+	defer udp.Close()
+	return a.runHubListeners(ctx, listener, udp)
+}
 
-	a.log.Info("hub listening", "addr", a.cfg.Listen)
-	rt := newRouter()
+func (a *Agent) runHubListeners(ctx context.Context, listener net.Listener, udp *net.UDPConn) error {
+	return a.runHubSockets(ctx, listener, udpProbeSocket{udp}, nil)
+}
 
-	errCh := make(chan error, 1)
-	go func() {
-		<-ctx.Done()
-		_ = listener.Close()
-	}()
-	go func() {
-		errCh <- a.deviceToPeers(ctx, rt)
-	}()
-
+func (a *Agent) runHubSockets(ctx context.Context, listener net.Listener, udp probeSocket, hostRuntime *peerRuntime) error {
+	ctx, cancel := context.WithCancel(ctx)
+	c := newCoordinator(a)
+	var workers sync.WaitGroup
+	defer func() { cancel(); _ = listener.Close(); _ = udp.Close(); c.close(); workers.Wait() }()
+	stop := context.AfterFunc(ctx, func() { _ = listener.Close(); _ = udp.Close() })
+	defer stop()
+	workers.Go(func() { c.runMaintenance(ctx) })
+	probeFailure := make(chan error, 2)
+	workers.Go(func() {
+		if err := c.runProbePackets(ctx, udp); err != nil && ctx.Err() == nil {
+			probeFailure <- fmt.Errorf("probe listener: %w", err)
+			_ = listener.Close() // Wake Accept so the owner can return the failure.
+		}
+	})
+	if hostRuntime != nil {
+		workers.Go(func() {
+			err := a.serverNode.runSpokeRuntime(ctx, hostRuntime)
+			if err != nil && ctx.Err() == nil {
+				probeFailure <- fmt.Errorf("server mesh node: %w", err)
+				_ = listener.Close()
+			}
+		})
+	}
+	a.status.setState("running")
+	a.status.setNetworkState(networkstate.Connected)
+	a.log.Info("coordinator listening", "control", listener.Addr(), "probe", udp.LocalAddr())
 	for {
 		conn, err := listener.Accept()
 		if err != nil {
-			select {
-			case <-ctx.Done():
+			if ctx.Err() != nil {
 				return ctx.Err()
+			}
+			select {
+			case probeErr := <-probeFailure:
+				return probeErr
 			default:
-				return err
 			}
+			return err
 		}
-		go a.handleHubConn(ctx, rt, conn)
-
-		select {
-		case err := <-errCh:
-			if err != nil && !errors.Is(err, context.Canceled) {
-				return err
-			}
-		default:
-		}
+		workers.Go(func() {
+			stop := context.AfterFunc(ctx, func() { _ = conn.Close() })
+			defer stop()
+			defer conn.Close()
+			a.handleHubConn(ctx, c, conn)
+		})
 	}
 }
 
-func (a *Agent) handleHubConn(ctx context.Context, rt *router, conn net.Conn) {
+func (a *Agent) handleHubConn(ctx context.Context, c *coordinator, conn net.Conn) {
 	reader := bufio.NewReader(conn)
-	if err := conn.SetReadDeadline(time.Now().Add(peerHelloTimeout)); err != nil {
-		a.log.Warn("failed to set connection sniff deadline", "remote", conn.RemoteAddr(), "err", err)
-		_ = conn.Close()
-		return
-	}
+	_ = conn.SetReadDeadline(time.Now().Add(peerHelloTimeout))
 	prefix, err := reader.Peek(4)
 	_ = conn.SetReadDeadline(time.Time{})
 	if err != nil {
-		a.log.Warn("failed to sniff hub connection", "remote", conn.RemoteAddr(), "err", err)
-		_ = conn.Close()
 		return
 	}
 	buffered := &bufferedConn{Conn: conn, reader: reader}
@@ -155,26 +147,13 @@ func (a *Agent) handleHubConn(ctx context.Context, rt *router, conn net.Conn) {
 		a.serveEnrollHTTP(buffered)
 		return
 	}
-	if !hasVerifiedClientCertificate(buffered) {
-		a.log.Warn("rejecting mesh connection without a verified client certificate", "remote", conn.RemoteAddr())
-		_ = conn.Close()
-		return
-	}
-	commonName, fingerprint := certInfoFromTLS(buffered)
-	if rejected, reason := a.rejectPeerByRegistry(commonName, fingerprint, conn.RemoteAddr().String()); rejected {
-		a.log.Warn("rejecting mesh connection from disabled or removed device", "remote", conn.RemoteAddr(), "node_id", commonName, "fingerprint", fingerprint, "reason", reason)
-		_ = conn.Close()
-		return
-	}
-	a.handlePeer(ctx, rt, buffered)
+	c.serveControl(ctx, buffered)
 }
 
 func (a *Agent) serveEnrollHTTP(conn net.Conn) {
 	listener := newSingleConnListener(conn)
 	manager := onboarding.Manager{BaseDir: a.baseDir}
-	server := &http.Server{
-		Handler:           manager.EnrollHTTPHandler(),
-		ReadHeaderTimeout: 5 * time.Second,
+	server := &http.Server{Handler: manager.EnrollHTTPHandler(), ReadHeaderTimeout: 5 * time.Second,
 		ConnState: func(_ net.Conn, state http.ConnState) {
 			switch state {
 			case http.StateIdle, http.StateClosed, http.StateHijacked:
@@ -184,107 +163,7 @@ func (a *Agent) serveEnrollHTTP(conn net.Conn) {
 	}
 	err := server.Serve(listener)
 	if err != nil && !errors.Is(err, net.ErrClosed) && !errors.Is(err, http.ErrServerClosed) {
-		a.log.Warn("enrollment HTTP connection failed", "remote", conn.RemoteAddr(), "err", err)
-	}
-}
-
-func (a *Agent) handlePeer(ctx context.Context, rt *router, conn net.Conn) {
-	defer conn.Close()
-
-	helloFrame, err := readFrameWithTimeout(conn, peerHelloTimeout)
-	if err != nil {
-		a.log.Warn("failed to read hello", "remote", conn.RemoteAddr(), "err", err)
-		return
-	}
-	if helloFrame.Type != proto.TypeHello {
-		a.log.Warn("first frame was not hello", "remote", conn.RemoteAddr(), "type", helloFrame.Type)
-		return
-	}
-	hello, err := proto.ParseHello(helloFrame.Payload)
-	if err != nil {
-		a.log.Warn("invalid hello", "remote", conn.RemoteAddr(), "err", err)
-		return
-	}
-	addr, _ := netip.ParseAddr(hello.VirtualIP)
-	routes := make([]netip.Prefix, 0, len(hello.Routes))
-	for _, raw := range hello.Routes {
-		prefix, _ := netip.ParsePrefix(raw)
-		routes = append(routes, prefix)
-	}
-	commonName, fingerprint := certInfoFromTLS(conn)
-	if rejected, reason := a.rejectPeerByRegistry(hello.NodeID, fingerprint, conn.RemoteAddr().String()); rejected {
-		a.log.Warn("rejecting peer after hello because device is disabled or removed", "remote", conn.RemoteAddr(), "node_id", hello.NodeID, "fingerprint", fingerprint, "reason", reason)
-		return
-	}
-	connectedAt := time.Now()
-
-	p := &peer{
-		id:        hello.NodeID,
-		virtualIP: addr,
-		routes:    routes,
-		conn:      conn,
-		log:       a.log.With("peer", hello.NodeID, "remote", conn.RemoteAddr()),
-	}
-	old := rt.add(p)
-	if old != nil && old != p {
-		p.log.Warn("replacing existing peer connection", "old_remote", old.conn.RemoteAddr())
-		_ = old.conn.Close()
-	}
-	a.status.upsertPeer(PeerStatus{
-		NodeID:      hello.NodeID,
-		VirtualIP:   hello.VirtualIP,
-		Routes:      hello.Routes,
-		RemoteAddr:  conn.RemoteAddr().String(),
-		Fingerprint: fingerprint,
-		CommonName:  commonName,
-		ConnectedAt: connectedAt,
-	})
-	a.broadcastRoster(rt)
-	defer func() {
-		if rt.removeIf(p.id, p) {
-			a.status.removePeer(p.id)
-			a.broadcastRoster(rt)
-		}
-	}()
-
-	p.log.Info("peer connected", "virtual_ip", hello.VirtualIP, "routes", hello.Routes, "mtu", hello.MTU)
-	ticker := time.NewTicker(peerHeartbeatInterval)
-	defer ticker.Stop()
-
-	errCh := make(chan error, 1)
-	go func() {
-		for {
-			frame, err := readFrameWithTimeout(conn, peerReadTimeout)
-			if err != nil {
-				errCh <- err
-				return
-			}
-			if err := a.handlePeerFrame(rt, p, frame); err != nil {
-				errCh <- err
-				return
-			}
-		}
-	}()
-
-	for {
-		select {
-		case <-ctx.Done():
-			return
-		case err := <-errCh:
-			if isTimeout(err) {
-				p.log.Warn("peer heartbeat timed out", "timeout", peerReadTimeout)
-			} else if err != nil && !errors.Is(err, io.EOF) {
-				p.log.Warn("peer disconnected", "err", err)
-			} else {
-				p.log.Info("peer disconnected")
-			}
-			return
-		case <-ticker.C:
-			if err := p.write(proto.TypePing, nil); err != nil {
-				p.log.Warn("peer ping failed", "err", err)
-				return
-			}
-		}
+		a.log.Warn("enrollment HTTP connection failed", "err", err)
 	}
 }
 
@@ -293,16 +172,28 @@ type bufferedConn struct {
 	reader *bufio.Reader
 }
 
-func (c *bufferedConn) Read(b []byte) (int, error) {
-	return c.reader.Read(b)
+// closeControlWrite sends TLS close_notify and then half-closes the underlying
+// TCP write side. This lets a terminal control error reach the peer even when
+// the rejected frame body remains intentionally unread.
+func closeControlWrite(conn net.Conn) {
+	if buffered, ok := conn.(*bufferedConn); ok {
+		conn = buffered.Conn
+	}
+	if secure, ok := conn.(*tls.Conn); ok {
+		_ = secure.CloseWrite()
+		conn = secure.NetConn()
+	}
+	if tcp, ok := conn.(*net.TCPConn); ok {
+		_ = tcp.CloseWrite()
+	}
 }
 
+func (c *bufferedConn) Read(b []byte) (int, error) { return c.reader.Read(b) }
 func (c *bufferedConn) ConnectionState() tls.ConnectionState {
-	tlsConn, ok := c.Conn.(*tls.Conn)
-	if !ok {
-		return tls.ConnectionState{}
+	if conn, ok := c.Conn.(interface{ ConnectionState() tls.ConnectionState }); ok {
+		return conn.ConnectionState()
 	}
-	return tlsConn.ConnectionState()
+	return tls.ConnectionState{}
 }
 
 type singleConnListener struct {
@@ -315,7 +206,6 @@ type singleConnListener struct {
 func newSingleConnListener(conn net.Conn) *singleConnListener {
 	return &singleConnListener{conn: conn, closed: make(chan struct{})}
 }
-
 func (l *singleConnListener) Accept() (net.Conn, error) {
 	if !l.accepted {
 		l.accepted = true
@@ -324,19 +214,11 @@ func (l *singleConnListener) Accept() (net.Conn, error) {
 	<-l.closed
 	return nil, net.ErrClosed
 }
-
 func (l *singleConnListener) Close() error {
-	l.closeOnce.Do(func() {
-		close(l.closed)
-		_ = l.conn.Close()
-	})
+	l.closeOnce.Do(func() { close(l.closed); _ = l.conn.Close() })
 	return nil
 }
-
-func (l *singleConnListener) Addr() net.Addr {
-	return l.conn.LocalAddr()
-}
-
+func (l *singleConnListener) Addr() net.Addr { return l.conn.LocalAddr() }
 func isHTTPPreface(prefix []byte) bool {
 	if len(prefix) < 4 {
 		return false
@@ -344,176 +226,12 @@ func isHTTPPreface(prefix []byte) bool {
 	switch string(prefix[:4]) {
 	case "GET ", "POST", "HEAD", "PUT ", "PATC", "DELE", "OPTI":
 		return true
-	default:
-		return false
 	}
+	return false
 }
-
 func hasVerifiedClientCertificate(conn net.Conn) bool {
-	stateProvider, ok := conn.(interface {
-		ConnectionState() tls.ConnectionState
-	})
-	if !ok {
-		return false
-	}
-	state := stateProvider.ConnectionState()
-	return len(state.VerifiedChains) > 0
-}
-
-func (a *Agent) rejectPeerByRegistry(nodeID, fingerprint, remoteAddr string) (bool, string) {
-	manager := onboarding.Manager{BaseDir: a.baseDir}
-	rejection, rejected, err := manager.DeviceRejection(nodeID, fingerprint)
-	if err != nil {
-		if a.log != nil {
-			a.log.Warn("failed to check device registry for peer admission", "remote", remoteAddr, "node_id", nodeID, "fingerprint", fingerprint, "err", err)
-		}
-		return true, "device registry unavailable"
-	}
-	if !rejected {
-		return false, ""
-	}
-	reason := rejection.Reason
-	if err := manager.RecordCertificateRejected(rejection.NodeID, rejection.Fingerprint, remoteAddr, reason); err != nil && a.log != nil {
-		a.log.Warn("failed to write certificate rejection audit", "remote", remoteAddr, "node_id", nodeID, "fingerprint", fingerprint, "reason", reason, "err", err)
-	}
-	return true, reason
-}
-
-func (a *Agent) handlePeerFrame(rt *router, p *peer, frame proto.Frame) error {
-	a.status.touchPeer(p.id)
-	switch frame.Type {
-	case proto.TypePacket:
-		dst, err := proto.DestinationIP(frame.Payload)
-		if err != nil {
-			if errors.Is(err, proto.ErrNotIPPacket) {
-				p.log.Debug("dropping non-IPv4 packet", "err", err)
-			} else {
-				p.log.Warn("dropping invalid packet", "err", err)
-			}
-			return nil
-		}
-		if a.ownsDestination(dst) {
-			return a.dev.WritePacket(frame.Payload)
-		}
-		target := rt.find(dst)
-		if target == nil {
-			p.log.Debug("no route for packet", "dst", dst)
-			return nil
-		}
-		if err := target.write(proto.TypePacket, frame.Payload); err != nil {
-			a.dropPeer(rt, target, "dropping peer after packet forward failed", err)
-		}
-		return nil
-	case proto.TypePing:
-		return p.write(proto.TypePong, nil)
-	case proto.TypePong:
-		return nil
-	default:
-		return fmt.Errorf("unsupported frame type from peer: %d", frame.Type)
-	}
-}
-
-func (a *Agent) broadcastRoster(rt *router) {
-	payload, err := a.roster().Marshal()
-	if err != nil {
-		a.log.Warn("failed to marshal roster", "err", err)
-		return
-	}
-	for _, p := range rt.list() {
-		if err := p.write(proto.TypeRoster, payload); err != nil {
-			p.log.Warn("failed to send roster", "err", err)
-			_ = p.conn.Close()
-		}
-	}
-}
-
-func (a *Agent) roster() proto.Roster {
-	status := a.status.snapshot()
-	selfStatus := PeerStatusOnline
-	if status.State != "running" {
-		selfStatus = PeerStatusOffline
-	}
-	nodes := []proto.RosterNode{
-		{
-			NodeID:      status.Self.NodeID,
-			Mode:        status.Self.Mode,
-			Status:      selfStatus,
-			VirtualIP:   status.Self.VirtualIP,
-			Routes:      status.Self.Routes,
-			Fingerprint: status.Self.Fingerprint,
-			CommonName:  status.Self.CommonName,
-			LastSeen:    status.UpdatedAt,
-		},
-	}
-	for _, peer := range status.Peers {
-		nodes = append(nodes, proto.RosterNode{
-			NodeID:         peer.NodeID,
-			Status:         peer.Status,
-			VirtualIP:      peer.VirtualIP,
-			Routes:         peer.Routes,
-			RemoteAddr:     peer.RemoteAddr,
-			Fingerprint:    peer.Fingerprint,
-			CommonName:     peer.CommonName,
-			ConnectedAt:    peer.ConnectedAt,
-			LastSeen:       peer.LastSeen,
-			DisconnectedAt: peer.DisconnectedAt,
-		})
-	}
-	return proto.Roster{
-		UpdatedAt: status.UpdatedAt,
-		State:     status.State,
-		Nodes:     nodes,
-	}
-}
-
-func (a *Agent) deviceToPeers(ctx context.Context, rt *router) error {
-	for {
-		packet, err := a.dev.ReadPacket(ctx)
-		if err != nil {
-			return err
-		}
-		dst, err := proto.DestinationIP(packet)
-		if err != nil {
-			if errors.Is(err, proto.ErrNotIPPacket) {
-				a.log.Debug("dropping non-IPv4 packet from device", "err", err)
-			} else {
-				a.log.Warn("dropping invalid packet from device", "err", err)
-			}
-			continue
-		}
-		target := rt.find(dst)
-		if target == nil {
-			a.log.Debug("no route for device packet", "dst", dst)
-			continue
-		}
-		if err := target.write(proto.TypePacket, packet); err != nil {
-			a.dropPeer(rt, target, "dropping peer after device packet forward failed", err)
-			continue
-		}
-	}
-}
-
-func (a *Agent) dropPeer(rt *router, p *peer, msg string, err error) {
-	if p == nil {
-		return
-	}
-	p.log.Warn(msg, "err", err)
-	if rt.removeIf(p.id, p) {
-		a.status.removePeer(p.id)
-		a.broadcastRoster(rt)
-	}
-	_ = p.conn.Close()
-}
-
-func (p *peer) write(typ byte, payload []byte) error {
-	p.sendMu.Lock()
-	defer p.sendMu.Unlock()
-	if err := p.conn.SetWriteDeadline(time.Now().Add(peerWriteTimeout)); err != nil {
-		return err
-	}
-	err := proto.Write(p.conn, typ, payload)
-	_ = p.conn.SetWriteDeadline(time.Time{})
-	return err
+	state, ok := conn.(interface{ ConnectionState() tls.ConnectionState })
+	return ok && len(state.ConnectionState().VerifiedChains) > 0
 }
 
 func readFrameWithTimeout(conn net.Conn, timeout time.Duration) (proto.Frame, error) {
@@ -528,31 +246,7 @@ func readFrameWithTimeout(conn net.Conn, timeout time.Duration) (proto.Frame, er
 	}
 	return frame, err
 }
-
 func isTimeout(err error) bool {
 	var netErr net.Error
 	return errors.As(err, &netErr) && netErr.Timeout()
-}
-
-func mustAddr(s string) netip.Addr {
-	addr, err := netip.ParseAddr(s)
-	if err != nil {
-		panic(err)
-	}
-	if !addr.Is4() {
-		panic("IPv6 address is not supported")
-	}
-	return addr
-}
-
-func (a *Agent) ownsDestination(dst netip.Addr) bool {
-	if dst == mustAddr(a.cfg.VirtualIP) {
-		return true
-	}
-	for _, route := range a.routes {
-		if route.Contains(dst) {
-			return true
-		}
-	}
-	return false
 }

@@ -7,11 +7,19 @@ import (
 	"os/exec"
 	"strconv"
 	"strings"
+	"syscall"
 )
 
 func applyPlatform(plan Plan, logger *slog.Logger) error {
+	firewall, err := tunnelFirewallPlan(plan)
+	if err != nil {
+		return err
+	}
 	if err := runPowerShell(addressScript, plan.Interface, plan.Address.Addr().String(), strconv.Itoa(plan.Address.Bits())); err != nil {
 		return fmt.Errorf("configure address: %w", err)
+	}
+	if err := applyFirewallPlan(firewall); err != nil {
+		return fmt.Errorf("configure Meshlink interface firewall (administrator rights required): %w", err)
 	}
 	for _, route := range plan.Routes {
 		nextHop := "0.0.0.0"
@@ -43,6 +51,7 @@ func runPowerShell(script string, args ...string) error {
 		powerShellCommand(script, args),
 	}
 	cmd := exec.Command("powershell.exe", cmdArgs...)
+	cmd.SysProcAttr = &syscall.SysProcAttr{HideWindow: true}
 	var stderr bytes.Buffer
 	cmd.Stderr = &stderr
 	if err := cmd.Run(); err != nil {

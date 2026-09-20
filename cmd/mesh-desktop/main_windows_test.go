@@ -3,13 +3,17 @@
 package main
 
 import (
+	"errors"
 	"os"
 	"path/filepath"
 	"strings"
 	"testing"
 	"time"
 
+	"meshlink/internal/diagnose"
+	"meshlink/internal/networkstate"
 	"meshlink/internal/onboarding"
+	"meshlink/internal/p2p"
 	"meshlink/internal/winservice"
 )
 
@@ -35,14 +39,21 @@ func TestDesktopMainWindowOnlyExposesSimpleModeTabs(t *testing.T) {
 	}
 	for _, want := range []string{
 		`Text: "我有公网 IP，创建服务器"`,
-		`Text: "我没有公网 IP，使用官方 Hub"`,
-		`Text: "我有云服务器，帮我自建中继"`,
+		`Text: "我没有公网 IP，使用官方 Hub", OnClicked: a.showOfficialHubMVPDialog, Visible: productflags.OfficialHubMVPEnabled()`,
 		`Text: "加入已有网络"`,
-		`官方 Hub 尚未开放`,
-		`showSelfRelayWizard`,
+		`showOfficialHubMVPDialog`,
+		`官方 Hub MVP/内测`,
 	} {
 		if !strings.Contains(src, want) {
 			t.Fatalf("desktop main window missing entry %s", want)
+		}
+	}
+	if strings.Contains(src, `showOfficialHubPlaceholder`) || strings.Contains(src, `官方 Hub 尚未开放`) {
+		t.Fatal("desktop official Hub entry should open the MVP dialog, not the old placeholder")
+	}
+	for _, forbidden := range []string{`我有云服务器，帮我自建中继`, `showSelfRelayWizard`} {
+		if strings.Contains(src, forbidden) {
+			t.Fatalf("desktop self-hosted flow still exposes Relay surface %q", forbidden)
 		}
 	}
 	for _, hidden := range []string{
@@ -58,38 +69,146 @@ func TestDesktopMainWindowOnlyExposesSimpleModeTabs(t *testing.T) {
 	}
 }
 
-func TestDesktopSelfHostedRelayWizardExposesDeploymentFields(t *testing.T) {
+func TestDesktopOfficialHubDialogExposesMVPControlPlaneFields(t *testing.T) {
 	b, err := os.ReadFile("main_windows.go")
 	if err != nil {
 		t.Fatal(err)
 	}
 	src := string(b)
 	for _, want := range []string{
-		`func (a *desktopApp) showSelfRelayWizard()`,
-		`云服务器地址`,
-		`SSH 端口`,
-		`SSH 用户名`,
-		`SSH 密码`,
-		`私钥内容`,
-		`Meshlink 监听端口`,
-		`服务器公网访问地址`,
-		`检查云服务器`,
-		`部署自建中继`,
-		`buildReq(true)`,
-		`buildReq(false)`,
-		`DeploySelfHostedRelay`,
-		`远程服务状态`,
-		`主机指纹`,
-		`接入链接`,
-		`接入码`,
-		`有效期`,
+		`func (a *desktopApp) showOfficialHubMVPDialog()`,
+		`官方 Hub MVP/内测`,
+		`Hub API 地址`,
+		`http://127.0.0.1:18080`,
+		`账号邮箱`,
+		`账号名称`,
+		`网络名称`,
+		`本机设备名称`,
+		`创建测试账号`,
+		`创建官方网络`,
+		`加入当前设备`,
+		`发送 heartbeat`,
+		`刷新设备列表`,
+		`当前只是官方 Hub 控制面 MVP，不代表 Relay/P2P 已完成。`,
+		`CreateOfficialHubAccount`,
+		`CreateOfficialHubNetwork`,
+		`CreateOfficialHubInvite`,
+		`JoinOfficialHubDevice`,
+		`HeartbeatOfficialHubDevice`,
+		`ListOfficialHubDevices`,
 	} {
 		if !strings.Contains(src, want) {
-			t.Fatalf("self-hosted relay wizard missing %s", want)
+			t.Fatalf("official Hub dialog missing %s", want)
 		}
 	}
-	if strings.Contains(src, `自建中继向导尚未开放`) {
-		t.Fatal("desktop self-hosted relay entry should no longer be a placeholder")
+	for _, misleading := range []string{`官方订阅已开通`, `Relay 数据面已完成`} {
+		if strings.Contains(src, misleading) {
+			t.Fatalf("official Hub dialog should not contain misleading text %s", misleading)
+		}
+	}
+}
+
+func TestDesktopSelfHostedFlowHasNoRelaySurface(t *testing.T) {
+	b, err := os.ReadFile("main_windows.go")
+	if err != nil {
+		t.Fatal(err)
+	}
+	src := string(b)
+	for _, forbidden := range []string{
+		`func (a *desktopApp) showSelfRelayWizard()`,
+		`我有云服务器，帮我自建中继`,
+		`Title:     "自建中继部署"`,
+		`DeploySelfHostedRelay`,
+	} {
+		if strings.Contains(src, forbidden) {
+			t.Fatalf("self-hosted desktop still exposes Relay behavior %q", forbidden)
+		}
+	}
+}
+
+func TestDesktopShowsCoordinatorAndDirectStateSeparately(t *testing.T) {
+	b, err := os.ReadFile("main_windows.go")
+	if err != nil {
+		t.Fatal(err)
+	}
+	src := string(b)
+	for _, want := range []string{
+		`Text: "协调服务器："`,
+		`AssignTo: &a.coordinatorSummary`,
+		`Text: "对端路径："`,
+		`AssignTo: &a.p2pPathSummary`,
+		`a.coordinatorState = devices.CoordinatorState`,
+		`a.p2pListen = devices.P2PListen`,
+	} {
+		if !strings.Contains(src, want) {
+			t.Fatalf("desktop is missing truthful coordinator/P2P diagnostic %q", want)
+		}
+	}
+}
+
+func TestDesktopConnectionLabelsNeverInferDirectFromOnlineMembership(t *testing.T) {
+	node := meshNode{Kind: "peer", Online: true, State: "online"}
+	if got := meshNodeConnectionLabel(node); got != "已在线 · 尚未建立直连" {
+		t.Fatalf("meshNodeConnectionLabel() = %q, want online membership without inventing a direct session", got)
+	}
+}
+
+func TestDesktopMembershipStatusStaysOnlineWhilePathIsIdle(t *testing.T) {
+	node := meshNode{
+		Kind:   "peer",
+		Online: true,
+		State:  "online",
+		ConnectionStatus: p2p.ConnectionStatus{
+			PathState: p2p.PathState("idle"),
+		},
+	}
+	if got := meshNodeStatusText(node); got != "在线" {
+		t.Fatalf("meshNodeStatusText() = %q, want independent online membership status", got)
+	}
+	if got := meshNodeConnectionLabel(node); got != "已在线 · 尚未建立直连" {
+		t.Fatalf("meshNodeConnectionLabel() = %q, want no inferred direct path", got)
+	}
+}
+
+func TestDesktopConnectionLabelsUseTruthfulP2PStates(t *testing.T) {
+	for state, want := range map[string]string{
+		"connected":    "已连接",
+		"reconnecting": "重连中",
+		"disconnected": "已断开",
+	} {
+		if got := desktopCoordinatorStateText(state); got != want {
+			t.Fatalf("desktopCoordinatorStateText(%q) = %q, want %q", state, got, want)
+		}
+	}
+
+	tests := []struct {
+		name string
+		node meshNode
+		want string
+	}{
+		{name: "LAN direct", node: meshNode{Kind: "peer", Online: true, ConnectionStatus: p2p.ConnectionStatus{PathType: p2p.PathType("lan_direct"), PathState: p2p.PathState("lan_direct")}}, want: "局域网直连"},
+		{name: "public direct", node: meshNode{Kind: "peer", Online: true, ConnectionStatus: p2p.ConnectionStatus{PathType: p2p.PathType("public_direct"), PathState: p2p.PathState("public_direct")}}, want: "公网直连"},
+		{name: "negotiating", node: meshNode{Kind: "peer", Online: true, ConnectionStatus: p2p.ConnectionStatus{PathState: p2p.PathState("punching")}}, want: "正在协商"},
+		{name: "waiting", node: meshNode{Kind: "peer", Online: true, ConnectionStatus: p2p.ConnectionStatus{PathState: p2p.PathState("waiting_coordinator")}}, want: "等待协调服务器"},
+		{name: "failed without relay", node: meshNode{Kind: "peer", Online: true, ConnectionStatus: p2p.ConnectionStatus{PathState: p2p.PathStateFailed, LastError: "direct_unreachable_no_relay"}}, want: "直连失败 · 本版本未启用中继"},
+		{name: "absent", node: meshNode{Kind: "peer", Online: false, ConnectionStatus: p2p.ConnectionStatus{PathState: p2p.PathState("offline_or_unknown")}}, want: "离线或未知"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := meshNodeConnectionLabel(tt.node); got != tt.want {
+				t.Fatalf("meshNodeConnectionLabel() = %q, want %q", got, tt.want)
+			}
+		})
+	}
+
+	directDuringOutage := meshNode{
+		Kind:             "peer",
+		Online:           true,
+		CoordinatorState: "reconnecting",
+		ConnectionStatus: p2p.ConnectionStatus{PathType: p2p.PathType("lan_direct"), PathState: p2p.PathState("lan_direct")},
+	}
+	if got := meshNodeConnectionSummary(directDuringOutage); !strings.Contains(got, "协调服务器离线，当前直连不受影响") {
+		t.Fatalf("meshNodeConnectionSummary() = %q, want coordinator-outage continuity note", got)
 	}
 }
 
@@ -131,13 +250,13 @@ func TestDesktopMainWindowHasAboutUpdateMenu(t *testing.T) {
 	}
 }
 
-func TestDesktopKeepsAdvancedToolsBehindMenu(t *testing.T) {
+func TestDesktopRemovesAdvancedToolsAndRequestsElevation(t *testing.T) {
 	b, err := os.ReadFile("main_windows.go")
 	if err != nil {
 		t.Fatal(err)
 	}
 	src := string(b)
-	for _, want := range []string{
+	for _, forbidden := range []string{
 		`Text: "工具"`,
 		`Text: "高级设置"`,
 		`showAdvancedSettingsDialog`,
@@ -148,9 +267,14 @@ func TestDesktopKeepsAdvancedToolsBehindMenu(t *testing.T) {
 		`PushButton{Text: "读取日志"`,
 		`PushButton{Text: "开始诊断"`,
 	} {
-		if !strings.Contains(src, want) {
-			t.Fatalf("desktop advanced tools missing %s", want)
+		if strings.Contains(src, forbidden) {
+			t.Fatalf("desktop still exposes removed advanced tools: %s", forbidden)
 		}
+	}
+	mainStart := strings.Index(src, "func main()")
+	runStart := strings.Index(src[mainStart:], "app.run()")
+	if !strings.Contains(src[mainStart:mainStart+runStart], "relaunchAsAdministrator()") {
+		t.Fatal("desktop must request elevation before opening the UI")
 	}
 }
 
@@ -160,8 +284,154 @@ func TestInviteOutputHasBoundedHeight(t *testing.T) {
 		t.Fatal(err)
 	}
 	src := string(b)
-	if !strings.Contains(src, `TextEdit{AssignTo: &a.inviteOutput, ReadOnly: true, MinSize: Size{0, 76}, MaxSize: Size{10000, 96}, ColumnSpan: 4}`) {
-		t.Fatal("invite output should have a bounded height")
+	if !strings.Contains(src, `TextEdit{AssignTo: &a.inviteOutput, ReadOnly: true, VScroll: true, MinSize: Size{Width: 0, Height: 76}, MaxSize: Size{Width: 10000, Height: 96}, ColumnSpan: 4}`) {
+		t.Fatal("invite output should have a bounded height and vertical scrolling")
+	}
+}
+
+func TestDesktopMainWindowHasOneConnectAction(t *testing.T) {
+	b, err := os.ReadFile("main_windows.go")
+	if err != nil {
+		t.Fatal(err)
+	}
+	src := string(b)
+	for _, want := range []string{
+		`PushButton{Text: "断开连接", OnClicked: a.disconnectNetwork`,
+		`Text: "连接", OnClicked: a.connectNetwork`,
+		`PushButton{Text: "退出网络", OnClicked: a.exitNetwork`,
+		`退出后需要重新使用邀请码才能加入`,
+		`networklifecycle.Leave`,
+	} {
+		if !strings.Contains(src, want) {
+			t.Fatalf("desktop lifecycle UI missing %s", want)
+		}
+	}
+	for _, forbidden := range []string{`OnClicked: a.joinOnboarding`, `OnClicked: a.reconnectNetwork`} {
+		if strings.Contains(src, forbidden) {
+			t.Fatalf("fresh clients must use the same enrollment-aware connect action: %s", forbidden)
+		}
+	}
+}
+
+func TestCompleteDesktopLeaveDoesNotDestroyIdentityWhenSettingsSaveFails(t *testing.T) {
+	leaveCalled := false
+	err := completeDesktopLeave(
+		desktopSettings{LastConfigPath: `C:\Meshlink\configs\active.json`},
+		func(desktopSettings) error { return errors.New("settings are read-only") },
+		func() error {
+			leaveCalled = true
+			return nil
+		},
+	)
+	if err == nil {
+		t.Fatal("completeDesktopLeave must report settings persistence failure")
+	}
+	if leaveCalled {
+		t.Fatal("destructive leave must not run before cleared settings are persisted")
+	}
+}
+
+func TestDesktopRefreshUsesDeviceListNetworkStateEvenWhenEmpty(t *testing.T) {
+	b, err := os.ReadFile("main_windows.go")
+	if err != nil {
+		t.Fatal(err)
+	}
+	src := string(b)
+	for _, want := range []string{
+		`devicesErr == nil {`,
+		`desktopNetworkStateText(devices.NetworkState)`,
+	} {
+		if !strings.Contains(src, want) {
+			t.Fatalf("desktop status refresh missing %s", want)
+		}
+	}
+	if strings.Contains(src, `devicesErr == nil && len(devices.Nodes) > 0`) {
+		t.Fatal("desktop status refresh should trust an empty successful DeviceList")
+	}
+}
+
+func TestDesktopRefreshFailureKeepsNodesButProjectsThemOffline(t *testing.T) {
+	original := []meshNode{
+		{
+			ConnectionStatus: p2p.ConnectionStatus{
+				PathType:     p2p.PathTypeRelay,
+				PathState:    p2p.PathStateFallbackRelay,
+				QualityScore: 82,
+				LatencyMS:    45,
+			},
+			Key:       "peer:office",
+			Kind:      "peer",
+			Online:    true,
+			NodeID:    "office",
+			VirtualIP: "10.77.0.9",
+			State:     "online",
+		},
+		{
+			ConnectionStatus: p2p.ConnectionStatus{
+				PathType:  p2p.PathTypeLANDirect,
+				PathState: p2p.PathStateLANDirectConnected,
+			},
+			Key:    "peer:blocked",
+			Kind:   "peer",
+			NodeID: "blocked",
+			State:  "disabled",
+		},
+	}
+
+	state, got := conservativeDesktopDeviceSnapshot(original)
+	if state != networkstate.Disconnected {
+		t.Fatalf("network state = %q, want disconnected", state)
+	}
+	if len(got) != 2 || got[0].NodeID != "office" || got[0].VirtualIP != "10.77.0.9" {
+		t.Fatalf("nodes = %+v, want preserved identity", got)
+	}
+	if got[0].Online || got[0].State != "offline" || got[0].PathType != "" || got[0].PathState != p2p.PathStateOffline || got[0].QualityScore != 0 || got[0].LatencyMS != 0 {
+		t.Fatalf("node = %+v, want conservative offline projection", got[0])
+	}
+	if !original[0].Online || original[0].State != "online" {
+		t.Fatalf("input snapshot was mutated: %+v", original[0])
+	}
+	if got[1].State != "disabled" || got[1].PathState != p2p.PathStateOffline {
+		t.Fatalf("policy-disabled node = %+v, want policy retained with offline connection", got[1])
+	}
+
+	b, err := os.ReadFile("main_windows.go")
+	if err != nil {
+		t.Fatal(err)
+	}
+	failureBranch := string(b)
+	start := strings.Index(failureBranch, "func (a *desktopApp) loadMeshStatus()")
+	end := strings.Index(failureBranch[start:], "func (a *desktopApp) showSelectedMeshNode()")
+	if start < 0 || end < 0 {
+		t.Fatal("loadMeshStatus source boundary missing")
+	}
+	failureBranch = failureBranch[start : start+end]
+	if !strings.Contains(failureBranch, "conservativeDesktopDeviceSnapshot(a.meshModel.items)") {
+		t.Fatal("desktop refresh failure must invalidate the retained device snapshot")
+	}
+	if strings.Contains(failureBranch, "os.ReadFile(statusPath)") || strings.Contains(failureBranch, "buildMeshNodes(status, statusPath)") {
+		t.Fatal("desktop refresh failure must not re-project the raw status file")
+	}
+}
+
+func TestDesktopRDPDiagnosticsPassSeparateNetworkAndTargetStates(t *testing.T) {
+	b, err := os.ReadFile("main_windows.go")
+	if err != nil {
+		t.Fatal(err)
+	}
+	src := string(b)
+	compact := strings.ReplaceAll(src, " ", "")
+	if !strings.Contains(compact, "networkStatenetworkstate.State") {
+		t.Fatal("desktop RDP diagnostics do not retain DeviceList network state")
+	}
+	for _, want := range []string{
+		"a.networkState = devices.NetworkState",
+		"NetworkState: string(a.networkState)",
+		"TargetStatus: node.State",
+	} {
+		if !strings.Contains(src, want) {
+			t.Fatalf("desktop RDP diagnostics missing separate state propagation %q", want)
+		}
 	}
 }
 
@@ -172,9 +442,9 @@ func TestDesktopMainWindowUsesCompactSizing(t *testing.T) {
 	}
 	src := string(b)
 	for _, want := range []string{
-		`MinSize:    Size{960, 620}`,
-		`Size:       Size{1060, 690}`,
-		`MaxSize:    Size{410, 0}`,
+		`MinSize:    Size{Width: 960, Height: 620}`,
+		`Size:       Size{Width: 1060, Height: 690}`,
+		`MaxSize:    Size{Width: 410, Height: 0}`,
 		`Layout:     VBox{Margins: Margins{Left: 12, Top: 12, Right: 8, Bottom: 12}, Spacing: 8}`,
 	} {
 		if !strings.Contains(src, want) {
@@ -183,7 +453,7 @@ func TestDesktopMainWindowUsesCompactSizing(t *testing.T) {
 	}
 }
 
-func TestRegeneratingInviteReplacesInvitesAndRestartsAgent(t *testing.T) {
+func TestRegeneratingInvitePreservesConnectedDevices(t *testing.T) {
 	b, err := os.ReadFile("main_windows.go")
 	if err != nil {
 		t.Fatal(err)
@@ -191,7 +461,7 @@ func TestRegeneratingInviteReplacesInvitesAndRestartsAgent(t *testing.T) {
 	src := string(b)
 	for _, want := range []string{
 		`ReplaceExisting: true`,
-		`serviceErr := a.installAndStartAgent(a.currentConfigPath())`,
+		`已连接的设备继续使用原身份`,
 	} {
 		if !strings.Contains(src, want) {
 			t.Fatalf("regenerate invite flow missing %s", want)
@@ -214,15 +484,13 @@ func TestDesktopLongLivedInviteShowsRiskAndDeviceLimit(t *testing.T) {
 	}
 }
 
-func TestDesktopMainWindowExposesDeviceAdminControlsAndInviteLimit(t *testing.T) {
+func TestDesktopMainWindowExposesDeviceAdminControls(t *testing.T) {
 	b, err := os.ReadFile("main_windows.go")
 	if err != nil {
 		t.Fatal(err)
 	}
 	src := string(b)
 	for _, want := range []string{
-		`LineEdit{AssignTo: &a.inviteMaxUses`,
-		`Text: "设备数限制"`,
 		`Text: "重命名设备"`,
 		`Text: "禁用设备"`,
 		`Text: "移除设备"`,
@@ -257,6 +525,130 @@ func TestDesktopDeviceListShowsDisabledAndDisplayName(t *testing.T) {
 	detail := formatMeshNodeDetail(nodes[0])
 	if !strings.Contains(detail, "显示名称：Alice laptop") || !strings.Contains(detail, "状态：已禁用") {
 		t.Fatalf("detail = %q, want display name and disabled status", detail)
+	}
+}
+
+func TestDesktopDeviceListShowsConnectionPathQualityStatus(t *testing.T) {
+	nodes := buildMeshNodesFromDevices(onboarding.DeviceList{
+		Nodes: []onboarding.DeviceSummary{
+			{
+				ConnectionStatus: p2p.ConnectionStatus{
+					PathType:     p2p.PathTypeLANDirect,
+					PathState:    p2p.PathStateLANDirectConnected,
+					LatencyMS:    24,
+					QualityScore: 96,
+				},
+				Kind:      "peer",
+				NodeID:    "direct-pc",
+				Status:    "online",
+				VirtualIP: "10.77.0.2",
+			},
+			{
+				ConnectionStatus: p2p.ConnectionStatus{
+					PathType:     p2p.PathTypeRelay,
+					PathState:    p2p.PathStateFallbackRelay,
+					LatencyMS:    88,
+					QualityScore: 72,
+				},
+				Kind:      "peer",
+				NodeID:    "relay-pc",
+				Status:    "online",
+				VirtualIP: "10.77.0.3",
+			},
+			{
+				ConnectionStatus: p2p.ConnectionStatus{
+					PathState: p2p.PathStateOffline,
+				},
+				Kind:      "peer",
+				NodeID:    "offline-pc",
+				Status:    "offline",
+				VirtualIP: "10.77.0.4",
+			},
+			{
+				ConnectionStatus: p2p.ConnectionStatus{
+					PathState: p2p.PathStateFailed,
+				},
+				Kind:      "peer",
+				NodeID:    "failed-pc",
+				Status:    "online",
+				VirtualIP: "10.77.0.5",
+			},
+			{
+				ConnectionStatus: p2p.ConnectionStatus{
+					PathState: p2p.PathStateRDPUnreachable,
+				},
+				Kind:      "peer",
+				NodeID:    "rdp-pc",
+				Status:    "online",
+				VirtualIP: "10.77.0.6",
+			},
+		},
+	}, `C:\Meshlink\configs\logs\MeshlinkAgent.status.json`)
+	want := map[string]string{
+		"direct-pc":  "局域网直连 · 24 ms · 质量 96",
+		"relay-pc":   "直连失败 · 本版本未启用中继",
+		"offline-pc": "离线或未知",
+		"failed-pc":  "直连失败",
+		"rdp-pc":     "RDP 不可达",
+	}
+	for _, node := range nodes {
+		if got := meshNodeConnectionSummary(node); got != want[node.NodeID] {
+			t.Fatalf("meshNodeConnectionSummary(%s) = %q, want %q", node.NodeID, got, want[node.NodeID])
+		}
+		detail := formatMeshNodeDetail(node)
+		if !strings.Contains(detail, "连接方式："+want[node.NodeID]) {
+			t.Fatalf("detail for %s = %q, want connection summary", node.NodeID, detail)
+		}
+		for _, forbidden := range []string{"NAT", "CSR", "CA", "证书路径", "路由表", "JSON"} {
+			if strings.Contains(detail, forbidden) {
+				t.Fatalf("detail for %s exposes technical label %q: %q", node.NodeID, forbidden, detail)
+			}
+		}
+	}
+}
+
+func TestDesktopMainWindowExposesOneClickDiagnosticReport(t *testing.T) {
+	b, err := os.ReadFile("main_windows.go")
+	if err != nil {
+		t.Fatal(err)
+	}
+	src := string(b)
+	for _, want := range []string{
+		`Text: "一键诊断"`,
+		`runOneClickDiagnostics`,
+		`RunOneClick`,
+		`formatOneClickReport`,
+	} {
+		if !strings.Contains(src, want) {
+			t.Fatalf("desktop main window missing one-click diagnostics %s", want)
+		}
+	}
+}
+
+func TestDesktopOneClickDiagnosticReportUsesPlainUserCopy(t *testing.T) {
+	text := formatOneClickReport(diagnose.OneClickReport{
+		Status:  diagnose.Fail,
+		Summary: diagnose.OneClickSummary{Headline: "发现 1 个需要处理的问题。"},
+		Findings: []diagnose.Finding{
+			{
+				Severity:       diagnose.Fail,
+				Title:          "目标设备离线",
+				Problem:        "目标设备当前不在线。",
+				Impact:         "本机现在无法打开这台设备的远程桌面。",
+				Recommendation: "请确认目标设备已开机，并保持 Meshlink 正在运行。",
+				Action:         "目标设备上线后刷新设备列表，再重新诊断。",
+			},
+		},
+	})
+	for _, want := range []string{"一键诊断报告", "发现的问题", "影响原因", "建议处理", "下一步动作"} {
+		if !strings.Contains(text, want) {
+			t.Fatalf("report text = %q, want %q", text, want)
+		}
+	}
+	for _, forbidden := range []string{"NAT", "CSR", "CA", "证书路径", "路由表", "服务名", "JSON", "MeshlinkAgent"} {
+		if strings.Contains(text, forbidden) {
+			t.Fatalf("report text exposes %q: %q", forbidden, text)
+		}
 	}
 }
 
@@ -352,7 +744,7 @@ func TestWaitForAgentRunningIgnoresTransientStoppedStatusFromRestart(t *testing.
 	}
 	go func() {
 		time.Sleep(80 * time.Millisecond)
-		running := `{"updated_at":"` + time.Now().Format(time.RFC3339Nano) + `","state":"running","self":{"node_id":"hub","mode":"hub","virtual_ip":"10.77.0.1"}}`
+		running := `{"updated_at":"` + time.Now().Format(time.RFC3339Nano) + `","state":"running","network_state":"connected","self":{"node_id":"hub","mode":"hub","virtual_ip":"10.77.0.1"}}`
 		_ = os.WriteFile(statusPath, []byte(running), 0o600)
 	}()
 	if err := waitForAgentRunningAfterStart(configPath, "MeshlinkAgent", startedAt, time.Second); err != nil {
@@ -397,6 +789,22 @@ func TestPublishUpdateBatPackagesAndRestartsUpdateService(t *testing.T) {
 	}
 }
 
+func TestBuildScriptBuildsMeshCloudHub(t *testing.T) {
+	b, err := os.ReadFile(filepath.Join("..", "..", "scripts", "build.ps1"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	src := string(b)
+	for _, want := range []string{
+		`mesh-cloudhub.exe`,
+		`.\cmd\mesh-cloudhub`,
+	} {
+		if !strings.Contains(src, want) {
+			t.Fatalf("build.ps1 should include %s", want)
+		}
+	}
+}
+
 func TestPackageIncludesPublishUpdateBat(t *testing.T) {
 	b, err := os.ReadFile(filepath.Join("..", "..", "scripts", "package.ps1"))
 	if err != nil {
@@ -405,6 +813,7 @@ func TestPackageIncludesPublishUpdateBat(t *testing.T) {
 	src := string(b)
 	for _, want := range []string{
 		`publish-update.bat`,
+		`mesh-cloudhub.exe`,
 		`bin\linux\mesh-agent`,
 		`build-linux-agent.ps1`,
 		`linux-systemd.sh`,

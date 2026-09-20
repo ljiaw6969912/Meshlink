@@ -11,17 +11,19 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"reflect"
 	"regexp"
 	"strings"
 	"testing"
 	"time"
 
 	"meshlink/internal/certutil"
+	"meshlink/internal/cloudhub"
 	"meshlink/internal/config"
 	"meshlink/internal/deployssh"
 )
 
-func TestCreateHubWritesManagedConfig(t *testing.T) {
+func TestGeneratedHubConfigIsV2(t *testing.T) {
 	dir := t.TempDir()
 	mgr := testManager(dir)
 
@@ -52,14 +54,46 @@ func TestCreateHubWritesManagedConfig(t *testing.T) {
 	if cfg.Mode != "hub" || cfg.NodeID != "home-pc" {
 		t.Fatalf("unexpected config identity: mode=%q node=%q", cfg.Mode, cfg.NodeID)
 	}
-	if cfg.Transport.Protocol != "tcp_tls_v1" || cfg.Transport.Listen != "192.168.1.23:8443" {
+	if cfg.Version != config.ConfigVersion || cfg.Transport.Protocol != config.ControlProtocolV2 || cfg.Transport.Listen != "192.168.1.23:8443" {
 		t.Fatalf("unexpected transport: %+v", cfg.Transport)
 	}
 	if result.Listen != "192.168.1.23:8443" {
 		t.Fatalf("result.Listen = %q, want local LAN listener", result.Listen)
 	}
-	if cfg.Setup.Address != "10.77.0.1/24" {
-		t.Fatalf("setup address = %q", cfg.Setup.Address)
+	if cfg.NetworkCIDR != "10.77.0.0/24" {
+		t.Fatalf("network CIDR = %q", cfg.NetworkCIDR)
+	}
+	if cfg.VirtualIP != "" || cfg.Routes != nil || cfg.MTU != 0 || cfg.Device != (config.DeviceConfig{}) || !reflect.DeepEqual(cfg.Setup, config.SetupConfig{}) || cfg.P2P != (config.P2PConfig{}) {
+		t.Fatalf("generated coordinator contains data-plane configuration: %+v", cfg)
+	}
+	raw, err := os.ReadFile(result.ConfigPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var persisted map[string]json.RawMessage
+	if err := json.Unmarshal(raw, &persisted); err != nil {
+		t.Fatal(err)
+	}
+	for _, forbidden := range []string{"virtual_ip", "routes", "mtu", "device", "setup", "p2p"} {
+		if _, ok := persisted[forbidden]; ok {
+			t.Fatalf("generated coordinator JSON contains %q: %s", forbidden, raw)
+		}
+	}
+}
+
+func TestGeneratedSpokeConfigIsV2(t *testing.T) {
+	cfg := spokeConfig("laptop", "10.77.0.2", Invite{
+		Server:   "home.example.com:8443",
+		Protocol: "tcp_tls_v1",
+	})
+	if err := cfg.Validate(); err != nil {
+		t.Fatal(err)
+	}
+	if cfg.Version != config.ConfigVersion || cfg.Transport.Protocol != config.ControlProtocolV2 {
+		t.Fatalf("generated spoke version/control transport = %d/%q", cfg.Version, cfg.Transport.Protocol)
+	}
+	if cfg.P2P != (config.P2PConfig{Protocol: config.P2PProtocolQUICUDPv1, Listen: "0.0.0.0:0"}) {
+		t.Fatalf("generated spoke P2P = %+v", cfg.P2P)
 	}
 }
 
@@ -480,6 +514,191 @@ func TestSelfHostedProductLoopCreatesJoinableDevices(t *testing.T) {
 	}
 }
 
+func TestDevicesKeepHealthyDirectPeerOnlineWhenCoordinatorReconnects(t *testing.T) {
+	dir := t.TempDir()
+	writeSpokeConfigForDeviceTest(t, dir, "desk")
+	now := time.Now().UTC()
+	runtimeJSON := strings.NewReplacer(
+		"$UPDATED_AT", now.Format(time.RFC3339Nano),
+		"$LAST_HEARTBEAT", now.Add(-10*time.Second).Format(time.RFC3339Nano),
+	).Replace(`{
+  "updated_at":"$UPDATED_AT",
+  "state":"running",
+  "network_state":"reconnecting",
+  "coordinator_state":"reconnecting",
+  "p2p_listen":"0.0.0.0:51820",
+  "self":{"node_id":"desk","mode":"spoke","virtual_ip":"10.77.0.2"},
+  "peers":[{
+    "node_id":"office",
+    "mode":"spoke",
+    "status":"online",
+    "virtual_ip":"10.77.0.3",
+    "path_type":"lan_direct",
+    "path_state":"lan_direct",
+    "last_heartbeat":"$LAST_HEARTBEAT",
+    "last_seen":"$LAST_HEARTBEAT"
+  }]
+}`)
+	writeRuntimeStatusForDeviceTest(t, dir, runtimeJSON)
+
+	devices, err := (Manager{BaseDir: dir}).Devices("mesh-agent")
+	if err != nil {
+		t.Fatal(err)
+	}
+	peer := findDeviceSummary(devices, "office")
+	if peer == nil {
+		t.Fatalf("office missing from device list: %+v", devices.Nodes)
+	}
+	if peer.Status != "online" || string(peer.PathType) != "lan_direct" || string(peer.PathState) != "lan_direct" {
+		t.Fatalf("office = %+v, want healthy LAN direct peer to stay online", *peer)
+	}
+
+	raw, err := json.Marshal(devices)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var projection struct {
+		CoordinatorState string `json:"coordinator_state"`
+		P2PListen        string `json:"p2p_listen"`
+	}
+	if err := json.Unmarshal(raw, &projection); err != nil {
+		t.Fatal(err)
+	}
+	if projection.CoordinatorState != "reconnecting" || projection.P2PListen != "0.0.0.0:51820" {
+		t.Fatalf("projection = %+v, want independent coordinator and P2P diagnostics", projection)
+	}
+}
+
+func TestDevicesRejectStaleFrozenDirectSnapshot(t *testing.T) {
+	dir := t.TempDir()
+	writeSpokeConfigForDeviceTest(t, dir, "desk")
+	now := time.Now().UTC()
+	staleSnapshot := now.Add(-2 * time.Minute)
+	runtimeJSON := strings.NewReplacer(
+		"$UPDATED_AT", staleSnapshot.Format(time.RFC3339Nano),
+		"$LAST_HEARTBEAT", staleSnapshot.Add(-10*time.Second).Format(time.RFC3339Nano),
+	).Replace(`{
+  "updated_at":"$UPDATED_AT",
+  "state":"running",
+  "network_state":"reconnecting",
+  "coordinator_state":"reconnecting",
+  "p2p_listen":"0.0.0.0:51820",
+  "self":{"node_id":"desk","mode":"spoke","virtual_ip":"10.77.0.2"},
+  "peers":[{
+    "node_id":"office",
+    "mode":"spoke",
+    "status":"online",
+    "virtual_ip":"10.77.0.3",
+    "path_type":"lan_direct",
+    "path_state":"lan_direct",
+    "last_heartbeat":"$LAST_HEARTBEAT",
+    "last_seen":"$LAST_HEARTBEAT"
+  }]
+}`)
+	writeRuntimeStatusForDeviceTest(t, dir, runtimeJSON)
+
+	devices, err := (Manager{BaseDir: dir}).Devices("mesh-agent")
+	if err != nil {
+		t.Fatal(err)
+	}
+	peer := findDeviceSummary(devices, "office")
+	if peer == nil {
+		t.Fatalf("office missing from device list: %+v", devices.Nodes)
+	}
+	if peer.Status != "offline" || peer.PathType != "" || string(peer.PathState) != "offline_or_unknown" {
+		t.Fatalf("office = %+v, want a frozen status snapshot to lose its direct path", *peer)
+	}
+}
+
+func TestDevicesNeverInferDirectFromMemberOnlineStatus(t *testing.T) {
+	dir := t.TempDir()
+	writeSpokeConfigForDeviceTest(t, dir, "desk")
+	writeRuntimeStatusForDeviceTest(t, dir, `{
+  "updated_at":"2026-09-14T08:00:00Z",
+  "state":"running",
+  "network_state":"connected",
+  "coordinator_state":"connected",
+  "p2p_listen":"0.0.0.0:51820",
+  "self":{"node_id":"desk","mode":"spoke","virtual_ip":"10.77.0.2"},
+  "peers":[{
+    "node_id":"office",
+    "mode":"spoke",
+    "status":"online",
+    "virtual_ip":"10.77.0.3",
+    "last_seen":"2026-09-14T08:00:00Z"
+  }]
+}`)
+
+	devices, err := (Manager{BaseDir: dir}).Devices("mesh-agent")
+	if err != nil {
+		t.Fatal(err)
+	}
+	peer := findDeviceSummary(devices, "office")
+	if peer == nil {
+		t.Fatalf("office missing from device list: %+v", devices.Nodes)
+	}
+	if peer.PathType != "" || string(peer.PathState) != "idle" {
+		t.Fatalf("office path = %+v, want idle member without an inferred direct path", peer.ConnectionStatus)
+	}
+}
+
+func TestDevicesTreatPresentEmptyP2PFieldsAsTruthfulRuntime(t *testing.T) {
+	dir := t.TempDir()
+	writeSpokeConfigForDeviceTest(t, dir, "desk")
+	writeRuntimeStatusForDeviceTest(t, dir, `{
+  "updated_at":"2026-09-14T08:00:00Z",
+  "state":"running",
+  "network_state":"connected",
+  "coordinator_state":"",
+  "p2p_listen":"",
+  "self":{"node_id":"desk","mode":"spoke","virtual_ip":"10.77.0.2"},
+  "peers":[{
+    "node_id":"office",
+    "mode":"spoke",
+    "status":"online",
+    "virtual_ip":"10.77.0.3"
+  }]
+}`)
+
+	devices, err := (Manager{BaseDir: dir}).Devices("mesh-agent")
+	if err != nil {
+		t.Fatal(err)
+	}
+	peer := findDeviceSummary(devices, "office")
+	if peer == nil {
+		t.Fatalf("office missing from device list: %+v", devices.Nodes)
+	}
+	if peer.PathType != "" || string(peer.PathState) != "idle" {
+		t.Fatalf("office path = %+v, want present v2 diagnostics to suppress legacy direct inference", peer.ConnectionStatus)
+	}
+}
+
+func TestDevicesRegistryFallbackNeverProjectsPersistedOnlineAsDirect(t *testing.T) {
+	dir := t.TempDir()
+	writeSpokeConfigForDeviceTest(t, dir, "desk")
+	mgr := Manager{BaseDir: dir}
+	if err := mgr.saveDeviceRegistry(DeviceRegistry{Nodes: []RegisteredNode{{
+		NodeID:    "office",
+		VirtualIP: "10.77.0.3",
+		Status:    "online",
+		LastSeen:  time.Now().UTC(),
+	}}}); err != nil {
+		t.Fatal(err)
+	}
+
+	devices, err := mgr.Devices("mesh-agent")
+	if err != nil {
+		t.Fatal(err)
+	}
+	peer := findDeviceSummary(devices, "office")
+	if peer == nil {
+		t.Fatalf("office missing from registry fallback: %+v", devices.Nodes)
+	}
+	if peer.Status != "offline" || peer.PathType != "" || string(peer.PathState) != "offline_or_unknown" {
+		t.Fatalf("office = %+v, want no-runtime registry data to be offline/unknown", *peer)
+	}
+}
+
 func TestDeploySelfHostedRelayStagesRemoteHubAndInvite(t *testing.T) {
 	dir := t.TempDir()
 	agentPath := filepath.Join(dir, "mesh-agent-linux")
@@ -688,6 +907,130 @@ func TestDeploySelfHostedRelayRejectsPublicAddressResolvingToProxyFakeIPBeforeSS
 		if !strings.Contains(err.Error(), want) {
 			t.Fatalf("error = %q, want %q", err.Error(), want)
 		}
+	}
+}
+
+func TestOfficialHubStatePersistsControlPlaneIDsWithoutSecrets(t *testing.T) {
+	dir := t.TempDir()
+	hub := httptest.NewServer(cloudhub.NewServer(cloudhub.NewService(cloudhub.NewMemoryStore())))
+	defer hub.Close()
+
+	mgr := Manager{BaseDir: dir, HTTPClient: hub.Client()}
+	ctx := context.Background()
+	accountResult, err := mgr.CreateOfficialHubAccount(ctx, OfficialHubAccountRequest{
+		HubAPIURL:   hub.URL,
+		Email:       "owner@example.com",
+		DisplayName: "Owner",
+		Password:    "do-not-save-this-password",
+	})
+	if err != nil {
+		t.Fatalf("CreateOfficialHubAccount returned error: %v", err)
+	}
+	networkResult, err := mgr.CreateOfficialHubNetwork(ctx, OfficialHubNetworkRequest{
+		Name: "Home",
+	})
+	if err != nil {
+		t.Fatalf("CreateOfficialHubNetwork returned error: %v", err)
+	}
+	inviteResult, err := mgr.CreateOfficialHubInvite(ctx, OfficialHubInviteRequest{
+		MaxUses: 2,
+		OneTime: false,
+	})
+	if err != nil {
+		t.Fatalf("CreateOfficialHubInvite returned error: %v", err)
+	}
+	if inviteResult.Invite.Token == "" || inviteResult.Invite.Code == "" {
+		t.Fatalf("invite result = %+v, want token and code for immediate join", inviteResult)
+	}
+	deviceResult, err := mgr.JoinOfficialHubDevice(ctx, OfficialHubJoinDeviceRequest{
+		Token:      inviteResult.Invite.Token,
+		Code:       inviteResult.Invite.Code,
+		DeviceName: "office-pc",
+	})
+	if err != nil {
+		t.Fatalf("JoinOfficialHubDevice returned error: %v", err)
+	}
+
+	state, err := mgr.OfficialHubState()
+	if err != nil {
+		t.Fatalf("OfficialHubState returned error: %v", err)
+	}
+	if state.HubAPIURL != hub.URL {
+		t.Fatalf("HubAPIURL = %q, want %q", state.HubAPIURL, hub.URL)
+	}
+	if state.AccountID != accountResult.Account.ID || state.NetworkID != networkResult.Network.ID || state.DeviceID != deviceResult.Device.ID {
+		t.Fatalf("state = %+v, want account/network/device ids from results", state)
+	}
+	if state.LocalDeviceName != "office-pc" {
+		t.Fatalf("LocalDeviceName = %q, want office-pc", state.LocalDeviceName)
+	}
+	if state.LastInvite == nil || state.LastInvite.ID != inviteResult.Invite.ID {
+		t.Fatalf("LastInvite = %+v, want sanitized invite metadata", state.LastInvite)
+	}
+
+	raw, err := os.ReadFile(filepath.Join(dir, "configs", "official-hub.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, forbidden := range []string{"do-not-save-this-password", inviteResult.Invite.Token, inviteResult.Invite.Code} {
+		if strings.Contains(string(raw), forbidden) {
+			t.Fatalf("official hub state leaked secret %q: %s", forbidden, raw)
+		}
+	}
+
+	reloaded, err := (Manager{BaseDir: dir}).OfficialHubState()
+	if err != nil {
+		t.Fatalf("reloaded OfficialHubState returned error: %v", err)
+	}
+	if reloaded.AccountID != state.AccountID || reloaded.NetworkID != state.NetworkID || reloaded.DeviceID != state.DeviceID || reloaded.HubAPIURL != state.HubAPIURL {
+		t.Fatalf("reloaded state = %+v, want %+v", reloaded, state)
+	}
+}
+
+func TestOfficialHubDeviceRevokeRejectsHeartbeat(t *testing.T) {
+	dir := t.TempDir()
+	hub := httptest.NewServer(cloudhub.NewServer(cloudhub.NewService(cloudhub.NewMemoryStore())))
+	defer hub.Close()
+
+	mgr := Manager{BaseDir: dir, HTTPClient: hub.Client()}
+	ctx := context.Background()
+	if _, err := mgr.CreateOfficialHubAccount(ctx, OfficialHubAccountRequest{
+		HubAPIURL:   hub.URL,
+		Email:       "owner@example.com",
+		DisplayName: "Owner",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := mgr.CreateOfficialHubNetwork(ctx, OfficialHubNetworkRequest{Name: "Home"}); err != nil {
+		t.Fatal(err)
+	}
+	invite, err := mgr.CreateOfficialHubInvite(ctx, OfficialHubInviteRequest{MaxUses: 1})
+	if err != nil {
+		t.Fatal(err)
+	}
+	device, err := mgr.JoinOfficialHubDevice(ctx, OfficialHubJoinDeviceRequest{
+		Token:      invite.Invite.Token,
+		Code:       invite.Invite.Code,
+		DeviceName: "office-pc",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := mgr.RevokeOfficialHubDevice(ctx, OfficialHubRevokeDeviceRequest{
+		DeviceID: device.Device.ID,
+		Reason:   "lost laptop",
+	}); err != nil {
+		t.Fatalf("RevokeOfficialHubDevice returned error: %v", err)
+	}
+	_, err = mgr.HeartbeatOfficialHubDevice(ctx, OfficialHubHeartbeatRequest{
+		DeviceID: device.Device.ID,
+		Status:   cloudhub.DeviceStatusOnline,
+	})
+	if err == nil {
+		t.Fatal("HeartbeatOfficialHubDevice after revoke returned nil error")
+	}
+	if !strings.Contains(err.Error(), "revoked") {
+		t.Fatalf("heartbeat error = %v, want revoked", err)
 	}
 }
 

@@ -1,0 +1,33 @@
+{
+  "schema_version": "task11b.benchmark-config.v1",
+  "benchmark_id": "local-baseline",
+  "environment": {
+    "measurement_scope": "local_simulated",
+    "scenario": "single-windows-local-process-baseline",
+    "hardware_label": "local-windows-reference",
+    "peer_hardware_label": "not-applicable-local-only",
+    "hub_version": "not-measured",
+    "relay_version": "not-measured",
+    "network_profile": "local-host",
+    "nat_profile": "not-applicable",
+    "rdp_profile": "not-measured"
+  },
+  "sampling": {
+    "warmup_count": 2,
+    "sample_count": 10,
+    "process_interval_ms": 500,
+    "probe_timeout_ms": 1000
+  },
+  "connection_probe": {
+    "enabled": false
+  },
+  "process_names": [
+    "mesh-desktop",
+    "mesh-agent"
+  ],
+  "observations": {
+    "connection_establishment_ms": [],
+    "rdp_first_frame_ms": [],
+    "direct_path_types": []
+  }
+}
