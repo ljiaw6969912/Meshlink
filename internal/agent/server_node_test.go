@@ -127,7 +127,7 @@ func testServerHostSharesCoordinatorPortAndTransfersPeerPackets(t *testing.T, ro
 		t.Fatal(err)
 	}
 	peerDev := &runtimeDevice{incoming: make(chan []byte, 32), written: make(chan []byte, 32)}
-	peer, err := New(&peerCfg, discardLogger(), WithDevice(peerDev))
+	peer, err := New(&peerCfg, discardLogger(), WithDevice(peerDev), withTestDeviceMAC(peerCfg.NodeID))
 	if err != nil {
 		t.Fatal(err)
 	}

@@ -90,7 +90,7 @@ func newRuntimeFixtureWithListen(t *testing.T, listen string, ids ...string) *ru
 		}
 		cfg := &config.Config{Mode: "spoke", NodeID: id, VirtualIP: fmt.Sprintf("10.77.0.%d", i+2), MTU: 1280, CAFile: filepath.Join(dir, "ca.pem"), CertFile: filepath.Join(dir, id+".pem"), KeyFile: filepath.Join(dir, id+"-key.pem"), P2P: config.P2PConfig{Listen: listen}}
 		d := &runtimeDevice{incoming: make(chan []byte, 150), written: make(chan []byte, 150)}
-		a, err := New(cfg, discardLogger(), WithDevice(d))
+		a, err := New(cfg, discardLogger(), WithDevice(d), withTestDeviceMAC(cfg.NodeID))
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -1182,7 +1182,7 @@ func TestSpokeShutdownInterruptsBlockingDeviceExactlyOnce(t *testing.T) {
 				}()
 			}
 			d := &closeOnlyRuntimeDevice{runtimeDevice: f.devices["B"], entered: make(chan struct{}), closed: make(chan struct{})}
-			a, err := New(&cfg, discardLogger(), WithDevice(d))
+			a, err := New(&cfg, discardLogger(), WithDevice(d), withTestDeviceMAC(cfg.NodeID))
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -1628,7 +1628,7 @@ func TestPeerRuntimeNegotiatesThroughRealTLSCoordinator(t *testing.T) {
 			cfg.Routes = append(cfg.Routes, config.Route{CIDR: route})
 		}
 		d := &runtimeDevice{incoming: make(chan []byte, 10), written: make(chan []byte, 10)}
-		a, err := New(cfg, discardLogger(), WithDevice(d))
+		a, err := New(cfg, discardLogger(), WithDevice(d), withTestDeviceMAC(cfg.NodeID))
 		if err != nil {
 			t.Fatal(err)
 		}

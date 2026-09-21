@@ -72,6 +72,7 @@ type CandidateUpdate struct {
 // Member is safe to place in membership snapshots: it never includes a
 // candidate, socket, probe credential, or any other physical address.
 type Member struct {
+	DisplayName string   `json:"display_name,omitempty"`
 	NodeID      string   `json:"node_id"`
 	VirtualIP   string   `json:"virtual_ip"`
 	Routes      []string `json:"routes"`

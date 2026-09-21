@@ -17,14 +17,17 @@ import (
 
 	"meshlink/internal/certutil"
 	"meshlink/internal/config"
+	"meshlink/internal/deviceidentity"
 )
 
 type EnrollRequest struct {
-	Token      string `json:"token"`
-	Code       string `json:"code"`
-	NodeName   string `json:"node_name"`
-	CSRPEM     []byte `json:"csr_pem"`
-	SourceAddr string `json:"source_addr,omitempty"`
+	MACAddress  string `json:"mac_address,omitempty"`
+	DisplayName string `json:"display_name,omitempty"`
+	Token       string `json:"token"`
+	Code        string `json:"code"`
+	NodeName    string `json:"node_name"`
+	CSRPEM      []byte `json:"csr_pem"`
+	SourceAddr  string `json:"source_addr,omitempty"`
 }
 
 type EnrollResponse struct {
@@ -35,10 +38,12 @@ type EnrollResponse struct {
 }
 
 type EnrollHTTPRequest struct {
-	Token    string `json:"token"`
-	Code     string `json:"code"`
-	NodeName string `json:"node_name"`
-	CSRPEM   string `json:"csr_pem"`
+	MACAddress  string `json:"mac_address,omitempty"`
+	DisplayName string `json:"display_name,omitempty"`
+	Token       string `json:"token"`
+	Code        string `json:"code"`
+	NodeName    string `json:"node_name"`
+	CSRPEM      string `json:"csr_pem"`
 }
 
 type EnrollHTTPResponse struct {
@@ -54,6 +59,8 @@ type DeviceRegistry struct {
 }
 
 type RegisteredNode struct {
+	ReportedName    string     `json:"reported_name,omitempty"`
+	MACAddress      string     `json:"mac_address,omitempty"`
 	NodeID          string     `json:"node_id"`
 	DisplayName     string     `json:"display_name,omitempty"`
 	VirtualIP       string     `json:"virtual_ip"`
@@ -81,6 +88,19 @@ func (m Manager) HandleEnroll(req EnrollRequest) (EnrollResponse, error) {
 	if len(req.CSRPEM) == 0 {
 		return EnrollResponse{}, fmt.Errorf("csr_pem is required")
 	}
+	if req.DisplayName == "" {
+		req.DisplayName = req.NodeName
+	}
+	if err := validateEnrollmentNodeName(req.DisplayName); err != nil {
+		return EnrollResponse{}, err
+	}
+	if req.MACAddress != "" {
+		mac, err := deviceidentity.NormalizeMAC(req.MACAddress)
+		if err != nil {
+			return EnrollResponse{}, err
+		}
+		req.MACAddress = mac
+	}
 	enrollmentMu.Lock()
 	defer enrollmentMu.Unlock()
 	invite, err := m.validateInvite(req)
@@ -91,8 +111,28 @@ func (m Manager) HandleEnroll(req EnrollRequest) (EnrollResponse, error) {
 	if err != nil {
 		return EnrollResponse{}, err
 	}
-	for _, node := range registry.Nodes {
-		if sameNodeID(node.NodeID, req.NodeName) {
+	existing := -1
+	for i, node := range registry.Nodes {
+		if req.MACAddress != "" && node.MACAddress == req.MACAddress {
+			if existing >= 0 {
+				return EnrollResponse{}, ErrDeviceIdentityAmbiguous
+			}
+			if node.Disabled || node.DeletedAt != nil {
+				return EnrollResponse{}, fmt.Errorf("device disabled or removed")
+			}
+			// The server's local endpoint may only be managed locally.
+			if node.VirtualIP == "10.77.0.1" {
+				return EnrollResponse{}, fmt.Errorf("MAC belongs to the server's local device")
+			}
+			existing = i
+		}
+	}
+	nodeID := req.NodeName
+	if existing >= 0 {
+		nodeID = registry.Nodes[existing].NodeID
+	}
+	for i, node := range registry.Nodes {
+		if i != existing && sameNodeID(node.NodeID, nodeID) {
 			return EnrollResponse{}, fmt.Errorf("node name already registered: %s", req.NodeName)
 		}
 	}
@@ -100,7 +140,7 @@ func (m Manager) HandleEnroll(req EnrollRequest) (EnrollResponse, error) {
 	caKeyPath := filepath.Join(m.certsDir(), "ca-key.pem")
 	issued, err := certutil.IssueCSR(certutil.IssueCSROptions{
 		CSRPEM:    req.CSRPEM,
-		Name:      req.NodeName,
+		Name:      nodeID,
 		CAPath:    caPath,
 		CAKeyPath: caKeyPath,
 		Days:      825,
@@ -112,25 +152,45 @@ func (m Manager) HandleEnroll(req EnrollRequest) (EnrollResponse, error) {
 	if err != nil {
 		return EnrollResponse{}, err
 	}
-	virtualIP, err := nextVirtualIP(registry)
+	virtualIP := ""
+	if existing >= 0 {
+		virtualIP = registry.Nodes[existing].VirtualIP
+	} else {
+		virtualIP, err = nextVirtualIP(registry)
+	}
 	if err != nil {
 		return EnrollResponse{}, err
 	}
-	cfg := spokeConfig(req.NodeName, virtualIP, invite)
+	cfg := spokeConfig(nodeID, virtualIP, invite)
+	cfg.DisplayName = req.DisplayName
+	if existing >= 0 {
+		for _, route := range registry.Nodes[existing].Routes {
+			cfg.Routes = append(cfg.Routes, config.Route{CIDR: route})
+		}
+	}
 	if err := cfg.Validate(); err != nil {
 		return EnrollResponse{}, err
 	}
 	now := m.now()
-	registry.Nodes = append(registry.Nodes, RegisteredNode{
-		NodeID:          req.NodeName,
-		DisplayName:     req.NodeName,
+	node := RegisteredNode{
+		NodeID:          nodeID,
+		DisplayName:     req.DisplayName,
+		ReportedName:    req.DisplayName,
+		MACAddress:      req.MACAddress,
 		VirtualIP:       virtualIP,
 		SourceAddr:      req.SourceAddr,
 		CertFingerprint: certificateFingerprint(issued.CertPEM),
 		CreatedAt:       now,
 		LastSeen:        now,
 		Status:          "offline",
-	})
+	}
+	if existing >= 0 {
+		node.CreatedAt = registry.Nodes[existing].CreatedAt
+		node.Routes = registry.Nodes[existing].Routes
+		registry.Nodes[existing] = node
+	} else {
+		registry.Nodes = append(registry.Nodes, node)
+	}
 	if err := m.saveDeviceRegistry(registry); err != nil {
 		return EnrollResponse{}, err
 	}
@@ -138,8 +198,8 @@ func (m Manager) HandleEnroll(req EnrollRequest) (EnrollResponse, error) {
 		return EnrollResponse{}, err
 	}
 	if err := m.writeAudit("enroll_succeeded", map[string]any{
-		"node_id":      req.NodeName,
-		"display_name": req.NodeName,
+		"node_id":      nodeID,
+		"display_name": req.DisplayName,
 		"virtual_ip":   virtualIP,
 		"source_addr":  req.SourceAddr,
 		"fingerprint":  certificateFingerprint(issued.CertPEM),

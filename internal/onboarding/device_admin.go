@@ -98,6 +98,8 @@ func (m Manager) RemoveDevice(nodeID string) (RegisteredNode, error) {
 }
 
 func (m Manager) updateDevice(nodeID, auditEvent string, update func(*RegisteredNode, time.Time)) (RegisteredNode, error) {
+	enrollmentMu.Lock()
+	defer enrollmentMu.Unlock()
 	registry, err := m.loadDeviceRegistry()
 	if err != nil {
 		return RegisteredNode{}, err

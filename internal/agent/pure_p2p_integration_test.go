@@ -783,7 +783,7 @@ func (h *pureP2PHarness) startPeer(id string) {
 		cfg.Routes = append(cfg.Routes, config.Route{CIDR: route})
 	}
 	device := newChannelTUNDevice("integration-"+id, 1280, 4096, h.ledger.add)
-	a, err := New(cfg, discardLogger(), WithDevice(device))
+	a, err := New(cfg, discardLogger(), WithDevice(device), withTestDeviceMAC(cfg.NodeID))
 	if err != nil {
 		h.t.Fatal(err)
 	}

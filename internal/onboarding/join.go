@@ -19,6 +19,7 @@ import (
 
 	"meshlink/internal/certutil"
 	"meshlink/internal/config"
+	"meshlink/internal/deviceidentity"
 )
 
 type JoinSpokeRequest struct {
@@ -80,7 +81,7 @@ func (m Manager) JoinSpoke(req JoinSpokeRequest) (JoinSpokeResult, error) {
 
 var errNodeNameRegistered = errors.New("node name already registered")
 
-func (m Manager) enrollSpoke(req JoinSpokeRequest, invite InviteLink, nodeID string) (JoinSpokeResult, error) {
+func (m Manager) enrollSpoke(req JoinSpokeRequest, invite InviteLink, nodeID string, legacy ...bool) (JoinSpokeResult, error) {
 	if err := os.MkdirAll(m.configsDir(), 0o700); err != nil {
 		return JoinSpokeResult{}, err
 	}
@@ -99,12 +100,19 @@ func (m Manager) enrollSpoke(req JoinSpokeRequest, invite InviteLink, nodeID str
 	if err != nil {
 		return JoinSpokeResult{}, err
 	}
-	body, err := json.Marshal(EnrollHTTPRequest{
-		Token:    invite.Token,
-		Code:     req.Code,
-		NodeName: nodeID,
-		CSRPEM:   string(csr.CSRPEM),
-	})
+	request := EnrollHTTPRequest{
+		MACAddress:  m.localMAC(),
+		DisplayName: req.NodeName,
+		Token:       invite.Token,
+		Code:        req.Code,
+		NodeName:    nodeID,
+		CSRPEM:      string(csr.CSRPEM),
+	}
+	if len(legacy) > 0 {
+		request.MACAddress = ""
+		request.DisplayName = ""
+	}
+	body, err := json.Marshal(request)
 	if err != nil {
 		return JoinSpokeResult{}, err
 	}
@@ -128,6 +136,14 @@ func (m Manager) enrollSpoke(req JoinSpokeRequest, invite InviteLink, nodeID str
 		return JoinSpokeResult{}, err
 	}
 	if res.StatusCode < 200 || res.StatusCode >= 300 {
+		var rejected EnrollHTTPResponse
+		_ = json.Unmarshal(resBody, &rejected)
+		// Older servers reject the added fields before processing enrollment.
+		// Retry only that exact parse error, never a potentially completed join.
+		if len(legacy) == 0 && res.StatusCode == http.StatusBadRequest &&
+			(rejected.Error == `json: unknown field "mac_address"` || rejected.Error == `json: unknown field "display_name"`) {
+			return m.enrollSpoke(req, invite, nodeID, true)
+		}
 		msg := strings.TrimSpace(string(resBody))
 		if msg == "" {
 			msg = res.Status
@@ -148,9 +164,11 @@ func (m Manager) enrollSpoke(req JoinSpokeRequest, invite InviteLink, nodeID str
 		return JoinSpokeResult{}, fmt.Errorf("enroll response missing certificate material")
 	}
 	cfg := enroll.Config
-	if cfg.Mode != "spoke" || cfg.NodeID != nodeID {
+	if cfg.Mode != "spoke" || validateEnrollmentNodeName(cfg.NodeID) != nil {
 		return JoinSpokeResult{}, fmt.Errorf("服务器返回的客户端身份不匹配")
 	}
+	// The coordinator may resolve the MAC to an existing immutable node ID.
+	nodeID = cfg.NodeID
 	cfg.DisplayName = req.NodeName
 	if err := cfg.Validate(); err != nil {
 		return JoinSpokeResult{}, err
@@ -200,7 +218,7 @@ func (m Manager) resumeJoinedSpoke(nodeName string, invite InviteLink) (JoinSpok
 	if err != nil {
 		return JoinSpokeResult{}, false, fmt.Errorf("已有网络配置无法读取，已保留原有身份：%w", err)
 	}
-	if cfg.Mode != "spoke" || (nodeName != "" && !sameNodeID(cfg.NodeID, nodeName) && !sameNodeID(cfg.DisplayName, nodeName)) ||
+	if cfg.Mode != "spoke" ||
 		(invite.Server != "" && !strings.EqualFold(cfg.Connect, meshConnectAddress(invite.Server))) {
 		return JoinSpokeResult{}, false, fmt.Errorf("此目录已有其他网络或身份的配置；切换网络或身份前请先退出原网络")
 	}
@@ -226,7 +244,23 @@ func (m Manager) resumeJoinedSpoke(nodeName string, invite InviteLink) (JoinSpok
 	if _, err := leaf.Verify(x509.VerifyOptions{Roots: roots, KeyUsages: []x509.ExtKeyUsage{x509.ExtKeyUsageClientAuth}}); err != nil {
 		return JoinSpokeResult{}, false, fmt.Errorf("已有证书验证失败，未重新注册：%w", err)
 	}
+	if nodeName != "" && nodeName != cfg.DisplayName {
+		if err := validateEnrollmentNodeName(nodeName); err != nil {
+			return JoinSpokeResult{}, false, err
+		}
+		cfg.DisplayName = nodeName
+		if err := writePrettyJSON(m.activeConfigPath(), cfg); err != nil {
+			return JoinSpokeResult{}, false, err
+		}
+	}
 	return JoinSpokeResult{ConfigPath: m.activeConfigPath(), VirtualIP: cfg.VirtualIP, Server: cfg.Connect, Protocol: cfg.Transport.Protocol}, true, nil
+}
+
+func (m Manager) localMAC() string {
+	if m.LocalMAC != nil {
+		return m.LocalMAC()
+	}
+	return deviceidentity.LocalMAC()
 }
 
 func friendlyEnrollError(msg string) error {

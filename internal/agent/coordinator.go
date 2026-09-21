@@ -50,6 +50,7 @@ func unorderedPair(a, b string) peerPair {
 }
 
 type coordinatorPeer struct {
+	metadata           bool
 	node               onboarding.RegisteredNode
 	conn               net.Conn
 	out                chan coordinatorWrite
@@ -297,13 +298,28 @@ func (c *coordinator) serveControl(ctx context.Context, conn net.Conn) {
 		writeControlError(conn, "identity_mismatch", "The authenticated certificate, node, virtual IP and routes must match an enabled registry entry.")
 		return
 	}
+	metadata := slices.Contains(hello.Capabilities, proto.DeviceMetadataCapability)
+	if metadata {
+		admittedNode := node
+		displayName, mac, metadataErr := proto.ParseDeviceMetadata(hello.Capabilities)
+		if metadataErr == nil {
+			node, metadataErr = c.manager.SyncDeviceMetadata(node.NodeID, fp, displayName, mac)
+		}
+		if metadataErr == nil && (!validRegisteredNode(node) || !sameRegisteredIdentity(admittedNode, node)) {
+			metadataErr = errors.New("device identity changed during admission")
+		}
+		if metadataErr != nil {
+			writeControlError(conn, "device_metadata_conflict", metadataErr.Error())
+			return
+		}
+	}
 	c.mu.Lock()
 	if !c.routesAvailableLocked(node) {
 		c.mu.Unlock()
 		writeControlError(conn, "route_conflict", "The registered virtual IP or routes conflict with an online member or the network boundary.")
 		return
 	}
-	p := &coordinatorPeer{node: node, conn: conn, out: make(chan coordinatorWrite, 64), done: make(chan struct{}), reports: make(map[string]struct{}), startupRevocations: make(map[[sha256.Size]byte]struct{})}
+	p := &coordinatorPeer{metadata: metadata, node: node, conn: conn, out: make(chan coordinatorWrite, 64), done: make(chan struct{}), reports: make(map[string]struct{}), startupRevocations: make(map[[sha256.Size]byte]struct{})}
 	writerDone := make(chan struct{})
 	go func() { defer close(writerDone); p.writeLoop() }()
 	defer func() { p.close(); <-writerDone }()
@@ -328,9 +344,9 @@ func (c *coordinator) serveControl(ctx context.Context, conn net.Conn) {
 	if old != nil {
 		old.close()
 	}
-	p.send(proto.ControlTypeServerHello, "", proto.ServerHello{ProtocolVersion: 2, NetworkCIDR: c.a.cfg.NetworkCIDR, MemberRevision: c.revision, Capabilities: []string{"quic_udp_v1"}})
+	p.send(proto.ControlTypeServerHello, "", proto.ServerHello{ProtocolVersion: 2, NetworkCIDR: c.a.cfg.NetworkCIDR, MemberRevision: c.revision, Capabilities: []string{"quic_udp_v1", proto.DeviceMetadataCapability}})
 	c.issueProbeLocked(p)
-	c.a.status.upsertPeer(PeerStatus{NodeID: node.NodeID, Mode: "spoke", VirtualIP: node.VirtualIP, Routes: node.Routes, Fingerprint: node.CertFingerprint, CommonName: node.NodeID, ConnectedAt: time.Now()})
+	c.a.status.upsertPeer(PeerStatus{NodeID: node.NodeID, DisplayName: node.DisplayName, Mode: "spoke", VirtualIP: node.VirtualIP, Routes: node.Routes, Fingerprint: node.CertFingerprint, CommonName: node.NodeID, ConnectedAt: time.Now()})
 	c.broadcastMembersLocked()
 	c.sendRetainedRevocationsLocked(p, registeredNodes)
 	c.publishMetrics()
@@ -562,11 +578,18 @@ func (c *coordinator) remove(p *coordinatorPeer) {
 func (c *coordinator) broadcastMembersLocked() {
 	members := make([]proto.Member, 0, len(c.peers))
 	for _, p := range c.peers {
-		members = append(members, proto.Member{NodeID: p.node.NodeID, VirtualIP: p.node.VirtualIP, Routes: p.node.Routes, Status: "online", Fingerprint: p.node.CertFingerprint})
+		members = append(members, proto.Member{DisplayName: p.node.DisplayName, NodeID: p.node.NodeID, VirtualIP: p.node.VirtualIP, Routes: p.node.Routes, Status: "online", Fingerprint: p.node.CertFingerprint})
 	}
 	sort.Slice(members, func(i, j int) bool { return members[i].NodeID < members[j].NodeID })
 	for _, p := range c.peers {
-		p.send(proto.ControlTypeMemberSnapshot, "", proto.MemberSnapshot{Revision: c.revision, Members: members})
+		peerMembers := members
+		if !p.metadata {
+			peerMembers = append([]proto.Member(nil), members...)
+			for i := range peerMembers {
+				peerMembers[i].DisplayName = ""
+			}
+		}
+		p.send(proto.ControlTypeMemberSnapshot, "", proto.MemberSnapshot{Revision: c.revision, Members: peerMembers})
 	}
 }
 func (c *coordinator) issueProbeLocked(p *coordinatorPeer) {
@@ -1043,6 +1066,14 @@ func (c *coordinator) reconcileRegistry() {
 			continue
 		}
 		if err == nil && validRegisteredNode(node) && sameRegisteredIdentity(node, known) {
+			if node.DisplayName != known.DisplayName {
+				c.known[id] = node
+				if peer := c.peers[id]; peer != nil {
+					peer.node = node
+				}
+				c.a.status.setPeerDisplayName(id, node.DisplayName)
+				changed = true
+			}
 			continue
 		}
 		if c.revokeMemberLocked(id) {

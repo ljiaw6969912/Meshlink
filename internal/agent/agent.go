@@ -17,6 +17,7 @@ import (
 )
 
 type Agent struct {
+	localMAC            func() string
 	cfg                 *config.Config
 	log                 *slog.Logger
 	dev                 device.Device
@@ -47,6 +48,7 @@ func (a *Agent) closeDevice() error {
 type Option func(*options)
 
 type options struct {
+	localMAC   func() string
 	statusPath string
 	baseDir    string
 	device     device.Device
@@ -112,13 +114,14 @@ func New(cfg *config.Config, logger *slog.Logger, opts ...Option) (*Agent, error
 	}
 
 	a := &Agent{
-		cfg:     cfg,
-		log:     logger.With("node", cfg.NodeID, "mode", cfg.Mode),
-		dev:     dev,
-		hello:   hello,
-		routes:  routes,
-		status:  newStatusStore(settings.statusPath, nodeStatusFromConfig(cfg, cfg.CertFile)),
-		baseDir: settings.baseDir,
+		localMAC: settings.localMAC,
+		cfg:      cfg,
+		log:      logger.With("node", cfg.NodeID, "mode", cfg.Mode),
+		dev:      dev,
+		hello:    hello,
+		routes:   routes,
+		status:   newStatusStore(settings.statusPath, nodeStatusFromConfig(cfg, cfg.CertFile)),
+		baseDir:  settings.baseDir,
 	}
 	if cfg.Mode == "hub" && cfg.ServerNodeConfig != "" {
 		child, err := a.newServerNode(settings)

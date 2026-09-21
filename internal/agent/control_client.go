@@ -15,6 +15,7 @@ import (
 	"sync"
 	"time"
 
+	"meshlink/internal/deviceidentity"
 	"meshlink/internal/networkstate"
 	"meshlink/internal/p2p"
 	"meshlink/internal/proto"
@@ -192,7 +193,15 @@ func (c *ControlClient) serve(parent context.Context, conn net.Conn) error {
 	c.lastProbeRefresh = time.Time{}
 	c.refreshMu.Unlock()
 	a := c.runtime.a
-	hello := proto.ClientHello{ProtocolVersion: 2, Role: "peer", NodeID: a.cfg.NodeID, VirtualIP: a.cfg.VirtualIP, Routes: a.hello.Routes, MTU: a.cfg.MTU, Capabilities: []string{"quic_udp_v1"}}
+	displayName := a.cfg.DisplayName
+	if displayName == "" {
+		displayName = a.cfg.NodeID
+	}
+	localMAC := deviceidentity.LocalMAC
+	if a.localMAC != nil {
+		localMAC = a.localMAC
+	}
+	hello := proto.ClientHello{ProtocolVersion: 2, Role: "peer", NodeID: a.cfg.NodeID, VirtualIP: a.cfg.VirtualIP, Routes: a.hello.Routes, MTU: a.cfg.MTU, Capabilities: proto.DeviceMetadataCapabilities(displayName, localMAC())}
 	c.mu.Lock()
 	c.conn = conn
 	c.available = false

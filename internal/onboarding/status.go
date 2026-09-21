@@ -76,6 +76,7 @@ type runtimeStatus struct {
 }
 
 type nodeStatus struct {
+	DisplayName string `json:"display_name,omitempty"`
 	p2p.ConnectionStatus
 	NodeID      string   `json:"node_id"`
 	Mode        string   `json:"mode"`
@@ -88,6 +89,7 @@ type nodeStatus struct {
 }
 
 type peerStatus struct {
+	DisplayName string `json:"display_name,omitempty"`
 	p2p.ConnectionStatus
 	NodeID         string     `json:"node_id"`
 	Mode           string     `json:"mode,omitempty"`
@@ -135,6 +137,7 @@ func (m Manager) deviceListFromRuntime(status runtimeStatus) (DeviceList, error)
 			ConnectionStatus: connectionStatus,
 			Kind:             "self",
 			NodeID:           status.Self.NodeID,
+			DisplayName:      status.Self.DisplayName,
 			Status:           selfStatus,
 			VirtualIP:        status.Self.VirtualIP,
 			Fingerprint:      status.Self.Fingerprint,
@@ -161,7 +164,7 @@ func (m Manager) deviceListFromRuntime(status runtimeStatus) (DeviceList, error)
 				peerStatus = "offline"
 			}
 		}
-		displayName := ""
+		displayName := peer.DisplayName
 		if policy != nil {
 			displayName = policy.DisplayName
 			if policy.Disabled {

@@ -1201,7 +1201,8 @@ func hasHealthCheck(checks []deployssh.HealthCheck, name, status string) bool {
 
 func testManager(baseDir string) Manager {
 	return Manager{
-		BaseDir: baseDir,
+		LocalMAC: func() string { return "" },
+		BaseDir:  baseDir,
 		LocalIPv4: func() (string, error) {
 			return "192.168.1.23", nil
 		},

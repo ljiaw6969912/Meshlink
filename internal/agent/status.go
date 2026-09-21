@@ -63,6 +63,7 @@ func (s *statusStore) setCoordinatorMetrics(metrics CoordinatorMetrics) {
 }
 
 type NodeStatus struct {
+	DisplayName string `json:"display_name,omitempty"`
 	p2p.ConnectionStatus
 	NodeID      string   `json:"node_id"`
 	Mode        string   `json:"mode"`
@@ -75,6 +76,7 @@ type NodeStatus struct {
 }
 
 type PeerStatus struct {
+	DisplayName   string               `json:"display_name,omitempty"`
 	LastHeartbeat time.Time            `json:"last_heartbeat"`
 	ErrorCode     string               `json:"error_code,omitempty"`
 	Session       *p2p.SessionSnapshot `json:"session,omitempty"`
@@ -483,10 +485,14 @@ func (s *statusStore) applyMembers(members []proto.Member, revoked map[string]bo
 func (s *statusStore) applyMembersLocked(members []proto.Member, revoked map[string]bool) {
 	for _, m := range members {
 		if m.NodeID == s.status.Self.NodeID {
+			if m.DisplayName != "" {
+				s.status.Self.DisplayName = m.DisplayName
+			}
 			continue
 		}
 		peer := s.peers[m.NodeID]
 		peer.NodeID = m.NodeID
+		peer.DisplayName = m.DisplayName
 		peer.Mode = "spoke"
 		peer.VirtualIP = m.VirtualIP
 		peer.Routes = append([]string(nil), m.Routes...)
@@ -553,6 +559,7 @@ func nodeStatusFromConfig(cfg *config.Config, certFile string) NodeStatus {
 		routes = append(routes, route.CIDR)
 	}
 	return NodeStatus{
+		DisplayName: cfg.DisplayName,
 		NodeID:      cfg.NodeID,
 		Mode:        cfg.Mode,
 		VirtualIP:   cfg.VirtualIP,
@@ -611,4 +618,17 @@ func fingerprintDER(der []byte) string {
 		parts = append(parts, raw[i:i+2])
 	}
 	return "SHA256:" + strings.Join(parts, ":")
+}
+
+func (s *statusStore) setPeerDisplayName(id, name string) {
+	if s == nil {
+		return
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if peer, ok := s.peers[id]; ok {
+		peer.DisplayName = name
+		s.peers[id] = peer
+		_ = s.writeLocked()
+	}
 }

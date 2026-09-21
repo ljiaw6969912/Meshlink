@@ -22,11 +22,13 @@ func (m Manager) EnrollHTTPHandler() http.Handler {
 			return
 		}
 		result, err := m.HandleEnroll(EnrollRequest{
-			Token:      req.Token,
-			Code:       req.Code,
-			NodeName:   req.NodeName,
-			CSRPEM:     []byte(req.CSRPEM),
-			SourceAddr: r.RemoteAddr,
+			MACAddress:  req.MACAddress,
+			DisplayName: req.DisplayName,
+			Token:       req.Token,
+			Code:        req.Code,
+			NodeName:    req.NodeName,
+			CSRPEM:      []byte(req.CSRPEM),
+			SourceAddr:  r.RemoteAddr,
 		})
 		if err != nil {
 			writeEnrollError(w, err)

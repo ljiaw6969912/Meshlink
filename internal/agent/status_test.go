@@ -182,3 +182,17 @@ func findAgentPeerStatus(status RuntimeStatus, nodeID string) *PeerStatus {
 	}
 	return nil
 }
+
+func TestMemberDisplayNameRefreshPreservesDirectSession(t *testing.T) {
+	store := newStatusStore("", NodeStatus{NodeID: "self", DisplayName: "old self"})
+	members := []proto.Member{{NodeID: "self", DisplayName: "new self"}, {NodeID: "peer", DisplayName: "old", Status: "online"}}
+	store.applyMembers(members, nil)
+	store.applySession(p2p.SessionSnapshot{PeerNodeID: "peer", State: p2p.PathStateLANDirect})
+	members[1].DisplayName = "new"
+	store.applyMembers(members, nil)
+	got := store.snapshot()
+	peer := findAgentPeerStatus(got, "peer")
+	if got.Self.DisplayName != "new self" || peer == nil || peer.DisplayName != "new" || peer.Session == nil || peer.Session.State != p2p.PathStateLANDirect {
+		t.Fatalf("rename damaged projection: %+v", got)
+	}
+}

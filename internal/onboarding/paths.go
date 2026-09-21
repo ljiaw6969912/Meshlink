@@ -14,6 +14,7 @@ type Manager struct {
 	BaseDir           string
 	Now               func() time.Time
 	HTTPClient        *http.Client
+	LocalMAC          func() string
 	LocalIPv4         func() (string, error)
 	ResolveHost       func(string) ([]net.IP, error)
 	SelfRelayDeployer deployssh.Deployer
