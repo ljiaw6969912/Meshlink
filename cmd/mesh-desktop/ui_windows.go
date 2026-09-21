@@ -153,6 +153,8 @@ func (a *desktopApp) createWindow() error {
 								Label{Text: "网络设备", TextColor: themeInk, Font: heading},
 								HSpacer{},
 								styledButton{PushButton: PushButton{Text: "刷新列表", OnClicked: a.loadMeshStatus, MinSize: Size{Width: 82}}},
+								Label{Text: "远程端口", TextColor: themeMuted},
+								LineEdit{AssignTo: &a.rdpPort, Text: rememberedRDPPort(appBaseDir()), MinSize: Size{Width: 66}, MaxSize: Size{Width: 72}, MaxLength: 5, ToolTipText: "远程桌面端口，默认 3389"},
 								styledButton{PushButton: PushButton{Text: "打开远程桌面", OnClicked: a.openRDP, MinSize: Size{Width: 120}}, Treatment: buttonPrimary},
 							}},
 							Label{AssignTo: &a.meshSummary, Text: "等待设备连接", TextColor: themeMuted},

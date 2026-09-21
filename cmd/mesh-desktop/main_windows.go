@@ -22,6 +22,7 @@ import (
 
 	"github.com/lxn/walk"
 	. "github.com/lxn/walk/declarative"
+	"github.com/lxn/win"
 	"golang.org/x/sys/windows"
 
 	meshagent "meshlink/internal/agent"
@@ -70,6 +71,7 @@ type desktopApp struct {
 	ipSANs        *walk.LineEdit
 	certDays      *walk.LineEdit
 	rdpTarget     *walk.LineEdit
+	rdpPort       *walk.LineEdit
 	updateURL     *walk.LineEdit
 	updateHost    *walk.LineEdit
 	updatePort    *walk.LineEdit
@@ -92,12 +94,20 @@ type desktopApp struct {
 	coordinatorState   string
 	p2pListen          string
 	latestUpdate       *meshupdate.Manifest
+	updateDialog       *walk.Dialog
+	updateCheckButton  *walk.PushButton
+	updateApplyButton  *walk.PushButton
+	updateBusy         bool
+	updateCancel       context.CancelFunc
+	updateToken        uint64
 	output             *walk.TextEdit
 }
 
 type desktopSettings struct {
-	LastConfigPath string `json:"last_config_path"`
-	LastUpdateURL  string `json:"last_update_url,omitempty"`
+	LastConfigPath   string `json:"last_config_path"`
+	LastUpdateURL    string `json:"last_update_url,omitempty"`
+	LastRDPPort      int    `json:"last_rdp_port,omitempty"`
+	LastUpdateServer string `json:"last_update_server,omitempty"`
 }
 
 type meshNode struct {
@@ -148,6 +158,23 @@ func (m *meshNodeModel) Value(index int) interface{} {
 }
 
 func (m *meshNodeModel) SetItems(items []meshNode) {
+	sameOrder := len(m.items) == len(items)
+	for i := 0; sameOrder && i < len(items); i++ {
+		sameOrder = m.items[i].Key == items[i].Key
+	}
+	if sameOrder {
+		oldValues := make([]interface{}, len(m.items))
+		for i := range m.items {
+			oldValues[i] = m.Value(i)
+		}
+		m.items = items
+		for i := range items {
+			if oldValues[i] != m.Value(i) {
+				m.PublishItemChanged(i)
+			}
+		}
+		return
+	}
 	m.items = items
 	m.PublishItemsReset()
 }
@@ -323,9 +350,13 @@ func (a *desktopApp) run() error {
 	a.restoreSimpleModeState()
 	a.refreshServiceStatusLabels()
 	a.loadMeshStatus()
+	a.mw.Starting().Attach(a.reportUpdateResult)
 	stopRefresh := a.startMeshStatusAutoRefresh()
 	a.mw.Show()
 	a.mw.Run()
+	if a.updateCancel != nil {
+		a.updateCancel()
+	}
 	close(stopRefresh)
 	return nil
 }
@@ -533,8 +564,8 @@ func splitUpdateBaseURL(raw string) (string, string) {
 		host = "10.77.0.1"
 	}
 	port := u.Port()
-	if port == "" {
-		port = "1263"
+	if u.Scheme == "https" || u.Path != "" {
+		host = u.Scheme + "://" + host + u.EscapedPath()
 	}
 	return host, port
 }
@@ -1779,6 +1810,7 @@ func (a *desktopApp) loadMeshStatus() {
 	if a.meshModel == nil || a.meshList == nil || a.meshDetail == nil || a.meshSummary == nil {
 		return
 	}
+	defer a.preserveMeshViewport()()
 	configPath := a.currentConfigPath()
 	serviceName := a.currentServiceName()
 	statusPath := runner.StatusPath(configPath, serviceName)
@@ -1841,6 +1873,29 @@ func (a *desktopApp) loadMeshStatus() {
 		_ = a.meshList.SetCurrentIndex(-1)
 		a.meshSelected = ""
 		a.meshDetail.SetText("设备状态刷新失败，当前按已断开处理：\r\n" + devicesErr.Error())
+	}
+}
+
+// Restore the visible device after both status updates and membership changes.
+// The selected device may be outside the viewport; refreshing must not reveal it.
+func (a *desktopApp) preserveMeshViewport() func() {
+	top := int(a.meshList.SendMessage(win.LB_GETTOPINDEX, 0, 0))
+	key := ""
+	if top >= 0 && top < len(a.meshModel.items) {
+		key = a.meshModel.items[top].Key
+	}
+	suspended := a.meshList.Suspended()
+	a.meshList.SetSuspended(true)
+	return func() {
+		if index := findMeshNodeIndex(a.meshModel.items, key); key != "" && index >= 0 {
+			top = index
+		}
+		if n := len(a.meshModel.items); n > 0 {
+			top = max(0, min(top, n-1))
+			a.meshList.SendMessage(win.LB_SETTOPINDEX, uintptr(top), 0)
+		}
+		a.meshList.SetSuspended(suspended)
+		_ = a.meshList.Invalidate()
 	}
 }
 
@@ -1951,13 +2006,14 @@ func (a *desktopApp) startMeshStatusAutoRefresh() chan struct{} {
 }
 
 func (a *desktopApp) checkRDP() {
-	if a.rdpTarget == nil {
-		a.fail("检查 RDP 失败", fmt.Errorf("请先在节点列表选择远程节点"))
+	target, err := a.currentRDPAddress()
+	if err != nil {
+		a.fail("检查 RDP 失败", err)
 		return
 	}
 	node, _ := a.currentMeshNode()
 	check := diagnose.CheckRDPTarget(diagnose.RDPCheckRequest{
-		Target:       strings.TrimSpace(a.rdpTarget.Text()),
+		Target:       target,
 		TargetDevice: node.NodeID,
 		NetworkState: string(a.networkState),
 		TargetStatus: node.State,
@@ -2062,16 +2118,63 @@ func (a *desktopApp) openRDP() {
 		a.fail("打开远程桌面失败", fmt.Errorf("设备已禁用，不能继续连接"))
 		return
 	}
-	target := a.currentRDPTarget()
-	if target == "" {
-		a.fail("打开远程桌面失败", fmt.Errorf("请先在节点列表选择远程节点"))
+	target, err := a.currentRDPAddress()
+	if err != nil {
+		a.fail("打开远程桌面失败", err)
 		return
 	}
 	if err := rdp.Open(target); err != nil {
 		a.fail("打开远程桌面失败", err)
 		return
 	}
+	_, port, _ := net.SplitHostPort(target)
+	if err := rememberRDPPort(appBaseDir(), port); err != nil {
+		a.info("已打开远程桌面，但未能保存端口：" + err.Error())
+		return
+	}
 	a.info("已打开远程桌面：" + target)
+}
+
+func rdpAddress(host, port string) (string, error) {
+	if strings.TrimSpace(host) == "" {
+		return "", fmt.Errorf("请先在节点列表选择远程节点")
+	}
+	port = strings.TrimSpace(port)
+	if port == "" {
+		port = "3389"
+	}
+	n, err := strconv.Atoi(port)
+	if err != nil || n < 1 || n > 65535 {
+		return "", fmt.Errorf("远程桌面端口必须是 1–65535 的整数")
+	}
+	return net.JoinHostPort(strings.TrimSpace(host), strconv.Itoa(n)), nil
+}
+
+func (a *desktopApp) currentRDPAddress() (string, error) {
+	port := ""
+	if a.rdpPort != nil {
+		port = a.rdpPort.Text()
+	}
+	return rdpAddress(a.currentRDPTarget(), port)
+}
+
+func rememberedRDPPort(baseDir string) string {
+	port := loadDesktopSettings(baseDir).LastRDPPort
+	if port < 1 || port > 65535 {
+		port = 3389
+	}
+	return strconv.Itoa(port)
+}
+
+func rememberRDPPort(baseDir, port string) error {
+	address, err := rdpAddress("127.0.0.1", port)
+	if err != nil {
+		return err
+	}
+	_, port, _ = net.SplitHostPort(address)
+	settings := loadDesktopSettings(baseDir)
+	settings.LastRDPPort, _ = strconv.Atoi(port)
+	return saveDesktopSettings(baseDir, settings)
 }
 
 func (a *desktopApp) currentRDPTarget() string {
@@ -2106,7 +2209,7 @@ func (a *desktopApp) currentMeshNode() (meshNode, bool) {
 }
 
 func (a *desktopApp) showAboutDialog() {
-	host, port := splitUpdateBaseURL(rememberedUpdateURL(appBaseDir()))
+	host, port := splitUpdateBaseURL(preferredUpdateURL(appBaseDir(), a.currentConfigPath()))
 	var dlg *walk.Dialog
 	var closeButton *walk.PushButton
 	if err := (Dialog{
@@ -2132,8 +2235,8 @@ func (a *desktopApp) showAboutDialog() {
 					LineEdit{AssignTo: &a.updateHost, Text: host, ColumnSpan: 3},
 					Label{Text: "更新端口"},
 					LineEdit{AssignTo: &a.updatePort, Text: port, ColumnSpan: 3},
-					PushButton{Text: "检查更新", OnClicked: a.checkUpdate, ColumnSpan: 2},
-					PushButton{Text: "立即更新", OnClicked: a.applyUpdate, ColumnSpan: 2},
+					PushButton{AssignTo: &a.updateCheckButton, Text: "检查更新", OnClicked: a.checkUpdate, ColumnSpan: 2},
+					PushButton{AssignTo: &a.updateApplyButton, Text: "立即更新并重启", OnClicked: a.applyUpdate, ColumnSpan: 2},
 					Label{AssignTo: &a.updateState, Text: "更新状态：未检查", ColumnSpan: 4},
 					TextEdit{AssignTo: &a.updateOutput, ReadOnly: true, MinSize: Size{Width: 0, Height: 120}, ColumnSpan: 4},
 				},
@@ -2152,7 +2255,18 @@ func (a *desktopApp) showAboutDialog() {
 		a.fail("打开关于窗口失败", err)
 		return
 	}
+	a.updateDialog = dlg
 	dlg.Run()
+	a.updateToken++
+	if a.updateCancel != nil {
+		a.updateCancel()
+		a.updateCancel = nil
+	}
+	a.updateBusy = false
+	a.updateDialog = nil
+	a.updateHost, a.updatePort = nil, nil
+	a.updateState, a.updateOutput = nil, nil
+	a.updateCheckButton, a.updateApplyButton = nil, nil
 }
 
 func (a *desktopApp) currentUpdateBaseURL() (string, error) {
@@ -2166,108 +2280,12 @@ func (a *desktopApp) currentUpdateBaseURL() (string, error) {
 	if a.updateURL != nil {
 		return meshupdate.NormalizeBaseURL(a.updateURL.Text())
 	}
-	return meshupdate.NormalizeBaseURL(rememberedUpdateURL(appBaseDir()))
+	return meshupdate.NormalizeBaseURL(preferredUpdateURL(appBaseDir(), a.currentConfigPath()))
 }
 
-func (a *desktopApp) checkUpdate() {
-	if a.updateState == nil {
-		a.fail("检查更新失败", fmt.Errorf("普通模式不显示更新设置"))
-		return
-	}
-	normalized, err := a.currentUpdateBaseURL()
-	if err != nil {
-		a.fail("更新地址无效", err)
-		return
-	}
-	if a.updateURL != nil {
-		a.updateURL.SetText(normalized)
-	}
-	if err := rememberUpdateURL(appBaseDir(), normalized); err != nil {
-		a.fail("保存更新地址失败", err)
-		return
-	}
+func (a *desktopApp) checkUpdate() { a.runRemoteUpdate(false) }
 
-	ctx, cancel := context.WithTimeout(context.Background(), 12*time.Second)
-	defer cancel()
-	result, err := meshupdate.Check(ctx, normalized, version.Version)
-	if err != nil {
-		a.latestUpdate = nil
-		a.updateState.SetText("更新状态：检查失败")
-		a.fail("检查更新失败", err)
-		return
-	}
-	if result.UpdateAvailable {
-		a.latestUpdate = &result.Manifest
-		a.updateState.SetText("更新状态：发现新版本 " + result.Manifest.Version)
-		a.showUpdateInfo(formatUpdateResult(result))
-		return
-	}
-	a.latestUpdate = nil
-	a.updateState.SetText("更新状态：已是最新版本")
-	a.showUpdateInfo(formatUpdateResult(result))
-}
-
-func (a *desktopApp) applyUpdate() {
-	if a.updateState == nil {
-		a.fail("立即更新失败", fmt.Errorf("普通模式不显示更新设置"))
-		return
-	}
-	if a.latestUpdate == nil {
-		a.checkUpdate()
-		if a.latestUpdate == nil {
-			return
-		}
-	}
-	manifest := *a.latestUpdate
-	if meshupdate.CompareVersions(manifest.Version, version.Version) <= 0 {
-		a.info("当前已经是最新版本，无需更新。")
-		return
-	}
-	confirm := walk.MsgBox(
-		a.mw,
-		"确认更新",
-		"将下载并安装 Meshlink "+manifest.Version+"。\r\n\r\n更新会关闭桌面控制台，停止并重启 MeshlinkAgent 服务；配置、证书和日志不会被覆盖。\r\n\r\n建议以管理员身份运行本控制台。",
-		walk.MsgBoxOKCancel|walk.MsgBoxIconInformation,
-	)
-	if confirm != walk.DlgCmdOK {
-		return
-	}
-
-	baseDir := appBaseDir()
-	updateURL, err := a.currentUpdateBaseURL()
-	if err != nil {
-		a.fail("更新地址无效", err)
-		return
-	}
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
-	defer cancel()
-	packagePath, err := meshupdate.DownloadPackage(ctx, updateURL, manifest, filepath.Join(baseDir, "updates", "downloads"))
-	if err != nil {
-		a.updateState.SetText("更新状态：下载失败")
-		a.fail("下载更新失败", err)
-		return
-	}
-	scriptPath, err := meshupdate.WriteApplyScript(meshupdate.ApplyOptions{
-		BaseDir:     baseDir,
-		PackagePath: packagePath,
-		Version:     manifest.Version,
-		ServiceName: a.currentServiceName(),
-		WaitPID:     os.Getpid(),
-	})
-	if err != nil {
-		a.updateState.SetText("更新状态：准备失败")
-		a.fail("准备更新失败", err)
-		return
-	}
-	cmd := exec.Command("powershell.exe", "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", scriptPath)
-	if err := cmd.Start(); err != nil {
-		a.updateState.SetText("更新状态：启动失败")
-		a.fail("启动更新脚本失败", err)
-		return
-	}
-	a.info("更新脚本已启动：\r\n" + scriptPath + "\r\n\r\n控制台即将关闭，更新完成后会自动重新打开。")
-	a.mw.Close()
-}
+func (a *desktopApp) applyUpdate() { a.runRemoteUpdate(true) }
 
 func (a *desktopApp) showUpdateInfo(text string) {
 	if a.updateOutput != nil {

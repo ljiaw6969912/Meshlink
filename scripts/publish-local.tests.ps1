@@ -140,7 +140,47 @@ try {
     Assert-Throws { Stop-MeshlinkRuntime -State $runtime -TimeoutSeconds 0 } 'a service that never stopped was accepted'
   } finally { Restore-MeshlinkRuntime $runtime }
   Assert-True ($script:fixtureServices[0].State -eq 'Running' -and $script:fixtureServices[0].StartMode -eq 'Auto') 'failed shutdown did not restore original service mode'
-  Write-Output 'publish-local tests passed (metadata, all-data preservation, containment, bounded shutdown and restoration)'
+  # Run the real packaging entry point on disposable fixtures with SCM shadowed.
+  $packageSource = Get-Content -LiteralPath (Join-Path $PSScriptRoot 'package-clean.ps1') -Raw -Encoding UTF8
+  $packageSource = $packageSource.Replace('#Requires -RunAsAdministrator', '')
+  $packageSource = $packageSource.Replace('if ($FunctionsOnly) { return }', "function Stop-MeshlinkRuntime { }`nfunction Restore-MeshlinkRuntime { }`nfunction Assert-MeshlinkStopped { }`nif (`$FunctionsOnly) { return }")
+  $fixturePackageScript = Write-Fixture 'fixture-package.ps1' $packageSource
+  [IO.File]::WriteAllText($fixturePackageScript, $packageSource, (New-Object Text.UTF8Encoding($true)))
+  $fixtureRelease = Join-Path $temporaryRoot 'package/meshlink'
+  $fixtureArtifacts = @()
+  foreach ($relative in @(Get-MeshlinkDistributionFiles)) {
+    $path = Write-Fixture ('package/meshlink/' + $relative) ('fixture-' + $relative)
+    if ($relative.StartsWith('bin/') -and $relative.Substring(4) -in $compiled) {
+      $fixtureArtifacts += [ordered]@{ path=$relative.Substring(4); sha256=(Get-FileHash -LiteralPath $path).Hash; size=(Get-Item -LiteralPath $path).Length }
+    }
+  }
+  Write-Fixture 'package/meshlink/VERSION' '0.2.0' | Out-Null
+  $fixtureMetadata = [ordered]@{schema='meshlink-build-v1'; version='0.2.0'; mode='development'; signing=@{code_signed=$false}; build_time='2026-09-21T00:00:00Z'; artifacts=$fixtureArtifacts}
+  Write-Fixture 'package/meshlink/build-metadata.json' ($fixtureMetadata | ConvertTo-Json -Depth 10) | Out-Null
+  Write-Fixture 'package/meshlink/certs/key.pem' 'private-fixture' | Out-Null
+  $packageBefore = Get-MeshlinkDataHashes $fixtureRelease
+  $packageResult = (& $fixturePackageScript -SourceDirectory $fixtureRelease | Out-String) | ConvertFrom-Json
+  Assert-MeshlinkDataUnchanged $fixtureRelease $packageBefore
+  $releaseManifest = Get-Content -LiteralPath (Join-Path $temporaryRoot 'package/manifest.json') -Raw | ConvertFrom-Json
+  Assert-True ($releaseManifest.package.file -ceq 'meshlink-0.2.0.zip') 'release manifest compatibility URL incorrect'
+  Assert-True ($releaseManifest.package.sha256 -eq (Get-FileHash -LiteralPath $packageResult.Archive).Hash) 'release archive hash mismatch'
+  Assert-True (-not (Test-Path -LiteralPath (Join-Path $temporaryRoot 'package/meshlink-0.2.0.zip'))) 'versioned archive must not exist'
+  $archive = [IO.Compression.ZipFile]::OpenRead($packageResult.Archive)
+  try {
+    $entry = $archive.GetEntry('meshlink/manifest.json')
+    Assert-True ($null -ne $entry) 'package manifest missing'
+    $reader = New-Object IO.StreamReader($entry.Open())
+    try { $document = $reader.ReadToEnd() | ConvertFrom-Json } finally { $reader.Dispose() }
+    Assert-True ($document.schema -ceq 'meshlink-package-v1') 'package schema incorrect'
+    Assert-True ($document.files.Count -eq @(Get-MeshlinkDistributionFiles).Count) 'package manifest coverage incomplete'
+    [string[]]$paths = @($document.files | ForEach-Object { $_.path })
+    [string[]]$sorted = $paths.Clone()
+    [Array]::Sort($sorted, [StringComparer]::Ordinal)
+    Assert-True (($paths -join '|') -ceq ($sorted -join '|')) 'package paths must use ordinal order'
+    Assert-True ($null -eq $archive.GetEntry('meshlink/certs/key.pem')) 'archive leaked runtime data'
+    Assert-True ($null -ne $archive.GetEntry('meshlink/scripts/support-triage.ps1')) 'runtime support script missing'
+  } finally { $archive.Dispose() }
+  Write-Output 'publish-local tests passed (metadata, data preservation, shutdown/restoration, clean update package)'
 } finally {
   $resolvedTemporary = [IO.Path]::GetFullPath($temporaryRoot)
   $resolvedBase = [IO.Path]::GetFullPath([IO.Path]::GetTempPath()).TrimEnd('\') + '\'

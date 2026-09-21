@@ -15,7 +15,7 @@ function Get-MeshlinkDistributionFiles {
     'bin/mesh-agent.exe', 'bin/mesh-cloudhub.exe', 'bin/mesh-desktop.exe',
     'bin/mesh-update-server.exe', 'bin/meshctl.exe', 'bin/linux/mesh-agent', 'bin/wintun.dll',
     'start-meshlink.bat', 'LICENSE', 'THIRD_PARTY_NOTICES.md', 'VERSION',
-    'build-metadata.json', '使用说明.txt'
+    'build-metadata.json', '使用说明.txt', 'scripts/support-triage.ps1'
   )
 }
 
@@ -187,10 +187,16 @@ try {
   $before = Get-MeshlinkDataHashes $sourceRoot
   $version = (Get-Content -LiteralPath (Join-Path $sourceRoot 'VERSION') -Raw -Encoding UTF8).Trim()
   $metadata = Read-MeshlinkBuildMetadata -BinDirectory (Join-Path $sourceRoot 'bin') -Version $version -MetadataPath (Join-Path $sourceRoot 'build-metadata.json')
+  if ($version -notmatch '^[0-9]+\.[0-9]+\.[0-9]+(?:-[0-9A-Za-z.-]+)?$') { throw 'VERSION is invalid' }
+  if ($metadata.mode -notin @('development', 'release') -or $null -eq $metadata.signing) { throw 'Build signing metadata is missing' }
+  if ($metadata.mode -eq 'development' -and ($metadata.signing.code_signed -or $metadata.signing.certificate_thumbprint)) { throw 'Development build must be unsigned' }
+  if ($metadata.mode -eq 'release' -and (-not $metadata.signing.code_signed -or $metadata.signing.certificate_thumbprint -notmatch '^[0-9A-Fa-f]{40}$')) { throw 'Release build signing metadata is invalid' }
   $expectedHashes = @{}
+  $packageFiles = @{}
   foreach ($relative in $fileNames) {
     $path = Get-MeshlinkDestinationPath -Root $sourceRoot -Relative $relative
     $expectedHashes[$relative] = (Get-FileHash -LiteralPath $path -Algorithm SHA256).Hash
+    $packageFiles[$relative] = [ordered]@{ path=$relative; sha256=$expectedHashes[$relative].ToLowerInvariant(); size=(Get-Item -LiteralPath $path).Length }
   }
   if ($metadata.source) { $metadata.source.PSObject.Properties.Remove('directory') }
   $instructions = @"
@@ -221,6 +227,20 @@ Meshlink $($metadata.version) — 无配置分发包
     '使用说明.txt' = $utf8.GetBytes($instructions)
     'build-metadata.json' = $utf8.GetBytes(($metadata | ConvertTo-Json -Depth 10))
   }
+  foreach ($relative in @($generated.Keys)) {
+    $sha = [Security.Cryptography.SHA256]::Create()
+    try { $hash = [BitConverter]::ToString($sha.ComputeHash($generated[$relative])).Replace('-', '').ToLowerInvariant() } finally { $sha.Dispose() }
+    $packageFiles[$relative] = [ordered]@{ path=$relative; sha256=$hash; size=$generated[$relative].Length }
+  }
+  # Go validates ordinal UTF-8 path ordering; PowerShell's culture sort differs.
+  [string[]]$sortedPaths = @($packageFiles.Keys)
+  [Array]::Sort($sortedPaths, [StringComparer]::Ordinal)
+  $packageManifest = [ordered]@{
+    schema='meshlink-package-v1'; product='Meshlink'; version=$version
+    mode=$metadata.mode; build_time=$metadata.build_time; signing=$metadata.signing
+    files=@($sortedPaths | ForEach-Object { $packageFiles[$_] })
+  }
+  $generated['manifest.json'] = $utf8.GetBytes(($packageManifest | ConvertTo-Json -Depth 10))
   Assert-MeshlinkStopped
   $localInstructions = "Meshlink $version 本机运行目录`r`n`r`n此目录保留本机配置。对外分发请使用上一层的 meshlink-无配置.zip。`r`n`r`n双击 start-meshlink.bat，程序自动申请管理员权限。`r`n关闭窗口后组网服务继续运行，已安装的服务随 Windows 自动启动。重新打开会恢复上次模式和保存的连接信息。`r`n控制连接或心跳失败后自动重连，上线后主动发现并连接其他节点。需要停止组网时，请使用停止或断开操作。`r`n服务器：填写公网地址和端口，启动后将同一端口的 TCP、UDP 映射至本机。本机虚拟 IP 为 10.77.0.1。`r`n客户端：输入邀请链接和接入码，点击连接；已有身份自动复用。`r`n升级时保留全部本机运行数据，包括 configs、certs、invites、logs、profiles 和 runtime。`r`n"
   [IO.File]::WriteAllText((Get-MeshlinkDestinationPath -Root $sourceRoot -Relative '使用说明.txt'), $localInstructions, $utf8)
@@ -264,6 +284,17 @@ Meshlink $($metadata.version) — 无配置分发包
   Assert-MeshlinkStopped
   if (Test-Path -LiteralPath $destination) { [IO.File]::Replace($temporary, $destination, [System.Management.Automation.Language.NullString]::Value) }
   else { [IO.File]::Move($temporary, $destination) }
+  $releaseManifest = [ordered]@{
+    schema='meshlink-release-v1'; product='Meshlink'; version=$version
+    mode=$metadata.mode; build_time=$metadata.build_time; generated_at=[datetime]::UtcNow.ToString('o')
+    signing=$metadata.signing
+    package=[ordered]@{ file=('meshlink-' + $version + '.zip'); sha256=(Get-FileHash -LiteralPath $destination -Algorithm SHA256).Hash.ToLowerInvariant(); size=(Get-Item -LiteralPath $destination).Length }
+  }
+  $manifestPath = Get-MeshlinkDestinationPath -Root $releaseRoot -Relative 'manifest.json'
+  # Replace the manifest last: HTTP refuses mismatched pairs during publication.
+  [IO.File]::WriteAllText($temporary, ($releaseManifest | ConvertTo-Json -Depth 10), $utf8)
+  if (Test-Path -LiteralPath $manifestPath) { [IO.File]::Replace($temporary, $manifestPath, [System.Management.Automation.Language.NullString]::Value) }
+  else { [IO.File]::Move($temporary, $manifestPath) }
   $result = [pscustomobject]@{ Archive=$destination; Files=$expectedHashes.Count; Size=(Get-Item -LiteralPath $destination).Length; PreservedDataFiles=$before.Count; BuildTime=$metadata.build_time; StoppedBeforePackaging=$true }
 } catch { $failures.Add($_.Exception.Message) }
 finally {

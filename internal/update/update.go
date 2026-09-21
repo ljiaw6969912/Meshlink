@@ -4,6 +4,7 @@ import (
 	"archive/zip"
 	"context"
 	"crypto/sha256"
+	_ "embed"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
@@ -59,14 +60,19 @@ type CheckResult struct {
 }
 
 type ApplyOptions struct {
-	BaseDir     string
-	PackagePath string
-	Version     string
-	ServiceName string
-	WaitPID     int
+	BaseDir       string
+	PackagePath   string
+	Version       string
+	ServiceName   string
+	WaitPID       int
+	PackageSHA256 string
 }
 
 func Check(ctx context.Context, baseURL, currentVersion string) (CheckResult, error) {
+	return CheckWithClient(ctx, http.DefaultClient, baseURL, currentVersion)
+}
+
+func CheckWithClient(ctx context.Context, client *http.Client, baseURL, currentVersion string) (CheckResult, error) {
 	baseURL, err := NormalizeBaseURL(baseURL)
 	if err != nil {
 		return CheckResult{}, err
@@ -79,7 +85,7 @@ func Check(ctx context.Context, baseURL, currentVersion string) (CheckResult, er
 	if err != nil {
 		return CheckResult{}, err
 	}
-	resp, err := http.DefaultClient.Do(req)
+	resp, err := client.Do(req)
 	if err != nil {
 		return CheckResult{}, err
 	}
@@ -102,6 +108,10 @@ func Check(ctx context.Context, baseURL, currentVersion string) (CheckResult, er
 }
 
 func DownloadPackage(ctx context.Context, baseURL string, manifest Manifest, destDir string) (string, error) {
+	return DownloadPackageWithClient(ctx, http.DefaultClient, baseURL, manifest, destDir)
+}
+
+func DownloadPackageWithClient(ctx context.Context, client *http.Client, baseURL string, manifest Manifest, destDir string) (string, error) {
 	if err := ValidateManifest(manifest); err != nil {
 		return "", err
 	}
@@ -120,7 +130,7 @@ func DownloadPackage(ctx context.Context, baseURL string, manifest Manifest, des
 	if err != nil {
 		return "", err
 	}
-	resp, err := http.DefaultClient.Do(req)
+	resp, err := client.Do(req)
 	if err != nil {
 		return "", err
 	}
@@ -139,7 +149,7 @@ func DownloadPackage(ctx context.Context, baseURL string, manifest Manifest, des
 		return "", err
 	}
 	hasher := sha256.New()
-	written, copyErr := io.Copy(io.MultiWriter(out, hasher), resp.Body)
+	written, copyErr := io.Copy(io.MultiWriter(out, hasher), io.LimitReader(resp.Body, manifest.Package.Size+1))
 	closeErr := out.Close()
 	if copyErr != nil {
 		_ = os.Remove(tmpPath)
@@ -178,6 +188,15 @@ func WriteApplyScript(opts ApplyOptions) (string, error) {
 	if strings.TrimSpace(opts.PackagePath) == "" {
 		return "", errors.New("package path is empty")
 	}
+	var err error
+	opts.BaseDir, err = filepath.Abs(opts.BaseDir)
+	if err != nil {
+		return "", err
+	}
+	opts.PackagePath, err = filepath.Abs(opts.PackagePath)
+	if err != nil {
+		return "", err
+	}
 	if opts.ServiceName == "" {
 		opts.ServiceName = "MeshlinkAgent"
 	}
@@ -186,12 +205,36 @@ func WriteApplyScript(opts ApplyOptions) (string, error) {
 		version = "unknown"
 	}
 	updatesDir := filepath.Join(opts.BaseDir, "updates")
+	if err := rejectLinkedPath(updatesDir); err != nil {
+		return "", err
+	}
 	if err := os.MkdirAll(updatesDir, 0o700); err != nil {
 		return "", err
 	}
-	scriptPath := filepath.Join(updatesDir, "apply-update-"+version+".ps1")
+	scriptPath := filepath.Join(updatesDir, "apply-update.ps1")
+	if err := rejectLinkedPath(scriptPath); err != nil {
+		return "", err
+	}
 	script := applyScript(opts, version)
-	return scriptPath, os.WriteFile(scriptPath, []byte(script), 0o600)
+	return scriptPath, os.WriteFile(scriptPath, []byte("\xef\xbb\xbf"+script), 0o600)
+}
+
+// Reject linked ancestors before writing elevated installer artifacts.
+func rejectLinkedPath(name string) error {
+	for {
+		info, err := os.Lstat(name)
+		if err != nil && !errors.Is(err, os.ErrNotExist) {
+			return err
+		}
+		if err == nil && info.Mode()&os.ModeSymlink != 0 {
+			return fmt.Errorf("linked update path rejected: %s", name)
+		}
+		parent := filepath.Dir(name)
+		if parent == name {
+			return nil
+		}
+		name = parent
+	}
 }
 
 func NormalizeBaseURL(raw string) (string, error) {
@@ -340,254 +383,9 @@ func psQuote(s string) string {
 	return "'" + strings.ReplaceAll(s, "'", "''") + "'"
 }
 
+//go:embed apply.ps1
+var applyScriptTemplate string
+
 func applyScript(opts ApplyOptions, safeVersion string) string {
-	return `$ErrorActionPreference = 'Stop'
-$WaitPid = ` + strconv.Itoa(opts.WaitPID) + `
-$BaseDir = ` + psQuote(opts.BaseDir) + `
-$PackagePath = ` + psQuote(opts.PackagePath) + `
-$Version = ` + psQuote(safeVersion) + `
-$ServiceName = ` + psQuote(opts.ServiceName) + `
-$UpdateDir = Join-Path $BaseDir 'updates'
-$LogPath = Join-Path $UpdateDir ('apply-update-' + $Version + '.log')
-$Stage = Join-Path $UpdateDir ('stage-' + $Version)
-$LastKnownGoodRoot = Join-Path $UpdateDir 'last-known-good'
-$script:BackupReady = $false
-$script:BackupRecords = @()
-$script:ServiceWasRunning = $false
-
-function Resolve-PackageFile([string]$RelativePath) {
-  $Normalized = $RelativePath.Replace('/', '\')
-  if ([System.IO.Path]::IsPathRooted($Normalized) -or $Normalized -match '(^|[\\/])\.\.([\\/]|$)' -or $Normalized -match '^[A-Za-z]:') {
-    throw ('unsafe package manifest path: ' + $RelativePath)
-  }
-  $FullPath = [System.IO.Path]::GetFullPath((Join-Path $PackageRoot $Normalized))
-  $Prefix = $PackageRoot.TrimEnd('\', '/') + [System.IO.Path]::DirectorySeparatorChar
-  if (-not $FullPath.StartsWith($Prefix, [System.StringComparison]::OrdinalIgnoreCase)) {
-    throw ('package manifest path escaped package root: ' + $RelativePath)
-  }
-  return $FullPath
-}
-
-function Backup-Target([string]$RelativePath) {
-  $Target = Join-Path $BaseDir $RelativePath
-  $Existed = Test-Path -LiteralPath $Target -PathType Leaf
-  if ($Existed) {
-    $BackupPath = Join-Path $BackupDir $RelativePath
-    New-Item -ItemType Directory -Force -Path (Split-Path -Parent $BackupPath) | Out-Null
-    Copy-Item -LiteralPath $Target -Destination $BackupPath -Force
-  }
-  $script:BackupRecords += [ordered]@{ path = $RelativePath.Replace('\', '/'); existed = [bool]$Existed }
-}
-
-function Restore-LastKnownGood {
-  if (-not $script:BackupReady) {
-    return
-  }
-  foreach ($Record in $script:BackupRecords) {
-    $RelativePath = ([string]$Record.path).Replace('/', '\')
-    $Target = Join-Path $BaseDir $RelativePath
-    if ([bool]$Record.existed) {
-      $BackupPath = Join-Path $BackupDir $RelativePath
-      New-Item -ItemType Directory -Force -Path (Split-Path -Parent $Target) | Out-Null
-      Copy-Item -LiteralPath $BackupPath -Destination $Target -Force
-    } else {
-      Remove-Item -LiteralPath $Target -Force -ErrorAction SilentlyContinue
-    }
-  }
-}
-
-New-Item -ItemType Directory -Force -Path $UpdateDir | Out-Null
-try { Start-Transcript -Path $LogPath -Append | Out-Null } catch {}
-try {
-  if ($WaitPid -gt 0) {
-    try { Wait-Process -Id $WaitPid -Timeout 60 -ErrorAction SilentlyContinue } catch {}
-  }
-
-  Remove-Item -LiteralPath $Stage -Recurse -Force -ErrorAction SilentlyContinue
-  New-Item -ItemType Directory -Force -Path $Stage | Out-Null
-  Expand-Archive -LiteralPath $PackagePath -DestinationPath $Stage -Force
-
-  $Dirs = @(Get-ChildItem -LiteralPath $Stage -Directory)
-  $RootFiles = @(Get-ChildItem -LiteralPath $Stage -File)
-  if ($Dirs.Count -ne 1 -or $RootFiles.Count -ne 0 -or $Dirs[0].Name -ne 'meshlink') {
-    throw 'update package must contain exactly one meshlink root directory'
-  }
-  $PackageRoot = $Dirs[0].FullName
-
-  $ManifestPath = Join-Path $PackageRoot 'manifest.json'
-  if (-not (Test-Path -LiteralPath $ManifestPath -PathType Leaf)) {
-    throw 'required package manifest.json is missing'
-  }
-  $PackageManifest = Get-Content -Raw -LiteralPath $ManifestPath | ConvertFrom-Json
-  if ($PackageManifest.schema -ne 'meshlink-package-v1') {
-    throw 'unsupported package manifest schema'
-  }
-  if ([string]$PackageManifest.version -ne $Version) {
-    throw 'package manifest version does not match requested version'
-  }
-  $VersionPath = Join-Path $PackageRoot 'VERSION'
-  if (-not (Test-Path -LiteralPath $VersionPath -PathType Leaf) -or (Get-Content -Raw -LiteralPath $VersionPath).Trim() -ne $Version) {
-    throw 'package VERSION does not match requested version'
-  }
-
-  $RequiredFiles = @(
-    'VERSION', 'bin/mesh-agent.exe', 'bin/mesh-cloudhub.exe', 'bin/mesh-desktop.exe',
-    'bin/mesh-update-server.exe', 'bin/meshctl.exe'
-  )
-  foreach ($RelativePath in $RequiredFiles) {
-    if (-not (Test-Path -LiteralPath (Resolve-PackageFile $RelativePath) -PathType Leaf)) {
-      throw ('required update package file is missing: ' + $RelativePath)
-    }
-  }
-
-  $ManifestPaths = @($PackageManifest.files | ForEach-Object { [string]$_.path })
-  [string[]]$SortedPaths = @($ManifestPaths)
-  [System.Array]::Sort($SortedPaths, [System.StringComparer]::Ordinal)
-  if (($ManifestPaths -join [char]10) -cne ($SortedPaths -join [char]10)) {
-    throw 'package manifest file list is not sorted'
-  }
-  $Covered = @{}
-  foreach ($File in @($PackageManifest.files)) {
-    $RelativePath = [string]$File.path
-    $Source = Resolve-PackageFile $RelativePath
-    $Key = $RelativePath.Replace('\', '/').ToLowerInvariant()
-    if ($Covered.ContainsKey($Key)) {
-      throw ('duplicate package manifest file: ' + $RelativePath)
-    }
-    if (-not (Test-Path -LiteralPath $Source -PathType Leaf)) {
-      throw ('package manifest references missing file: ' + $RelativePath)
-    }
-    $Info = Get-Item -LiteralPath $Source
-    $ActualHash = (Get-FileHash -Algorithm SHA256 -LiteralPath $Source).Hash.ToLowerInvariant()
-    if ([int64]$Info.Length -ne [int64]$File.size -or $ActualHash -cne ([string]$File.sha256).ToLowerInvariant()) {
-      throw ('package manifest hash or size mismatch: ' + $RelativePath)
-    }
-    $Covered[$Key] = $true
-  }
-  foreach ($SourceFile in @(Get-ChildItem -LiteralPath $PackageRoot -File -Recurse)) {
-    $RelativePath = $SourceFile.FullName.Substring($PackageRoot.Length + 1).Replace('\', '/')
-    if ($RelativePath -ceq 'manifest.json') {
-      continue
-    }
-    if (-not $Covered.ContainsKey($RelativePath.ToLowerInvariant())) {
-      throw ('package contains file not covered by manifest: ' + $RelativePath)
-    }
-  }
-
-  $PackageMode = [string]$PackageManifest.mode
-  if ($PackageMode -eq 'release') {
-    if (-not [bool]$PackageManifest.signing.code_signed) {
-      throw 'release package is not marked code signed'
-    }
-    $CertificateThumbprint = ([string]$PackageManifest.signing.certificate_thumbprint).Replace(' ', '').ToUpperInvariant()
-    if ($CertificateThumbprint -notmatch '^[0-9A-F]{40}$') {
-      throw 'release package certificate thumbprint is invalid'
-    }
-    foreach ($Executable in @(Get-ChildItem -LiteralPath (Join-Path $PackageRoot 'bin') -File -Filter '*.exe')) {
-      $Signature = Get-AuthenticodeSignature -LiteralPath $Executable.FullName
-      if ($Signature.Status -ne [System.Management.Automation.SignatureStatus]::Valid -or $null -eq $Signature.SignerCertificate) {
-        throw ('Authenticode signature is invalid: ' + $Executable.Name)
-      }
-      $ActualThumbprint = $Signature.SignerCertificate.Thumbprint.Replace(' ', '').ToUpperInvariant()
-      if ($ActualThumbprint -cne $CertificateThumbprint) {
-        throw ('Authenticode signer certificate mismatch: ' + $Executable.Name)
-      }
-    }
-  } elseif ($PackageMode -eq 'development') {
-    if ([bool]$PackageManifest.signing.code_signed -or -not [string]::IsNullOrWhiteSpace([string]$PackageManifest.signing.certificate_thumbprint)) {
-      throw 'development package must be explicitly unsigned'
-    }
-  } else {
-    throw ('unsupported package mode: ' + $PackageMode)
-  }
-
-  $InstalledVersionPath = Join-Path $BaseDir 'VERSION'
-  if (-not (Test-Path -LiteralPath $InstalledVersionPath -PathType Leaf)) {
-    throw 'installed VERSION is missing; cannot establish last-known-good'
-  }
-  $CurrentVersion = (Get-Content -Raw -LiteralPath $InstalledVersionPath).Trim()
-  if ($CurrentVersion -notmatch '^[0-9]+\.[0-9]+\.[0-9]+(?:-[0-9A-Za-z.-]+)?$') {
-    throw 'installed VERSION is invalid; cannot establish last-known-good'
-  }
-
-  $Svc = Get-Service -Name $ServiceName -ErrorAction SilentlyContinue
-  if ($null -ne $Svc -and $Svc.Status -eq 'Running') {
-    $script:ServiceWasRunning = $true
-    Stop-Service -Name $ServiceName -Force -ErrorAction Stop
-    Start-Sleep -Seconds 3
-  }
-
-  New-Item -ItemType Directory -Force -Path $LastKnownGoodRoot | Out-Null
-  $BackupLeaf = $CurrentVersion + '-' + (Get-Date).ToUniversalTime().ToString('yyyyMMddTHHmmssZ')
-  $BackupDir = Join-Path $LastKnownGoodRoot $BackupLeaf
-  New-Item -ItemType Directory -Force -Path $BackupDir | Out-Null
-
-  $ManagedFiles = @(
-    'VERSION', 'bin\mesh-agent.exe', 'bin\mesh-cloudhub.exe', 'bin\mesh-desktop.exe',
-    'bin\mesh-update-server.exe', 'bin\meshctl.exe', 'README.md', 'DEPLOY.zh-CN.md',
-    'THIRD_PARTY_NOTICES.md', 'LICENSE'
-  )
-  $PackageConfigs = Join-Path $PackageRoot 'configs'
-  if (Test-Path -LiteralPath $PackageConfigs -PathType Container) {
-    foreach ($Config in @(Get-ChildItem -LiteralPath $PackageConfigs -File -Filter '*.example.json')) {
-      $ManagedFiles += 'configs\' + $Config.Name
-    }
-  }
-  foreach ($RelativePath in $ManagedFiles) {
-    Backup-Target $RelativePath
-  }
-  $script:BackupReady = $true
-  $BackupDocument = [ordered]@{
-    schema = 'meshlink-last-known-good-v1'
-    current_version = $CurrentVersion
-    attempted_version = $Version
-    created_at = (Get-Date).ToUniversalTime().ToString('o')
-    files = $script:BackupRecords
-  }
-  $BackupDocument | ConvertTo-Json -Depth 6 | Set-Content -LiteralPath (Join-Path $BackupDir 'backup-manifest.json') -Encoding UTF8
-
-  New-Item -ItemType Directory -Force -Path (Join-Path $BaseDir 'bin') | Out-Null
-  foreach ($Name in @('mesh-agent.exe', 'mesh-cloudhub.exe', 'mesh-desktop.exe', 'meshctl.exe', 'mesh-update-server.exe')) {
-    $Src = Join-Path $PackageRoot ('bin\' + $Name)
-    Copy-Item -LiteralPath $Src -Destination (Join-Path $BaseDir ('bin\' + $Name)) -Force
-  }
-
-  foreach ($Name in @('README.md', 'DEPLOY.zh-CN.md', 'THIRD_PARTY_NOTICES.md', 'LICENSE')) {
-    $Src = Join-Path $PackageRoot $Name
-    if (Test-Path -LiteralPath $Src -PathType Leaf) {
-      Copy-Item -LiteralPath $Src -Destination (Join-Path $BaseDir $Name) -Force
-    }
-  }
-
-  if (Test-Path -LiteralPath $PackageConfigs -PathType Container) {
-    New-Item -ItemType Directory -Force -Path (Join-Path $BaseDir 'configs') | Out-Null
-    Get-ChildItem -LiteralPath $PackageConfigs -File -Filter '*.example.json' | ForEach-Object {
-      Copy-Item -LiteralPath $_.FullName -Destination (Join-Path $BaseDir ('configs\' + $_.Name)) -Force
-    }
-  }
-  Copy-Item -LiteralPath $VersionPath -Destination $InstalledVersionPath -Force
-
-  if ($script:ServiceWasRunning) {
-    Start-Service -Name $ServiceName -ErrorAction Stop
-  }
-
-  $Desktop = Join-Path $BaseDir 'bin\mesh-desktop.exe'
-  if (Test-Path -LiteralPath $Desktop -PathType Leaf) {
-    Start-Process -FilePath $Desktop
-  }
-} catch {
-  Write-Host ('update failed: ' + $_.Exception.Message)
-  if ($script:ServiceWasRunning) {
-    try { Stop-Service -Name $ServiceName -Force -ErrorAction SilentlyContinue } catch {}
-  }
-  try { Restore-LastKnownGood } catch { Write-Host ('rollback failed: ' + $_.Exception.Message) }
-  if ($script:ServiceWasRunning) {
-    try { Start-Service -Name $ServiceName -ErrorAction SilentlyContinue } catch {}
-  }
-  exit 1
-} finally {
-  Remove-Item -LiteralPath $Stage -Recurse -Force -ErrorAction SilentlyContinue
-  try { Stop-Transcript | Out-Null } catch {}
-}
-`
+	return strings.NewReplacer("@@WAIT_PID@@", strconv.Itoa(opts.WaitPID), "@@BASE_DIR@@", psQuote(opts.BaseDir), "@@PACKAGE_PATH@@", psQuote(opts.PackagePath), "@@VERSION@@", psQuote(safeVersion), "@@SERVICE_NAME@@", psQuote(opts.ServiceName), "@@PACKAGE_HASH@@", psQuote(opts.PackageSHA256)).Replace(applyScriptTemplate)
 }

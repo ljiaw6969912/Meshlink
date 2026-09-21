@@ -16,6 +16,7 @@ import (
 	"meshlink/internal/onboarding"
 	"meshlink/internal/proto"
 	"meshlink/internal/tlsutil"
+	meshupdate "meshlink/internal/update"
 )
 
 const (
@@ -153,7 +154,23 @@ func (a *Agent) handleHubConn(ctx context.Context, c *coordinator, conn net.Conn
 func (a *Agent) serveEnrollHTTP(conn net.Conn) {
 	listener := newSingleConnListener(conn)
 	manager := onboarding.Manager{BaseDir: a.baseDir}
-	server := &http.Server{Handler: manager.EnrollHTTPHandler(), ReadHeaderTimeout: 5 * time.Second,
+	mux := http.NewServeMux()
+	mux.Handle("/", manager.EnrollHTTPHandler())
+	updates, err := meshupdate.NewServerHandler(meshupdate.ResolveReleaseDirectory(a.baseDir))
+	if err != nil {
+		_ = listener.Close()
+		return
+	}
+	mux.Handle("/updates/", http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		// net/http sees a buffered connection, so use the already verified
+		// TLS state on that connection rather than r.TLS (which is nil).
+		if !hasVerifiedClientCertificate(conn) {
+			http.Error(w, "network certificate required", http.StatusUnauthorized)
+			return
+		}
+		http.StripPrefix("/updates", updates).ServeHTTP(w, r)
+	}))
+	server := &http.Server{Handler: mux, ReadHeaderTimeout: 5 * time.Second,
 		ConnState: func(_ net.Conn, state http.ConnState) {
 			switch state {
 			case http.StateIdle, http.StateClosed, http.StateHijacked:
@@ -161,7 +178,7 @@ func (a *Agent) serveEnrollHTTP(conn net.Conn) {
 			}
 		},
 	}
-	err := server.Serve(listener)
+	err = server.Serve(listener)
 	if err != nil && !errors.Is(err, net.ErrClosed) && !errors.Is(err, http.ErrServerClosed) {
 		a.log.Warn("enrollment HTTP connection failed", "err", err)
 	}

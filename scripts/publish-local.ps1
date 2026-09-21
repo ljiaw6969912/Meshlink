@@ -60,7 +60,7 @@ try {
   $copies = @{}
   foreach ($relative in @(Get-MeshlinkCompiledFiles)) { $copies['bin/' + $relative] = Join-Path $bin $relative.Replace('/', '\') }
   $copies['bin/wintun.dll'] = Join-Path $bin 'wintun.dll'
-  foreach ($relative in @('LICENSE', 'THIRD_PARTY_NOTICES.md', 'VERSION')) { $copies[$relative] = Join-Path $root $relative }
+  foreach ($relative in @('LICENSE', 'THIRD_PARTY_NOTICES.md', 'VERSION', 'scripts/support-triage.ps1')) { $copies[$relative] = Join-Path $root $relative }
   $copyHashes = @{}
   foreach ($relative in $copies.Keys) {
     if (-not (Test-Path -LiteralPath $copies[$relative] -PathType Leaf)) { throw "Required publication file is missing: $relative" }
