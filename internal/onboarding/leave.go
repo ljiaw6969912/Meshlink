@@ -78,6 +78,7 @@ func managedLeaveFiles(baseDir, configPath, serviceName string, cfg *config.Conf
 		resolveConfigPath(configDir, cfg.CertFile),
 		resolveConfigPath(configDir, cfg.CAFile),
 		configPath,
+		filepath.Join(configDir, "join-state.json"),
 	}
 	files := make([]leaveFile, len(paths))
 	for i, path := range paths {
@@ -90,6 +91,9 @@ func managedLeaveFiles(baseDir, configPath, serviceName string, cfg *config.Conf
 			staged:   filepath.Join(transactionDir, fmt.Sprintf("%02d", i)),
 		}
 	}
+	// Keep the existing "04" commit marker compatible with older versions,
+	// but stage the new invitation record before committing the identity.
+	files[4], files[5] = files[5], files[4]
 	return files, nil
 }
 
@@ -116,10 +120,12 @@ func recoverLeaveTransaction(baseDir, configPath, serviceName, transactionDir st
 }
 
 func stagedLeaveFiles(transactionDir string) []leaveFile {
-	files := make([]leaveFile, 5)
+	files := make([]leaveFile, 6)
 	for i := range files {
 		files[i].staged = filepath.Join(transactionDir, fmt.Sprintf("%02d", i))
 	}
+	// Delete the commit marker last so any interrupted purge is recoverable.
+	files[4], files[5] = files[5], files[4]
 	return files
 }
 

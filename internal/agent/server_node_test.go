@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"errors"
+	"fmt"
 	"net"
 	"net/netip"
 	"os"
@@ -56,6 +57,15 @@ func resolveAgentTestPaths(cfg *config.Config, path string) {
 }
 
 func TestServerHostSharesCoordinatorPortAndTransfersPeerPackets(t *testing.T) {
+	for _, role := range []string{"dialer", "acceptor"} {
+		t.Run("server_"+role, func(t *testing.T) {
+			testServerHostSharesCoordinatorPortAndTransfersPeerPackets(t, role)
+		})
+	}
+}
+
+func testServerHostSharesCoordinatorPortAndTransfersPeerPackets(t *testing.T, role string) {
+	t.Helper()
 	m, cfg, started := serverNodeConfigForTest(t)
 	dev := &runtimeDevice{incoming: make(chan []byte, 32), written: make(chan []byte, 32)}
 	hub, err := New(cfg, discardLogger(), WithBaseDir(m.BaseDir), WithDevice(dev))
@@ -88,17 +98,24 @@ func TestServerHostSharesCoordinatorPortAndTransfersPeerPackets(t *testing.T) {
 		t.Fatal("host has an unmapped ephemeral UDP port")
 	}
 	clientDir := t.TempDir()
-	csr, err := certutil.CreateCSR(certutil.CSROptions{OutDir: clientDir, Name: "remote-B"})
+	peerName := strings.TrimSuffix(hub.serverNode.cfg.NodeID, "-node") + "-remote"
+	if role == "acceptor" {
+		peerName = strings.TrimSuffix(hub.serverNode.cfg.NodeID, "-node") + "-client"
+	}
+	if (hub.serverNode.cfg.NodeID < peerName) != (role == "dialer") {
+		t.Fatalf("test identities do not select server role %s", role)
+	}
+	csr, err := certutil.CreateCSR(certutil.CSROptions{OutDir: clientDir, Name: peerName})
 	if err != nil {
 		t.Fatal(err)
 	}
-	enrolled, err := m.HandleEnroll(onboarding.EnrollRequest{Token: started.Invite.Token, Code: started.Invite.Code, NodeName: "remote-B", CSRPEM: csr.CSRPEM})
+	enrolled, err := m.HandleEnroll(onboarding.EnrollRequest{Token: started.Invite.Token, Code: started.Invite.Code, NodeName: peerName, CSRPEM: csr.CSRPEM})
 	if err != nil {
 		t.Fatal(err)
 	}
 	peerCfg := enrolled.Config
 	peerCfg.CAFile = filepath.Join(clientDir, "ca.pem")
-	peerCfg.CertFile = filepath.Join(clientDir, "remote-B.pem")
+	peerCfg.CertFile = filepath.Join(clientDir, peerName+".pem")
 	peerCfg.KeyFile = csr.KeyPath
 	peerCfg.Setup.Enabled = false
 	peerCfg.Device.Type = "null"
@@ -126,6 +143,12 @@ func TestServerHostSharesCoordinatorPortAndTransfersPeerPackets(t *testing.T) {
 	}()
 	integrationEventually(t, 5*time.Second, func() (bool, string) {
 		return len(peer.status.snapshot().Peers) > 0 && hub.status.snapshot().CoordinatorMetrics.ProbeSuccesses > 0, "peer admission/probe not ready"
+	})
+	integrationEventually(t, 5*time.Second, func() (bool, string) {
+		remote := findAgentPeerStatus(peer.status.snapshot(), hub.serverNode.cfg.NodeID)
+		local := findAgentPeerStatus(hub.serverNode.status.snapshot(), peer.cfg.NodeID)
+		return remote != nil && local != nil && remote.Status == "online" && local.Status == "online",
+			fmt.Sprintf("server/client did not establish direct sessions before traffic: remote=%+v local=%+v", remote, local)
 	})
 	toHost := append([]byte(nil), literalBToC...)
 	toHost[19] = 1

@@ -96,11 +96,12 @@ type controlPlaneRecorder struct {
 	udp        *net.UDPConn
 	addr       string
 
-	closed    chan struct{}
-	closeOnce sync.Once
-	wg        sync.WaitGroup
-	nextID    atomic.Uint64
-	dropped   atomic.Uint64
+	closed     chan struct{}
+	closeOnce  sync.Once
+	wg         sync.WaitGroup
+	nextID     atomic.Uint64
+	dropped    atomic.Uint64
+	dropProbes atomic.Bool
 
 	mu       sync.Mutex
 	frames   []recordedNetworkFrame
@@ -279,6 +280,9 @@ func (r *controlPlaneRecorder) forwardUDP() {
 		}
 		payload := append([]byte(nil), buffer[:n]...)
 		r.record("udp", "to_coordinator", 0, payload)
+		if r.dropProbes.Load() {
+			continue
+		}
 		mapping, err := r.mapping(client)
 		if err != nil {
 			continue
@@ -1039,74 +1043,101 @@ func assertNoRelayRuntime(t *testing.T, h *pureP2PHarness) {
 	}
 }
 
-func TestTwentyIdlePeersDoNotCreatePairSessions(t *testing.T) {
+func TestLANPeersEstablishEveryPairWhenCoordinatorUDPIsUnavailable(t *testing.T) {
+	peerIDs := []string{"lan-01", "lan-02", "lan-03", "lan-04", "lan-05", "lan-06", "lan-07", "lan-08"}
+	h := newPureP2PHarnessWithPeers(t, peerIDs)
+	h.recorder.dropProbes.Store(true)
+	h.startPeers(peerIDs...)
+	integrationEventually(t, integrationWait, func() (bool, string) {
+		direct := 0
+		for _, id := range peerIDs {
+			for _, other := range peerIDs {
+				if id == other {
+					continue
+				}
+				snapshot, ok := h.peers[id].runtime.sessions.Snapshot(other)
+				if ok && isDirectSnapshot(snapshot) {
+					direct++
+				}
+			}
+		}
+		return direct == 56, fmt.Sprintf("direct=%d/56 coordinator=%+v", direct, h.currentA.status.snapshot().CoordinatorMetrics)
+	})
+	for _, peer := range h.peers {
+		if packets := peer.device.drain(); len(packets) != 0 {
+			t.Fatalf("idle peer %s received business packets", peer.id)
+		}
+	}
+	if packets := h.ledger.snapshot(); len(packets) != 0 {
+		t.Fatalf("LAN connection required %d business packets", len(packets))
+	}
+	if metrics := h.currentA.status.snapshot().CoordinatorMetrics; metrics.ProbeSuccesses != 0 || metrics.NegotiationsTimedOut != 0 {
+		t.Fatalf("LAN sessions relied on coordinator UDP or exceeded phase deadlines: %+v", metrics)
+	}
+	assertNoCoordinatorDataMetrics(t, h.allA)
+	assertNoRelayRuntime(t, h)
+}
+
+func TestTwentyIdlePeersEstablishEveryDirectPairWithoutTraffic(t *testing.T) {
 	const peerCount = 20
 	peerIDs := make([]string, peerCount)
 	for index := range peerIDs {
 		peerIDs[index] = fmt.Sprintf("idle-%02d", index+1)
 	}
-
 	h := newPureP2PHarnessWithPeers(t, peerIDs)
 	h.startPeers(peerIDs...)
-	integrationEventually(t, integrationWait, func() (bool, string) {
-		metrics := h.currentA.status.snapshot().CoordinatorMetrics
-		ready := metrics.ActiveControlConnections == peerCount &&
-			metrics.ControlConnections == peerCount &&
-			metrics.ProbeSuccesses >= peerCount &&
-			metrics.CandidateRefreshes >= 2*peerCount
-		return ready, fmt.Sprintf("coordinator metrics=%+v", metrics)
+	integrationEventually(t, 20*time.Second, func() (bool, string) {
+		for _, id := range peerIDs {
+			peer := h.peers[id]
+			for _, other := range peerIDs {
+				if id == other {
+					continue
+				}
+				snapshot, ok := peer.runtime.sessions.Snapshot(other)
+				if !ok || !isDirectSnapshot(snapshot) {
+					return false, fmt.Sprintf("idle pair %s/%s is not direct: %+v; metrics=%+v", id, other, snapshot, h.currentA.status.snapshot().CoordinatorMetrics)
+				}
+			}
+		}
+		return true, ""
 	})
-
-	before := h.currentA.status.snapshot().CoordinatorMetrics
-	if before.ProbeFailures != 0 {
-		t.Fatalf("idle peer startup produced failed probes before the renewal boundary: %+v", before)
-	}
-	beforeFrames := len(h.recorder.snapshot())
-	probeCredentials := make(map[string]proto.ProbeCredential)
-	captureProbeCredentials(h.peers, probeCredentials)
-	const idleControlCycles = 3
-	observationStarted := time.Now()
-	integrationEventually(t, idleControlCycles*peerHeartbeatInterval+15*time.Second, func() (bool, string) {
-		captureProbeCredentials(h.peers, probeCredentials)
-		metrics := h.currentA.status.snapshot().CoordinatorMetrics
-		frames := len(h.recorder.snapshot())
-		probeOutcomes := (metrics.ProbeSuccesses - before.ProbeSuccesses) + (metrics.ProbeFailures - before.ProbeFailures)
-		refreshed := metrics.CandidateRefreshes >= before.CandidateRefreshes+idleControlCycles*peerCount &&
-			probeOutcomes >= idleControlCycles*peerCount
-		observedLongEnough := time.Since(observationStarted) >= idleControlCycles*peerHeartbeatInterval
-		return observedLongEnough && refreshed && metrics.ActiveControlConnections == peerCount && frames > beforeFrames,
-			fmt.Sprintf("elapsed=%v before=%+v after=%+v frames=%d->%d", time.Since(observationStarted), before, metrics, beforeFrames, frames)
-	})
-
-	metrics := h.currentA.status.snapshot().CoordinatorMetrics
-	if metrics.ControlReconnects != 0 || metrics.ProbeFailures > peerCount || metrics.NegotiationsRequested != 0 ||
-		metrics.NegotiationsPrepared != 0 || metrics.NegotiationsOffered != 0 ||
-		metrics.NegotiationsStarted != 0 || metrics.NegotiationsSucceeded != 0 ||
-		metrics.NegotiationsAborted != 0 || metrics.NegotiationsTimedOut != 0 ||
-		metrics.TypePacketViolations != 0 {
-		t.Fatalf("idle peers produced session or invalid control activity: %+v", metrics)
-	}
-
+	metricsBefore := h.currentA.status.snapshot().CoordinatorMetrics
+	before := make(map[string]proto.ActiveSessions)
 	for _, id := range peerIDs {
 		peer := h.peers[id]
-		if active := peer.runtime.sessions.ActiveSessions().Sessions; len(active) != 0 {
-			t.Fatalf("idle peer %s reported active sessions: %+v", id, active)
+		before[id] = peer.runtime.sessions.ActiveSessions()
+		if len(before[id].Sessions) != peerCount-1 {
+			t.Fatalf("idle peer %s has %d active peers", id, len(before[id].Sessions))
 		}
-		for _, otherID := range peerIDs {
-			if otherID == id {
-				continue
+		// Periodic coordinator contact must not replace healthy pair sessions.
+		if err := peer.runtime.control.refresh(context.Background(), false); err != nil {
+			t.Fatal(err)
+		}
+		peer.runtime.connectOnlineMembers()
+		// A second refresh is an ordered control barrier after any request.
+		if err := peer.runtime.control.refresh(context.Background(), false); err != nil {
+			t.Fatal(err)
+		}
+	}
+	integrationEventually(t, time.Second, func() (bool, string) {
+		metrics := h.currentA.status.snapshot().CoordinatorMetrics
+		return metrics.CandidateRefreshes >= metricsBefore.CandidateRefreshes+2*peerCount,
+			fmt.Sprintf("coordinator has not processed all refreshes: %+v", metrics)
+	})
+	if metrics := h.currentA.status.snapshot().CoordinatorMetrics; metrics.NegotiationsRequested != metricsBefore.NegotiationsRequested {
+		t.Fatalf("refresh requested replacement sessions for healthy pairs: before=%+v after=%+v", metricsBefore, metrics)
+	}
+	for _, id := range peerIDs {
+		peer := h.peers[id]
+		active := peer.runtime.sessions.ActiveSessions().Sessions
+		for index, original := range before[id].Sessions {
+			if len(active) != peerCount-1 || active[index] != original {
+				t.Fatalf("membership refresh changed healthy pair for %s: before=%+v after=%+v", id, before[id], active)
 			}
-			if snapshot, ok := peer.runtime.sessions.Snapshot(otherID); ok {
-				t.Fatalf("idle pair %s/%s created session state: %+v", id, otherID, snapshot)
-			}
 		}
-		status := peer.agent.status.snapshot()
-		if len(status.Peers) != peerCount-1 {
-			t.Fatalf("idle peer %s learned %d members, want %d", id, len(status.Peers), peerCount-1)
-		}
-		for _, member := range status.Peers {
-			if member.Session != nil || member.PathType != "" || member.PathState != p2p.PathStateIdle {
-				t.Fatalf("idle peer %s projected %s as a session: %+v", id, member.NodeID, member)
+		for _, member := range peer.agent.status.snapshot().Peers {
+			if member.Status != "online" || member.Session == nil || member.PathType == "" {
+				t.Fatalf("idle peer %s did not display %s online: %+v", id, member.NodeID, member)
 			}
 		}
 		if packets := peer.device.drain(); len(packets) != 0 {
@@ -1116,23 +1147,18 @@ func TestTwentyIdlePeersDoNotCreatePairSessions(t *testing.T) {
 	if packets := h.ledger.snapshot(); len(packets) != 0 {
 		t.Fatalf("idle peer run injected %d business packets", len(packets))
 	}
-	if dropped := h.recorder.dropped.Load(); dropped != 0 {
-		t.Fatalf("idle peers sent %d non-coordinator UDP datagrams to recorded mappings", dropped)
-	}
+	credentials := make(map[string]proto.ProbeCredential)
+	captureProbeCredentials(h.peers, credentials)
 	integrationEventually(t, time.Second, func() (bool, string) {
-		captureProbeCredentials(h.peers, probeCredentials)
-		metrics = h.currentA.status.snapshot().CoordinatorMetrics
-		requests, responses, unmatched, err := authenticatedProbeExchangeCount(h.recorder.snapshot(), probeCredentials)
-		matched := err == nil && uint64(responses) == metrics.ProbeSuccesses &&
-			uint64(unmatched) == metrics.ProbeFailures && uint64(requests) == metrics.ProbeSuccesses+metrics.ProbeFailures
-		return matched, fmt.Sprintf("requests=%d responses=%d unmatched=%d metrics=%+v err=%v", requests, responses, unmatched, metrics, err)
+		metrics := h.currentA.status.snapshot().CoordinatorMetrics
+		requests, responses, unmatched, err := authenticatedProbeExchangeCount(h.recorder.snapshot(), credentials)
+		return err == nil && uint64(responses) == metrics.ProbeSuccesses && uint64(unmatched) == metrics.ProbeFailures && uint64(requests) == metrics.ProbeSuccesses+metrics.ProbeFailures,
+			fmt.Sprintf("authenticated probe requests=%d responses=%d unmatched=%d metrics=%+v error=%v", requests, responses, unmatched, metrics, err)
 	})
-
 	assertNoCoordinatorDataMetrics(t, h.allA)
 	h.recorder.assertNoUserData(t, nil)
 	assertNoRelayRuntime(t, h)
 }
-
 func TestPureP2PDataPlaneFaultMatrix(t *testing.T) {
 	h := newPureP2PHarness(t)
 	h.startPeers("B", "C", "D", "E")
@@ -1200,8 +1226,10 @@ func TestPureP2PDataPlaneFaultMatrix(t *testing.T) {
 		if err := entry.manager.StartOffer(entry.start); !errors.Is(err, p2p.ErrSessionOfferRejected) {
 			t.Fatalf("consumed authorization was reusable: %v", err)
 		}
-		if active := entry.manager.ActiveSessions().Sessions; len(active) != 0 {
-			t.Fatalf("failed B/C retained an active authorization: %+v", active)
+		for _, active := range entry.manager.ActiveSessions().Sessions {
+			if active.SessionID == entry.start.SessionID {
+				t.Fatalf("failed B/C retained an active authorization: %+v", active)
+			}
 		}
 	}
 	waitingPacket := sequenceIPv4Packet(2, 3, 0xfeed)

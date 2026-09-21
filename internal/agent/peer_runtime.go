@@ -124,6 +124,7 @@ func newPeerRuntime(a *Agent) (*peerRuntime, error) {
 		NodeID: a.cfg.NodeID, NetworkID: networkID, MTU: a.cfg.MTU, Candidates: service, TLSConfig: quicTLS.Clone(), LocalVirtualIP: localIP, LocalRoutes: a.routes,
 		PeerMember: r.member, RequestSession: r.requestSession, DeliverPacket: r.deliverPacket, SessionChanged: r.sessionChanged,
 		HeartbeatInterval: timings.heartbeatInterval, HeartbeatTimeout: timings.heartbeatTimeout, DialTimeout: timings.dialTimeout,
+		Logger: a.log,
 	})
 	if err != nil {
 		service.Close()
@@ -198,7 +199,28 @@ func (r *peerRuntime) applyMembership(snapshot proto.MemberSnapshot, removed []s
 		}
 		_ = r.sessions.ClosePeer(id, code)
 	}
+	r.connectOnlineMembers()
 	return nil
+}
+
+// Presence authorizes an attempt, never a direct status. The session manager
+// reports online only after the authenticated peer handshake has completed.
+func (r *peerRuntime) connectOnlineMembers() {
+	if r.closed.Load() || !r.control.Available() {
+		return
+	}
+	r.mu.RLock()
+	var peers []string
+	for id, member := range r.members {
+		if id != r.a.cfg.NodeID && !r.revoked[id] && member.Status == "online" {
+			peers = append(peers, id)
+		}
+	}
+	r.mu.RUnlock()
+	slices.Sort(peers)
+	for _, id := range peers {
+		_ = r.sessions.EnsureSession(id)
+	}
 }
 
 func (r *peerRuntime) publishMembership(snapshot proto.MemberSnapshot, removed []string, presence bool) ([]string, error) {

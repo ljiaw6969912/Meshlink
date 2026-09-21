@@ -11,6 +11,7 @@ import (
 	"encoding/hex"
 	"errors"
 	"fmt"
+	"log/slog"
 	"net"
 	"net/netip"
 	"sort"
@@ -65,6 +66,7 @@ type SessionManagerConfig struct {
 	HeartbeatTimeout  time.Duration
 	DialTimeout       time.Duration
 	Now               func() time.Time
+	Logger            *slog.Logger
 }
 
 type SessionManager struct {
@@ -84,6 +86,7 @@ type SessionManager struct {
 	heartbeatTimeout     time.Duration
 	dialTimeout          time.Duration
 	now                  func() time.Time
+	logger               *slog.Logger
 	reassembler          *Reassembler
 	ctx                  context.Context
 	cancel               context.CancelFunc
@@ -255,6 +258,7 @@ func NewSessionManager(cfg SessionManagerConfig) (*SessionManager, error) {
 		heartbeatTimeout:     heartbeatTimeout,
 		dialTimeout:          dialTimeout,
 		now:                  now,
+		logger:               cfg.Logger,
 		reassembler:          NewReassembler(cfg.MTU),
 		ctx:                  ctx,
 		cancel:               cancel,
@@ -463,6 +467,45 @@ func (m *SessionManager) AbortOffer(abort proto.SessionAbort) error {
 	m.emit(snapshot)
 	if request {
 		m.invokeRequest(pair.peerID)
+	}
+	return nil
+}
+
+// EnsureSession starts negotiation without needing a queued user packet. The
+// pair's live transport, offer and request state coalesce repeated membership
+// notifications with each other and with traffic-triggered requests.
+func (m *SessionManager) EnsureSession(peerID string) error {
+	peerID = strings.TrimSpace(peerID)
+	if peerID == "" || peerID == m.nodeID {
+		return errors.New("session peer ID is invalid")
+	}
+	if _, ok := m.peerMember(peerID); !ok {
+		return fmt.Errorf("%w: peer %q is not authorized by the current member snapshot", ErrSessionNotReady, peerID)
+	}
+	m.mu.Lock()
+	if m.closed {
+		m.mu.Unlock()
+		return ErrSessionManagerClosed
+	}
+	pair := m.ensurePairLocked(peerID)
+	if pair.closed || pair.active != nil || pair.attempt != nil || pair.requestInFlight {
+		m.mu.Unlock()
+		return nil
+	}
+	request := false
+	if !m.coordinatorAvailable {
+		pair.snapshot.State = PathStateWaitingCoordinator
+		pair.snapshot.ErrorCode = "control_unavailable"
+	} else {
+		pair.snapshot.State = PathStateRequesting
+		pair.snapshot.ErrorCode = ""
+		request = m.beginRequestLocked(pair)
+	}
+	snapshot := m.snapshotLocked(pair)
+	m.mu.Unlock()
+	m.emit(snapshot)
+	if request {
+		m.invokeRequest(peerID)
 	}
 	return nil
 }
@@ -824,6 +867,7 @@ func (m *SessionManager) handleIncoming(conn *quic.Conn) {
 		return
 	}
 	if err := m.validateQUICConnection(conn, attempt, true); err != nil {
+		m.logHandshakeFailure(peerID, "incoming identity", conn.RemoteAddr(), err)
 		_ = conn.CloseWithError(sessionApplicationError, "peer identity rejected")
 		m.failAttempt(peerID, attempt, sessionFailureCode(err))
 		return
@@ -839,10 +883,12 @@ func (m *SessionManager) handleIncoming(conn *quic.Conn) {
 	pathType, ok := m.pathForRemote(attempt.offer.Candidates, conn.RemoteAddr())
 	if !ok {
 		_ = conn.CloseWithError(sessionApplicationError, "remote candidate rejected")
+		m.logHandshakeFailure(peerID, "incoming endpoint", conn.RemoteAddr(), errors.New("remote endpoint does not match an offered candidate"))
 		m.failAttempt(peerID, attempt, "candidate_unavailable")
 		return
 	}
 	if err := m.authenticateConnection(peerID, attempt, conn, false, pathType); err != nil {
+		m.logHandshakeFailure(peerID, "incoming authorization", conn.RemoteAddr(), err)
 		_ = conn.CloseWithError(sessionApplicationError, "session authorization failed")
 		m.failAttempt(peerID, attempt, sessionFailureCode(err))
 	}
@@ -863,6 +909,7 @@ func (m *SessionManager) runOffer(peerID string, attempt *sessionAttempt) {
 	m.finishPunch(attempt, err)
 	if err != nil {
 		m.failAttempt(peerID, attempt, "hole_punch_timeout")
+		m.logHandshakeFailure(peerID, "punch", nil, err)
 		return
 	}
 	if m.nodeID != attempt.offer.DialerNodeID {
@@ -969,7 +1016,15 @@ func (m *SessionManager) dialOffer(peerID string, attempt *sessionAttempt) {
 	if lastErr == nil {
 		lastErr = errors.New("no live peer candidate")
 	}
+	m.logHandshakeFailure(peerID, "outgoing handshake", nil, lastErr)
 	m.failAttempt(peerID, attempt, "quic_handshake_failed")
+}
+
+func (m *SessionManager) logHandshakeFailure(peerID, stage string, remote net.Addr, err error) {
+	if m.logger != nil && !errors.Is(err, context.Canceled) {
+		// Never log offers, pairing keys, credentials or packet contents.
+		m.logger.Warn("direct handshake failed", "peer", peerID, "stage", stage, "remote", remote, "err", err)
+	}
 }
 
 func (m *SessionManager) authenticateConnection(peerID string, attempt *sessionAttempt, conn *quic.Conn, outgoing bool, pathType PathType) error {

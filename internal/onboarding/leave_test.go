@@ -108,7 +108,7 @@ func TestLeaveNetworkRollsBackEveryStagingFailure(t *testing.T) {
 	originalRename := leaveRename
 	t.Cleanup(func() { leaveRename = originalRename })
 
-	for failAt := 1; failAt <= 5; failAt++ {
+	for failAt := 1; failAt <= 6; failAt++ {
 		t.Run(string(rune('0'+failAt)), func(t *testing.T) {
 			dir := t.TempDir()
 			writeManagedSpokeFixture(t, dir, "desk")
@@ -140,7 +140,7 @@ func TestLeaveNetworkRecoversEveryCommittedRemovalFailure(t *testing.T) {
 	originalRemove := leaveRemove
 	t.Cleanup(func() { leaveRemove = originalRemove })
 
-	for failAt := 1; failAt <= 5; failAt++ {
+	for failAt := 1; failAt <= 6; failAt++ {
 		t.Run(string(rune('0'+failAt)), func(t *testing.T) {
 			dir := t.TempDir()
 			writeManagedSpokeFixture(t, dir, "desk")
@@ -177,7 +177,7 @@ func TestLeaveNetworkRecoversEveryCommittedRemovalFailure(t *testing.T) {
 }
 
 func TestLeaveNetworkRecoversPreCommitTransactionThenCompletesLeave(t *testing.T) {
-	for stagedCount := 0; stagedCount <= 4; stagedCount++ {
+	for stagedCount := 0; stagedCount <= 5; stagedCount++ {
 		t.Run(string(rune('0'+stagedCount)), func(t *testing.T) {
 			dir := t.TempDir()
 			writeManagedSpokeFixture(t, dir, "desk")
@@ -225,6 +225,7 @@ func managedSpokePaths(dir, nodeID string) []string {
 		filepath.Join(dir, "certs", "ca.pem"),
 		filepath.Join(dir, "certs", nodeID+".pem"),
 		filepath.Join(dir, "certs", nodeID+"-key.pem"),
+		filepath.Join(dir, "configs", "join-state.json"),
 	}
 }
 
@@ -235,9 +236,10 @@ func stageInterruptedLeaveTransaction(t *testing.T, dir, nodeID string, stagedCo
 		t.Fatal(err)
 	}
 	paths := managedSpokePaths(dir, nodeID)
-	ordered := []string{paths[1], paths[4], paths[3], paths[2], paths[0]}
+	ordered := []string{paths[1], paths[4], paths[3], paths[2], paths[5], paths[0]}
+	stageNumbers := []int{0, 1, 2, 3, 5, 4}
 	for i := 0; i < stagedCount; i++ {
-		if err := os.Rename(ordered[i], filepath.Join(transactionDir, fmt.Sprintf("%02d", i))); err != nil {
+		if err := os.Rename(ordered[i], filepath.Join(transactionDir, fmt.Sprintf("%02d", stageNumbers[i]))); err != nil {
 			t.Fatal(err)
 		}
 	}
@@ -252,6 +254,7 @@ func writeManagedSpokeFixture(t *testing.T, dir, nodeID string) {
 		filepath.Join(dir, "certs", nodeID+"-key.pem"):                     "key",
 		filepath.Join(dir, "configs", "logs", "MeshlinkAgent.status.json"): `{"state":"running"}`,
 		filepath.Join(dir, "logs", "audit.jsonl"):                          "keep\n",
+		filepath.Join(dir, "configs", "join-state.json"):                   `{"invite_link":"test","code":"123456"}`,
 	} {
 		if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
 			t.Fatal(err)

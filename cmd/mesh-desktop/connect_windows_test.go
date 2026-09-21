@@ -11,12 +11,14 @@ import (
 	"net"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strconv"
 	"strings"
 	"testing"
 	"time"
 
 	"golang.org/x/sys/windows"
+	"golang.org/x/sys/windows/svc/mgr"
 	"meshlink/internal/config"
 	"meshlink/internal/onboarding"
 	"meshlink/internal/runner"
@@ -68,6 +70,7 @@ func TestWindowsServerHostConnect(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	assertPersistentDesktopService(t, serviceName)
 	statusPath := runner.StatusPath(started.ConfigPath, serviceName) + ".server-node.json"
 	status, err := readRuntimeStatusFile(statusPath)
 	if err != nil || status.Self.VirtualIP != "10.77.0.1" || status.CoordinatorState != "connected" {
@@ -172,6 +175,7 @@ func TestWindowsCleanClientConnect(t *testing.T) {
 		if err != nil {
 			t.Fatalf("fresh client %d failed: %v", i+1, err)
 		}
+		assertPersistentDesktopService(t, serviceName)
 		cfg, err := config.Load(result.ConfigPath)
 		if err != nil {
 			t.Fatal(err)
@@ -210,6 +214,45 @@ func TestWindowsCleanClientConnect(t *testing.T) {
 	}
 	if strings.Count(string(registryBytes), `"node_id"`) != 2 {
 		t.Fatalf("reconnect created duplicate registration: %s", registryBytes)
+	}
+}
+
+// Exercise the actual window lifecycle while a real SCM/Wintun service is
+// running, and inspect Windows boot/recovery configuration independently.
+func assertPersistentDesktopService(t *testing.T, name string) {
+	t.Helper()
+	manager, err := mgr.Connect()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer manager.Disconnect()
+	service, err := manager.OpenService(name)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer service.Close()
+	cfg, err := service.Config()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.StartType != mgr.StartAutomatic || cfg.ServiceStartName != "LocalSystem" {
+		t.Fatalf("service will not resume independently at boot: %+v", cfg)
+	}
+	actions, err := service.RecoveryActions()
+	if err != nil || len(actions) == 0 || actions[0].Type != mgr.ServiceRestart {
+		t.Fatalf("service crash recovery missing: %+v %v", actions, err)
+	}
+	runtime.LockOSThread()
+	defer runtime.UnlockOSThread()
+	window := &desktopApp{}
+	if err := window.createWindow(); err != nil {
+		t.Fatal(err)
+	}
+	window.mw.Close()
+	window.mw.Dispose()
+	status, err := winservice.Status(name)
+	if err != nil || status.State != "running" {
+		t.Fatalf("closing window stopped service: %+v %v", status, err)
 	}
 }
 

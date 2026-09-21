@@ -9,6 +9,8 @@ logs/
 # Runtime state generated on each machine.
 configs/active.json
 configs/desktop-state.json
+configs/join-state.json
+profiles/
 configs/devices.json
 configs/logs/
 invites/

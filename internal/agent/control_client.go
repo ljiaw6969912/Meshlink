@@ -23,27 +23,31 @@ import (
 // ControlClient owns only the current control socket. Its teardown never owns
 // the candidate UDP socket, TUN reader or a peer session context.
 type ControlClient struct {
-	runtime         *peerRuntime
-	tlsConfig       *tls.Config
-	mu              sync.Mutex
-	conn            net.Conn
-	socketMu        sync.Mutex
-	socket          net.Conn
-	available       bool
-	results         map[string]uint64
-	resultOrder     []string
-	memberRevision  uint64
-	refreshMu       sync.Mutex
-	credential      proto.ProbeCredential
-	revision        uint64
-	requestSequence uint64
-	requests        map[string]string
-	prepares        map[string]proto.ConnectPrepare
-	requestPeers    map[string]*list.Element
-	requestOrder    list.List
+	runtime          *peerRuntime
+	tlsConfig        *tls.Config
+	mu               sync.Mutex
+	conn             net.Conn
+	socketMu         sync.Mutex
+	socket           net.Conn
+	available        bool
+	results          map[string]uint64
+	resultOrder      []string
+	memberRevision   uint64
+	refreshMu        sync.Mutex
+	credential       proto.ProbeCredential
+	revision         uint64
+	lastProbeRefresh time.Time
+	requestSequence  uint64
+	requests         map[string]string
+	prepares         map[string]proto.ConnectPrepare
+	requestPeers     map[string]*list.Element
+	requestOrder     list.List
 }
 
-const maxControlRequests = 256
+const (
+	maxControlRequests           = 256
+	peerCandidateRefreshInterval = 30 * time.Second
+)
 
 // Correlations, not sessions, use a bounded FIFO. Eviction ignores late errors;
 // SessionManager retains its queue and owns subsequent retries. Both indexes
@@ -158,7 +162,10 @@ func (c *ControlClient) connect(ctx context.Context) error {
 		return err
 	}
 	conn := tls.Client(raw, c.tlsConfig)
-	if err := conn.HandshakeContext(ctx); err != nil {
+	handshakeCtx, cancelHandshake := context.WithTimeout(ctx, 10*time.Second)
+	err = conn.HandshakeContext(handshakeCtx)
+	cancelHandshake()
+	if err != nil {
 		raw.Close()
 		return err
 	}
@@ -182,6 +189,7 @@ func (c *ControlClient) serve(parent context.Context, conn net.Conn) error {
 	c.credential = proto.ProbeCredential{}
 	c.memberRevision = 0
 	c.revision = snapshot.Revision
+	c.lastProbeRefresh = time.Time{}
 	c.refreshMu.Unlock()
 	a := c.runtime.a
 	hello := proto.ClientHello{ProtocolVersion: 2, Role: "peer", NodeID: a.cfg.NodeID, VirtualIP: a.cfg.VirtualIP, Routes: a.hello.Routes, MTU: a.cfg.MTU, Capabilities: []string{"quic_udp_v1"}}
@@ -210,7 +218,9 @@ func (c *ControlClient) serve(parent context.Context, conn net.Conn) error {
 		if ctx.Err() != nil {
 			return ctx.Err()
 		}
-		return permanentControlError("missing_server_hello")
+		// Transport failures before admission are retryable. The frame reader
+		// already marks explicit malformed/protocol input as permanent.
+		return err
 	}
 	if first.Type != proto.TypeControl {
 		return permanentControlError("control_upgrade_required")
@@ -255,14 +265,16 @@ func (c *ControlClient) serve(parent context.Context, conn net.Conn) error {
 	workers.Add(1)
 	go func() {
 		defer workers.Done()
-		ticker := time.NewTicker(30 * time.Second)
+		ticker := time.NewTicker(peerCandidateRefreshInterval)
 		defer ticker.Stop()
 		for {
 			select {
 			case <-ctx.Done():
 				return
 			case <-ticker.C:
-				_ = c.refresh(ctx, false)
+				if c.refresh(ctx, false) == nil {
+					c.runtime.connectOnlineMembers()
+				}
 			}
 		}
 	}()
@@ -343,6 +355,12 @@ func (c *ControlClient) refreshLocked(ctx context.Context, lanOnly bool) error {
 	probeCtx, cancel := context.WithTimeout(ctx, 2*time.Second)
 	defer cancel()
 	snapshot, err := c.runtime.candidates.Refresh(probeCtx, address, c.credential)
+	if address != "" {
+		// Failed public probes still yield a fresh LAN fallback. Share this
+		// attempt across a prepare burst instead of blocking every peer pair
+		// on the same unreachable coordinator UDP endpoint.
+		c.lastProbeRefresh = time.Now()
+	}
 	if err != nil && ctx.Err() == nil {
 		snapshot, err = c.runtime.candidates.Refresh(ctx, "", proto.ProbeCredential{})
 	}
@@ -415,7 +433,11 @@ func (c *ControlClient) handle(ctx context.Context, env proto.ControlEnvelope) e
 		c.refreshMu.Lock()
 		defer c.refreshMu.Unlock()
 		if authorized {
-			err = c.refreshLocked(ctx, false)
+			// Always enumerate and publish current LAN candidates. Only the
+			// potentially blocking public probe is reused; credential updates
+			// and the periodic worker independently renew that observation.
+			lanOnly := time.Since(c.lastProbeRefresh) < peerCandidateRefreshInterval
+			err = c.refreshLocked(ctx, lanOnly)
 		}
 		return c.Send(proto.ControlTypeConnectReady, env.RequestID, proto.ConnectReady{SessionID: body.SessionID, Generation: body.Generation, CandidateRevision: c.revision, Ready: authorized && err == nil})
 	case proto.ControlTypeSessionOffer:

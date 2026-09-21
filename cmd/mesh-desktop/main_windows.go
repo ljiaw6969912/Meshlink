@@ -6,6 +6,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net"
@@ -32,7 +33,7 @@ import (
 	"meshlink/internal/networkstate"
 	"meshlink/internal/onboarding"
 	"meshlink/internal/p2p"
-	"meshlink/internal/productflags"
+
 	"meshlink/internal/rdp"
 	"meshlink/internal/runner"
 	meshupdate "meshlink/internal/update"
@@ -41,8 +42,15 @@ import (
 )
 
 type desktopApp struct {
-	mw         *walk.MainWindow
-	connecting bool
+	mw               *walk.MainWindow
+	connecting       bool
+	serverPanel      *walk.Composite
+	clientPanel      *walk.Composite
+	serverModeButton *walk.PushButton
+	clientModeButton *walk.PushButton
+	serverInfo       *walk.TextLabel
+	clientInfo       *walk.TextLabel
+	modeState        *walk.Label
 
 	serviceName   *walk.LineEdit
 	configPath    *walk.LineEdit
@@ -154,7 +162,7 @@ func (s *meshListStyler) ItemHeightDependsOnWidth() bool {
 }
 
 func (s *meshListStyler) DefaultItemHeight() int {
-	return s.scale(58)
+	return s.scale(66)
 }
 
 func (s *meshListStyler) ItemHeight(index, width int) int {
@@ -166,44 +174,83 @@ func (s *meshListStyler) StyleItem(style *walk.ListItemStyle) {
 		return
 	}
 	node := s.model.items[style.Index()]
-	if style.Index()%2 == 1 {
-		style.BackgroundColor = walk.RGB(250, 252, 255)
-	}
-	_ = style.DrawBackground()
-
 	bounds := style.BoundsPixels()
 	canvas := style.Canvas()
 	if canvas == nil {
 		return
 	}
-
-	dotColor := meshNodeDotColor(node)
-	if brush, err := walk.NewSolidColorBrush(dotColor); err == nil {
+	selected := s.list != nil && *s.list != nil && (*s.list).CurrentIndex() == style.Index()
+	rowColor := themeWhite
+	if selected {
+		rowColor = walk.RGB(237, 243, 255)
+	}
+	fill := func(color walk.Color, rect walk.Rectangle, round bool) {
+		brush, err := walk.NewSolidColorBrush(color)
+		if err != nil {
+			return
+		}
 		defer brush.Dispose()
-		dot := walk.Rectangle{X: bounds.X + s.scale(15), Y: bounds.Y + s.scale(22), Width: s.scale(10), Height: s.scale(10)}
-		_ = canvas.FillEllipsePixels(brush, dot)
+		if round {
+			_ = canvas.FillRoundedRectanglePixels(brush, rect, walk.Size{Width: s.scale(8), Height: s.scale(8)})
+		} else {
+			_ = canvas.FillRectanglePixels(brush, rect)
+		}
 	}
-
-	textLeft := bounds.X + s.scale(36)
-	textWidth := bounds.Width - s.scale(48)
+	fill(themeWhite, bounds, false)
+	row := bounds
+	row.Height -= s.scale(5)
+	fill(rowColor, row, true)
+	if selected && (*s.list).Focused() {
+		if pen, err := walk.NewCosmeticPen(walk.PenDash, themeAccent); err == nil {
+			focus := row
+			focus.X += s.scale(2)
+			focus.Y += s.scale(2)
+			focus.Width -= s.scale(5)
+			focus.Height -= s.scale(5)
+			_ = canvas.DrawRectanglePixels(pen, focus)
+			pen.Dispose()
+		}
+	}
+	if selected {
+		fill(themeAccent, walk.Rectangle{X: bounds.X, Y: bounds.Y + s.scale(16), Width: s.scale(3), Height: s.scale(36)}, true)
+	}
+	icon := walk.Rectangle{X: bounds.X + s.scale(14), Y: bounds.Y + s.scale(16), Width: s.scale(38), Height: s.scale(38)}
+	fill(walk.RGB(228, 236, 250), icon, true)
+	pen, err := walk.NewCosmeticPen(walk.PenSolid, themeAccent)
+	if err == nil {
+		defer pen.Dispose()
+		_ = canvas.DrawRoundedRectanglePixels(pen, walk.Rectangle{X: icon.X + s.scale(8), Y: icon.Y + s.scale(10), Width: s.scale(22), Height: s.scale(15)}, walk.Size{Width: s.scale(3), Height: s.scale(3)})
+		_ = canvas.DrawLinePixels(pen, walk.Point{X: icon.X + s.scale(19), Y: icon.Y + s.scale(25)}, walk.Point{X: icon.X + s.scale(19), Y: icon.Y + s.scale(29)})
+		_ = canvas.DrawLinePixels(pen, walk.Point{X: icon.X + s.scale(13), Y: icon.Y + s.scale(29)}, walk.Point{X: icon.X + s.scale(25), Y: icon.Y + s.scale(29)})
+	}
+	textLeft := bounds.X + s.scale(66)
+	statusWidth := s.scale(186)
+	textWidth := bounds.Width - s.scale(82) - statusWidth
 	title := nodeTitle(node)
-	if node.VirtualIP != "" {
-		title += "    " + node.VirtualIP
+	if node.Kind == "self" {
+		title += "  · 本机"
 	}
-	subtitle := meshNodeConnectionSummary(node)
-	if node.RemoteAddr != "" {
-		subtitle += " · " + sourceIP(node.RemoteAddr)
-	} else if node.Listen != "" {
-		subtitle += " · 监听 " + node.Listen
-	} else if node.Connect != "" {
-		subtitle += " · 连接 " + node.Connect
+	bold, err := walk.NewFont("Microsoft YaHei UI", 10, walk.FontBold)
+	if err != nil {
+		bold = style.Font
+	} else {
+		defer bold.Dispose()
 	}
-
-	titleRect := walk.Rectangle{X: textLeft, Y: bounds.Y + s.scale(9), Width: textWidth, Height: s.scale(22)}
-	subtitleRect := walk.Rectangle{X: textLeft, Y: bounds.Y + s.scale(31), Width: textWidth, Height: s.scale(20)}
-	_ = style.DrawText(title, titleRect, walk.TextSingleLine|walk.TextEndEllipsis)
-	style.TextColor = walk.RGB(100, 116, 139)
-	_ = style.DrawText(subtitle, subtitleRect, walk.TextSingleLine|walk.TextEndEllipsis)
+	_ = canvas.DrawTextPixels(title, bold, themeInk, walk.Rectangle{X: textLeft, Y: bounds.Y + s.scale(13), Width: textWidth, Height: s.scale(24)}, walk.TextSingleLine|walk.TextEndEllipsis)
+	_ = canvas.DrawTextPixels(fallbackText(node.VirtualIP, "等待分配地址"), style.Font, themeMuted, walk.Rectangle{X: textLeft, Y: bounds.Y + s.scale(39), Width: textWidth, Height: s.scale(22)}, walk.TextSingleLine|walk.TextEndEllipsis)
+	statusLeft := bounds.X + bounds.Width - statusWidth
+	if brush, err := walk.NewSolidColorBrush(meshNodeDotColor(node)); err == nil {
+		_ = canvas.FillEllipsePixels(brush, walk.Rectangle{X: statusLeft, Y: bounds.Y + s.scale(22), Width: s.scale(7), Height: s.scale(7)})
+		brush.Dispose()
+	}
+	_ = canvas.DrawTextPixels(meshNodeConnectionLabel(node), style.Font, themeInk, walk.Rectangle{X: statusLeft + s.scale(15), Y: bounds.Y + s.scale(14), Width: statusWidth - s.scale(24), Height: s.scale(23)}, walk.TextSingleLine|walk.TextEndEllipsis)
+	latency := "等待连接数据"
+	if node.Kind == "self" {
+		latency = "当前设备"
+	} else if node.LatencyMS > 0 {
+		latency = fmt.Sprintf("%d ms  ·  连接延迟", node.LatencyMS)
+	}
+	_ = canvas.DrawTextPixels(latency, style.Font, themeMuted, walk.Rectangle{X: statusLeft + s.scale(15), Y: bounds.Y + s.scale(39), Width: statusWidth - s.scale(24), Height: s.scale(22)}, walk.TextSingleLine|walk.TextEndEllipsis)
 }
 
 func nodeTitle(node meshNode) string {
@@ -270,180 +317,7 @@ func relaunchAsAdministrator() (bool, error) {
 }
 
 func (a *desktopApp) run() error {
-	bg := SolidColorBrush{Color: walk.RGB(246, 248, 251)}
-	header := SolidColorBrush{Color: walk.RGB(20, 33, 48)}
-	panel := SolidColorBrush{Color: walk.RGB(255, 255, 255)}
-	ink := walk.RGB(24, 36, 52)
-	muted := walk.RGB(101, 113, 128)
-	accent := walk.RGB(9, 105, 98)
-	mono := Font{Family: "Consolas", PointSize: 10}
-	a.meshModel = &meshNodeModel{}
-	meshStyler := &meshListStyler{list: &a.meshList, model: a.meshModel}
-
-	window := MainWindow{
-		AssignTo:   &a.mw,
-		Title:      "Meshlink 远程桌面组网",
-		MinSize:    Size{Width: 960, Height: 620},
-		Size:       Size{Width: 1060, Height: 690},
-		Layout:     VBox{MarginsZero: true, SpacingZero: true},
-		Background: bg,
-		MenuItems: []MenuItem{
-			Menu{
-				Text: "帮助",
-				Items: []MenuItem{
-					Action{Text: "关于 / 检查更新", OnTriggered: a.showAboutDialog},
-				},
-			},
-		},
-		Children: []Widget{
-			Composite{
-				Background: header,
-				Layout:     HBox{Margins: Margins{Left: 18, Top: 14, Right: 18, Bottom: 14}, Spacing: 14},
-				Children: []Widget{
-					Composite{
-						Layout:        VBox{MarginsZero: true, Spacing: 3},
-						StretchFactor: 1,
-						Background:    header,
-						Children: []Widget{
-							Label{
-								Text:      "Meshlink 远程桌面组网",
-								TextColor: walk.RGB(255, 255, 255),
-								Font:      Font{Family: "Microsoft YaHei UI", PointSize: 16, Bold: true},
-							},
-							Label{
-								Text:      "设备列表 · 创建服务器 · 加入已有网络",
-								TextColor: walk.RGB(198, 210, 222),
-							},
-						},
-					},
-					Label{
-						AssignTo:      &a.quickState,
-						Text:          "就绪",
-						TextColor:     walk.RGB(255, 255, 255),
-						MinSize:       Size{Width: 130, Height: 28},
-						TextAlignment: AlignCenter,
-						Background:    SolidColorBrush{Color: accent},
-					},
-				},
-			},
-			HSplitter{
-				HandleWidth:   6,
-				StretchFactor: 1,
-				Children: []Widget{
-					Composite{
-						MinSize:    Size{Width: 340, Height: 0},
-						MaxSize:    Size{Width: 410, Height: 0},
-						Background: bg,
-						Layout:     VBox{Margins: Margins{Left: 12, Top: 12, Right: 8, Bottom: 12}, Spacing: 8},
-						Children: []Widget{
-							GroupBox{
-								Title:      "使用入口",
-								Background: panel,
-								Layout:     Grid{Columns: 2, Margins: Margins{Left: 10, Top: 15, Right: 10, Bottom: 10}, Spacing: 6},
-								Children: []Widget{
-									PushButton{Text: "我有公网 IP，创建服务器", OnClicked: a.focusCreateServer, ColumnSpan: 2},
-									PushButton{Text: "我没有公网 IP，使用官方 Hub", OnClicked: a.showOfficialHubMVPDialog, Visible: productflags.OfficialHubMVPEnabled(), ColumnSpan: 2},
-									PushButton{Text: "加入已有网络", OnClicked: a.focusJoinNetwork, ColumnSpan: 2},
-								},
-							},
-							GroupBox{
-								Title:      "创建服务器",
-								Background: panel,
-								Layout:     Grid{Columns: 4, Margins: Margins{Left: 10, Top: 15, Right: 10, Bottom: 10}, Spacing: 6},
-								Children: []Widget{
-									Label{Text: "域名或公网地址", TextColor: muted},
-									LineEdit{AssignTo: &a.inviteServer, CueBanner: "example.com:8443", ColumnSpan: 3},
-									Label{Text: "监听端口", TextColor: muted},
-									LineEdit{AssignTo: &a.listenPort, Text: "8443", ColumnSpan: 3},
-									PushButton{Text: "启动服务器", OnClicked: a.createHubOnboarding, ColumnSpan: 2},
-									PushButton{Text: "停止服务器", OnClicked: func() { a.serviceAction("stop") }, ColumnSpan: 2},
-									PushButton{Text: "重新生成接入码", OnClicked: a.createInviteOnboarding, ColumnSpan: 4},
-									TextEdit{AssignTo: &a.inviteOutput, ReadOnly: true, VScroll: true, MinSize: Size{Width: 0, Height: 76}, MaxSize: Size{Width: 10000, Height: 96}, ColumnSpan: 4},
-									Label{AssignTo: &a.onboardingState, Text: "状态：服务器未启动", TextColor: muted, ColumnSpan: 4},
-								},
-							},
-							GroupBox{
-								Title:      "加入已有网络",
-								Background: panel,
-								Layout:     Grid{Columns: 4, Margins: Margins{Left: 10, Top: 15, Right: 10, Bottom: 10}, Spacing: 6},
-								Children: []Widget{
-									Label{Text: "邀请链接", TextColor: muted},
-									LineEdit{AssignTo: &a.inviteLink, CueBanner: "meshlink://join?...", ColumnSpan: 3},
-									Label{Text: "验证码", TextColor: muted},
-									LineEdit{AssignTo: &a.inviteCode, ColumnSpan: 3},
-									Label{Text: "本机名称", TextColor: muted},
-									LineEdit{AssignTo: &a.spokeNodeName, Text: defaultNodeName("spoke"), ColumnSpan: 3},
-									PushButton{Text: "连接", OnClicked: a.connectNetwork, ColumnSpan: 4},
-									PushButton{Text: "断开连接", OnClicked: a.disconnectNetwork, ColumnSpan: 2},
-									PushButton{Text: "退出网络", OnClicked: a.exitNetwork, ColumnSpan: 2},
-								},
-							},
-						},
-					},
-					TabWidget{
-						StretchFactor:  1,
-						ContentMargins: Margins{Left: 10, Top: 10, Right: 10, Bottom: 10},
-						Pages: []TabPage{
-							{
-								Title:  "组网机群节点列表",
-								Layout: VBox{MarginsZero: true, Spacing: 10},
-								Children: []Widget{
-									Composite{
-										Layout: HBox{MarginsZero: true, Spacing: 6},
-										Children: []Widget{
-											Label{Text: "协调服务器：", TextColor: muted},
-											Label{AssignTo: &a.coordinatorSummary, Text: "已断开", TextColor: ink},
-											Label{Text: "对端路径：", TextColor: muted},
-											Label{AssignTo: &a.p2pPathSummary, Text: "离线或未知", TextColor: ink, StretchFactor: 1},
-										},
-									},
-									Composite{
-										Layout: HBox{MarginsZero: true, Spacing: 8},
-										Children: []Widget{
-											Label{Text: "节点列表", TextColor: ink, Font: Font{Family: "Microsoft YaHei UI", PointSize: 11, Bold: true}},
-											Label{AssignTo: &a.meshSummary, Text: "等待刷新", TextColor: muted, StretchFactor: 1},
-											PushButton{Text: "一键诊断", OnClicked: a.runOneClickDiagnostics},
-											PushButton{Text: "打开远程桌面", OnClicked: a.openRDP},
-											PushButton{Text: "诊断远程桌面", OnClicked: a.checkRDP},
-											PushButton{Text: "重命名设备", OnClicked: a.renameSelectedDevice},
-											PushButton{Text: "禁用设备", OnClicked: a.disableSelectedDevice},
-											PushButton{Text: "移除设备", OnClicked: a.removeSelectedDevice},
-											PushButton{Text: "刷新列表", OnClicked: a.loadMeshStatus},
-										},
-									},
-									HSplitter{
-										StretchFactor: 1,
-										HandleWidth:   6,
-										Children: []Widget{
-											ListBox{
-												AssignTo:              &a.meshList,
-												Model:                 a.meshModel,
-												ItemStyler:            meshStyler,
-												Font:                  Font{Family: "Microsoft YaHei UI", PointSize: 10},
-												MinSize:               Size{Width: 280, Height: 0},
-												MaxSize:               Size{Width: 360, Height: 0},
-												OnCurrentIndexChanged: a.showSelectedMeshNode,
-											},
-											TextEdit{
-												AssignTo:      &a.meshDetail,
-												ReadOnly:      true,
-												Font:          mono,
-												VScroll:       true,
-												HScroll:       true,
-												Text:          "左侧会显示当前组网节点；点击一个节点查看连接方式、延迟和最近在线时间。",
-												StretchFactor: 1,
-											},
-										},
-									},
-								},
-							},
-						},
-					},
-				},
-			},
-		},
-	}
-	if err := window.Create(); err != nil {
+	if err := a.createWindow(); err != nil {
 		return err
 	}
 	a.restoreSimpleModeState()
@@ -569,6 +443,9 @@ func rememberConfigPath(baseDir, configPath string) error {
 		return err
 	}
 	settings := loadDesktopSettings(baseDir)
+	if settings.LastConfigPath == absPath {
+		return nil
+	}
 	settings.LastConfigPath = absPath
 	return saveDesktopSettings(baseDir, settings)
 }
@@ -799,6 +676,7 @@ func (a *desktopApp) onboardingManager() onboarding.Manager {
 }
 
 func (a *desktopApp) focusCreateServer() {
+	a.showConnectionMode("hub")
 	if a.onboardingState != nil {
 		a.onboardingState.SetText("状态：准备创建服务器")
 	}
@@ -808,6 +686,7 @@ func (a *desktopApp) focusCreateServer() {
 }
 
 func (a *desktopApp) focusJoinNetwork() {
+	a.showConnectionMode("spoke")
 	if a.onboardingState != nil {
 		a.onboardingState.SetText("状态：准备加入已有网络")
 	}
@@ -1020,6 +899,7 @@ func (a *desktopApp) createHubOnboarding() {
 			if result.ConfigPath != "" {
 				a.setCurrentConfigPath(result.ConfigPath)
 				a.showInvite(result.Invite)
+				a.restoreSimpleModeState()
 			}
 			a.loadMeshStatus()
 			if err != nil {
@@ -1248,11 +1128,15 @@ func formatOfficialHubSubscriptionExperience(experience onboarding.OfficialHubSu
 }
 
 type simpleModeSnapshot struct {
-	Mode       string
-	NodeName   string
-	Server     string
-	ListenPort string
-	InviteText string
+	Mode           string
+	NodeName       string
+	Server         string
+	ListenPort     string
+	InviteText     string
+	VirtualIP      string
+	InviteLink     string
+	InviteCode     string
+	ConnectionText string
 }
 
 func loadSimpleModeSnapshot(baseDir, configPath string, now time.Time) (simpleModeSnapshot, error) {
@@ -1260,22 +1144,36 @@ func loadSimpleModeSnapshot(baseDir, configPath string, now time.Time) (simpleMo
 	if err != nil {
 		return simpleModeSnapshot{}, err
 	}
-	snapshot := simpleModeSnapshot{Mode: cfg.Mode, NodeName: fallbackText(cfg.DisplayName, cfg.NodeID)}
+	snapshot := simpleModeSnapshot{Mode: cfg.Mode, NodeName: fallbackText(cfg.DisplayName, cfg.NodeID), VirtualIP: cfg.VirtualIP}
+	manager := onboarding.ManagerForConfig(baseDir, configPath)
 	switch cfg.Mode {
 	case "hub":
 		if _, port, err := net.SplitHostPort(cfg.Listen); err == nil {
 			snapshot.ListenPort = port
 		}
+		snapshot.ConnectionText = "本机名称：" + snapshot.NodeName + "\r\n虚拟 IP：" + cfg.VirtualIP + "\r\n监听地址：" + cfg.Listen
 	case "spoke":
 		snapshot.Server = cfg.Connect
+		snapshot.ConnectionText = "本机名称：" + snapshot.NodeName + "\r\n服务器：" + cfg.Connect + "\r\n虚拟 IP：" + cfg.VirtualIP
+		joined, err := manager.JoinedNetwork()
+		if err != nil {
+			snapshot.ConnectionText += "\r\n原加入信息读取失败，仍可使用本机身份重连。"
+		} else {
+			snapshot.InviteLink, snapshot.InviteCode = joined.InviteLink, joined.Code
+			if snapshot.InviteLink == "" {
+				snapshot.ConnectionText += "\r\n已有本机身份，点击连接即可恢复。"
+			}
+		}
+		return snapshot, nil
 	}
-	invite, ok, err := onboarding.ManagerForConfig(baseDir, configPath).LatestInvite()
+	invite, ok, err := manager.LatestInvite()
 	if err != nil {
 		return snapshot, err
 	}
 	if ok {
 		if invite.Server != "" {
 			snapshot.Server = invite.Server
+			snapshot.ConnectionText += "\r\n接入地址：" + invite.Server
 		}
 		snapshot.InviteText = formatInviteForDesktopAt(invite, now)
 	}
@@ -1287,24 +1185,69 @@ func (a *desktopApp) restoreSimpleModeState() {
 	configPath := a.currentConfigPath()
 	a.setCurrentConfigPath(configPath)
 	snapshot, err := loadSimpleModeSnapshot(baseDir, configPath, time.Now())
-	if err != nil {
+	if err != nil && snapshot.Mode == "" {
 		return
 	}
+	a.applySimpleModeSnapshot(snapshot)
+}
+
+func (a *desktopApp) showConnectionMode(mode string) {
+	if a.mw != nil {
+		a.mw.SetSuspended(true)
+		defer a.mw.SetSuspended(false)
+	}
+	if a.serverPanel != nil {
+		a.serverPanel.SetVisible(mode == "hub")
+	}
+	if a.clientPanel != nil {
+		a.clientPanel.SetVisible(mode != "hub")
+	}
+	setButtonSelected(a.serverModeButton, mode == "hub")
+	setButtonSelected(a.clientModeButton, mode != "hub")
+	if a.modeState != nil {
+		if mode == "hub" {
+			a.modeState.SetText("服务器模式")
+		} else {
+			a.modeState.SetText("客户端模式")
+		}
+	}
+}
+
+func (a *desktopApp) applySimpleModeSnapshot(snapshot simpleModeSnapshot) {
+	a.showConnectionMode(snapshot.Mode)
 	switch snapshot.Mode {
 	case "hub":
+		if a.modeState != nil {
+			a.modeState.SetText("服务器模式")
+		}
+		if a.serverInfo != nil {
+			a.serverInfo.SetText(snapshot.ConnectionText)
+		}
 		if a.inviteServer != nil && snapshot.Server != "" {
 			a.inviteServer.SetText(snapshot.Server)
 		}
 		if a.listenPort != nil && snapshot.ListenPort != "" {
 			a.listenPort.SetText(snapshot.ListenPort)
 		}
-		if a.inviteOutput != nil && snapshot.InviteText != "" {
+		if a.inviteOutput != nil {
 			a.inviteOutput.SetText(snapshot.InviteText)
 		}
 		if a.onboardingState != nil {
 			a.onboardingState.SetText("状态：已读取当前服务器配置")
 		}
 	case "spoke":
+		if a.modeState != nil {
+			a.modeState.SetText("客户端模式")
+		}
+		if a.clientInfo != nil {
+			a.clientInfo.SetText(snapshot.ConnectionText)
+		}
+		if a.inviteLink != nil {
+			a.inviteLink.SetText(snapshot.InviteLink)
+		}
+		if a.inviteCode != nil {
+			a.inviteCode.SetText(snapshot.InviteCode)
+		}
 		if a.spokeNodeName != nil {
 			a.spokeNodeName.SetText(snapshot.NodeName)
 		}
@@ -1372,14 +1315,18 @@ func (a *desktopApp) connectNetwork() {
 			a.mw.SetEnabled(true)
 			if result.ConfigPath != "" {
 				a.setCurrentConfigPath(result.ConfigPath)
-				if cfg, loadErr := config.Load(result.ConfigPath); loadErr == nil {
-					a.spokeNodeName.SetText(fallbackText(cfg.DisplayName, cfg.NodeID))
-				}
+				a.restoreSimpleModeState()
 			}
 			a.loadMeshStatus()
 			if err != nil {
-				a.onboardingState.SetText("状态：未连接")
-				a.fail("连接失败", err)
+				service, statusErr := winservice.Status(name)
+				if statusErr == nil && isBackgroundReconnect(result.ConfigPath, service, err) {
+					a.onboardingState.SetText("状态：后台服务正在自动重连")
+					a.info("后台服务已启动，正在等待服务器恢复。\r\n关闭窗口后仍会自动重连，无需重复加入。\r\n\r\n" + err.Error())
+				} else {
+					a.onboardingState.SetText("状态：未连接")
+					a.fail("连接失败", err)
+				}
 				return
 			}
 			a.onboardingState.SetText("状态：已连接")
@@ -1477,6 +1424,19 @@ func completeDesktopLeave(settings desktopSettings, persist func(desktopSettings
 }
 
 func (a *desktopApp) clearCurrentNetworkUI() {
+	a.showConnectionMode("spoke")
+	if a.modeState != nil {
+		a.modeState.SetText("选择创建或加入网络")
+	}
+	if a.inviteLink != nil {
+		a.inviteLink.SetText("")
+	}
+	if a.inviteCode != nil {
+		a.inviteCode.SetText("")
+	}
+	if a.clientInfo != nil {
+		a.clientInfo.SetText("已退出网络，请使用新的邀请信息加入。")
+	}
 	a.coordinatorState = "disconnected"
 	a.p2pListen = ""
 	if a.configPath != nil {
@@ -1533,6 +1493,20 @@ func isServiceNotRunningError(err error) bool {
 		strings.Contains(text, "没有启动")
 }
 
+type agentConnectionPendingError struct{ detail string }
+
+func (e *agentConnectionPendingError) Error() string { return "未连接服务器：" + e.detail }
+
+func isBackgroundReconnect(configPath string, status winservice.ServiceStatus, err error) bool {
+	var pending *agentConnectionPendingError
+	if configPath == "" || !status.Installed || status.State != "running" || !errors.As(err, &pending) {
+		return false
+	}
+	path, pathErr := filepath.Abs(configPath)
+	servicePath, serviceErr := filepath.Abs(status.ConfigPath)
+	return pathErr == nil && serviceErr == nil && strings.EqualFold(path, servicePath)
+}
+
 func waitForAgentRunningAfterStart(configPath, serviceName string, startedAt time.Time, timeout time.Duration) error {
 	if serviceName == "" {
 		serviceName = winservice.DefaultName
@@ -1542,6 +1516,7 @@ func waitForAgentRunningAfterStart(configPath, serviceName string, startedAt tim
 	deadline := time.Now().Add(timeout)
 	var lastErr error
 	var sawStopped bool
+	var sawRunning bool
 	for {
 		status, err := readRuntimeStatusFile(statusPath)
 		if err != nil {
@@ -1550,6 +1525,7 @@ func waitForAgentRunningAfterStart(configPath, serviceName string, startedAt tim
 			lastErr = nil
 			switch strings.ToLower(status.State) {
 			case "running":
+				sawRunning = true
 				if status.NetworkState == networkstate.Connected && (status.Self.Mode != "spoke" || status.CoordinatorState == networkstate.Connected) {
 					if cfg == nil || cfg.ServerNodeConfig == "" {
 						return nil
@@ -1569,6 +1545,9 @@ func waitForAgentRunningAfterStart(configPath, serviceName string, startedAt tim
 			}
 			if lastErr != nil {
 				return fmt.Errorf("等待服务运行状态超时，无法读取状态文件 %s：%w", statusPath, lastErr)
+			}
+			if sawRunning {
+				return &agentConnectionPendingError{detail: agentLogTail(configPath, serviceName)}
 			}
 			return fmt.Errorf("未连接服务器：%s", agentLogTail(configPath, serviceName))
 		}
@@ -1805,6 +1784,7 @@ func (a *desktopApp) loadMeshStatus() {
 	statusPath := runner.StatusPath(configPath, serviceName)
 	selectedKey := a.currentMeshNodeKey()
 	devices, devicesErr := a.onboardingManager().Devices(serviceName)
+	a.refreshServiceStatusLabels()
 	if devicesErr == nil {
 		service, err := winservice.Status(serviceName)
 		devices = onboarding.WithServiceRunning(devices, err == nil && service.Installed && service.State == "running")
@@ -1874,7 +1854,7 @@ func (a *desktopApp) showSelectedMeshNode() {
 		return
 	}
 	node := a.meshModel.items[index]
-	a.meshDetail.SetText(formatMeshNodeDetail(node))
+	a.meshDetail.SetText(formatMeshNodePresentation(node))
 	a.updateConnectivityOverview(a.meshModel.items, node.Key)
 	a.fillRDPTargetFromMeshNode(node)
 }

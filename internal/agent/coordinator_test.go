@@ -1325,6 +1325,23 @@ func TestCoordinatorProbeCredentialIsBoundToCurrentControl(t *testing.T) {
 	replacement.barrier()
 }
 
+func TestCoordinatorCandidateRenewalPreservesOtherPairReadiness(t *testing.T) {
+	f := newCoordinatorFixture(t)
+	b, _ := f.connect("B")
+	c, _ := f.connect("C")
+	coordinatorCandidates(b, "192.168.1.20")
+	coordinatorCandidates(c, "192.168.2.20")
+	s := coordinatorPrepare(t, b, c)
+	coordinatorReady(b, s)
+	b.barrier()
+	// Preparing another pair refreshes the same endpoints with a newer TTL.
+	b.send(proto.ControlTypeCandidateUpdate, proto.CandidateUpdate{Revision: 2, Candidates: []proto.Candidate{{Address: "192.168.1.20", Port: 45000, Scope: "lan", Priority: 100, ExpiresAt: time.Now().Add(time.Minute)}}})
+	b.barrier()
+	coordinatorReady(c, s)
+	b.want(proto.ControlTypeSessionOffer)
+	c.want(proto.ControlTypeSessionOffer)
+}
+
 func TestCoordinatorCandidateChangeAfterReadyRequiresNewReady(t *testing.T) {
 	f := newCoordinatorFixture(t)
 	b, _ := f.connect("B")

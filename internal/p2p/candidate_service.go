@@ -91,7 +91,12 @@ func NewCandidateService(cfg CandidateServiceConfig) (*CandidateService, error) 
 		return nil, fmt.Errorf("listen for candidates: %w", err)
 	}
 
-	transport := &quic.Transport{Conn: conn}
+	packetConn, err := candidatePacketConn(conn)
+	if err != nil {
+		_ = conn.Close()
+		return nil, fmt.Errorf("configure candidate socket: %w", err)
+	}
+	transport := &quic.Transport{Conn: packetConn}
 	tlsConfig := cfg.TLSConfig.Clone()
 	quicConfig := normalizedSessionQUICConfig(cfg.QUICConfig)
 	listener, err := transport.Listen(tlsConfig.Clone(), quicConfig.Clone())

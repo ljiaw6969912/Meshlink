@@ -825,7 +825,7 @@ func TestControlRequestCorrelationsBoundedAndCleaned(t *testing.T) {
 	})
 }
 
-func TestMemberRefreshPreservesManagerOwnedStatus(t *testing.T) {
+func TestMemberRefreshPreservesSessionStateAndRetriesOnlineFailure(t *testing.T) {
 	f := newRuntimeFixture(t, "B", "C")
 	r := f.r["B"]
 	b := attachRuntimeControl(t, r)
@@ -855,12 +855,16 @@ func TestMemberRefreshPreservesManagerOwnedStatus(t *testing.T) {
 	}
 	b.send(t, proto.ControlTypePing, proto.ControlPing{Nonce: "failed-barrier"})
 	b.want(t, proto.ControlTypePong)
-	for i, members := range [][]proto.Member{f.members, {f.members[0]}} {
-		if err := r.applyMembers(proto.MemberSnapshot{Revision: uint64(i + 3), Members: members}); err != nil {
-			t.Fatal(err)
-		}
-		assertState(p2p.PathStateFailed)
+	assertState(p2p.PathStateFailed)
+	if err := r.applyMembers(proto.MemberSnapshot{Revision: 3, Members: []proto.Member{f.members[0]}}); err != nil {
+		t.Fatal(err)
 	}
+	assertState(p2p.PathStateFailed)
+	if err := r.applyMembers(proto.MemberSnapshot{Revision: 4, Members: f.members}); err != nil {
+		t.Fatal(err)
+	}
+	b.want(t, proto.ControlTypeConnectRequest)
+	assertState(p2p.PathStateRequesting)
 }
 
 // Holding the status lock creates the exact split-publication window. No
@@ -1285,6 +1289,7 @@ func TestControlStaleMembershipCannotRevokeNewerSnapshot(t *testing.T) {
 	f := newRuntimeFixture(t, "B", "C")
 	b := attachRuntimeControl(t, f.r["B"])
 	b.send(t, proto.ControlTypeMemberSnapshot, proto.MemberSnapshot{Revision: 8, Members: f.members})
+	b.want(t, proto.ControlTypeConnectRequest)
 	b.send(t, proto.ControlTypeMemberDelta, proto.MemberDelta{Revision: 7, RemovedNodeIDs: []string{"C"}})
 	b.send(t, proto.ControlTypePing, proto.ControlPing{Nonce: "revision-barrier"})
 	b.want(t, proto.ControlTypePong)
@@ -1321,7 +1326,7 @@ func TestControlSessionResultDedupIsBounded(t *testing.T) {
 }
 
 func TestControlIncompatibilityIsPermanentBeforeAndAfterHello(t *testing.T) {
-	for _, kind := range []string{"packet", "legacy", "eof", "upgrade", "capability", "network", "noncanonical_network", "version"} {
+	for _, kind := range []string{"packet", "legacy", "upgrade", "capability", "network", "noncanonical_network", "version"} {
 		t.Run(kind, func(t *testing.T) {
 			f := newRuntimeFixture(t, "B")
 			local, remote := net.Pipe()
@@ -1652,6 +1657,12 @@ func TestPeerRuntimeNegotiatesThroughRealTLSCoordinator(t *testing.T) {
 		_, b := endpoints[0].member("C")
 		_, c := endpoints[1].member("B")
 		return b && c
+	})
+	// Authenticated peer sessions must become visible before any TUN traffic.
+	runtimeEventually(t, func() bool {
+		b, _ := endpoints[0].sessions.Snapshot("C")
+		c, _ := endpoints[1].sessions.Snapshot("B")
+		return b.State == p2p.PathStateLANDirect && c.State == p2p.PathStateLANDirect
 	})
 	packet := runtimePacket(2, 3)
 	if err := endpoints[0].routePacket(packet); err != nil {

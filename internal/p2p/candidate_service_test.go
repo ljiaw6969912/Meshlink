@@ -103,8 +103,8 @@ func TestCandidateServiceProbePunchAndQUICShareOneSocket(t *testing.T) {
 	if len(probe.payload) == 0 || probe.payload[0] != 0x00 {
 		t.Fatalf("probe payload begins %x, want non-QUIC marker", probe.payload)
 	}
-	if service.Transport() == nil || service.Transport().Conn != service.conn {
-		t.Fatal("quic transport does not own the candidate service UDPConn")
+	if service.Transport() == nil || service.Transport().Conn.LocalAddr().String() != service.conn.LocalAddr().String() {
+		t.Fatal("quic transport does not share the candidate service socket address")
 	}
 	if service.Transport() != service.transport || service.Listener() != service.listener {
 		t.Fatal("candidate service did not retain its one transport and listener")

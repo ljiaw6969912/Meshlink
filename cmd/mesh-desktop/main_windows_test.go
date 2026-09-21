@@ -28,7 +28,7 @@ func TestDesktopUsesDefaultServiceAndActiveConfigWithoutAdvancedControls(t *test
 }
 
 func TestDesktopMainWindowOnlyExposesSimpleModeTabs(t *testing.T) {
-	b, err := os.ReadFile("main_windows.go")
+	b, err := readDesktopUISource()
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -70,7 +70,7 @@ func TestDesktopMainWindowOnlyExposesSimpleModeTabs(t *testing.T) {
 }
 
 func TestDesktopOfficialHubDialogExposesMVPControlPlaneFields(t *testing.T) {
-	b, err := os.ReadFile("main_windows.go")
+	b, err := readDesktopUISource()
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -109,7 +109,7 @@ func TestDesktopOfficialHubDialogExposesMVPControlPlaneFields(t *testing.T) {
 }
 
 func TestDesktopSelfHostedFlowHasNoRelaySurface(t *testing.T) {
-	b, err := os.ReadFile("main_windows.go")
+	b, err := readDesktopUISource()
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -127,15 +127,15 @@ func TestDesktopSelfHostedFlowHasNoRelaySurface(t *testing.T) {
 }
 
 func TestDesktopShowsCoordinatorAndDirectStateSeparately(t *testing.T) {
-	b, err := os.ReadFile("main_windows.go")
+	b, err := readDesktopUISource()
 	if err != nil {
 		t.Fatal(err)
 	}
 	src := string(b)
 	for _, want := range []string{
-		`Text: "协调服务器："`,
+		`Text: "协调服务器"`,
 		`AssignTo: &a.coordinatorSummary`,
-		`Text: "对端路径："`,
+		`Text: "对端连接路径"`,
 		`AssignTo: &a.p2pPathSummary`,
 		`a.coordinatorState = devices.CoordinatorState`,
 		`a.p2pListen = devices.P2PListen`,
@@ -213,13 +213,13 @@ func TestDesktopConnectionLabelsUseTruthfulP2PStates(t *testing.T) {
 }
 
 func TestJoinOnboardingUsesLocalDeviceName(t *testing.T) {
-	b, err := os.ReadFile("main_windows.go")
+	b, err := readDesktopUISource()
 	if err != nil {
 		t.Fatal(err)
 	}
 	src := string(b)
 	for _, want := range []string{
-		`Label{Text: "本机名称", TextColor: muted}`,
+		`Label{Text: "本机名称", TextColor: muted`,
 		`LineEdit{AssignTo: &a.spokeNodeName`,
 		`NodeName:   strings.TrimSpace(a.spokeNodeName.Text()),`,
 	} {
@@ -230,7 +230,7 @@ func TestJoinOnboardingUsesLocalDeviceName(t *testing.T) {
 }
 
 func TestDesktopMainWindowHasAboutUpdateMenu(t *testing.T) {
-	b, err := os.ReadFile("main_windows.go")
+	b, err := readDesktopUISource()
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -251,7 +251,7 @@ func TestDesktopMainWindowHasAboutUpdateMenu(t *testing.T) {
 }
 
 func TestDesktopRemovesAdvancedToolsAndRequestsElevation(t *testing.T) {
-	b, err := os.ReadFile("main_windows.go")
+	b, err := readDesktopUISource()
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -278,19 +278,8 @@ func TestDesktopRemovesAdvancedToolsAndRequestsElevation(t *testing.T) {
 	}
 }
 
-func TestInviteOutputHasBoundedHeight(t *testing.T) {
-	b, err := os.ReadFile("main_windows.go")
-	if err != nil {
-		t.Fatal(err)
-	}
-	src := string(b)
-	if !strings.Contains(src, `TextEdit{AssignTo: &a.inviteOutput, ReadOnly: true, VScroll: true, MinSize: Size{Width: 0, Height: 76}, MaxSize: Size{Width: 10000, Height: 96}, ColumnSpan: 4}`) {
-		t.Fatal("invite output should have a bounded height and vertical scrolling")
-	}
-}
-
 func TestDesktopMainWindowHasOneConnectAction(t *testing.T) {
-	b, err := os.ReadFile("main_windows.go")
+	b, err := readDesktopUISource()
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -332,7 +321,7 @@ func TestCompleteDesktopLeaveDoesNotDestroyIdentityWhenSettingsSaveFails(t *test
 }
 
 func TestDesktopRefreshUsesDeviceListNetworkStateEvenWhenEmpty(t *testing.T) {
-	b, err := os.ReadFile("main_windows.go")
+	b, err := readDesktopUISource()
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -395,7 +384,7 @@ func TestDesktopRefreshFailureKeepsNodesButProjectsThemOffline(t *testing.T) {
 		t.Fatalf("policy-disabled node = %+v, want policy retained with offline connection", got[1])
 	}
 
-	b, err := os.ReadFile("main_windows.go")
+	b, err := readDesktopUISource()
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -415,7 +404,7 @@ func TestDesktopRefreshFailureKeepsNodesButProjectsThemOffline(t *testing.T) {
 }
 
 func TestDesktopRDPDiagnosticsPassSeparateNetworkAndTargetStates(t *testing.T) {
-	b, err := os.ReadFile("main_windows.go")
+	b, err := readDesktopUISource()
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -435,26 +424,8 @@ func TestDesktopRDPDiagnosticsPassSeparateNetworkAndTargetStates(t *testing.T) {
 	}
 }
 
-func TestDesktopMainWindowUsesCompactSizing(t *testing.T) {
-	b, err := os.ReadFile("main_windows.go")
-	if err != nil {
-		t.Fatal(err)
-	}
-	src := string(b)
-	for _, want := range []string{
-		`MinSize:    Size{Width: 960, Height: 620}`,
-		`Size:       Size{Width: 1060, Height: 690}`,
-		`MaxSize:    Size{Width: 410, Height: 0}`,
-		`Layout:     VBox{Margins: Margins{Left: 12, Top: 12, Right: 8, Bottom: 12}, Spacing: 8}`,
-	} {
-		if !strings.Contains(src, want) {
-			t.Fatalf("desktop main window is missing compact sizing %s", want)
-		}
-	}
-}
-
 func TestRegeneratingInvitePreservesConnectedDevices(t *testing.T) {
-	b, err := os.ReadFile("main_windows.go")
+	b, err := readDesktopUISource()
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -485,7 +456,7 @@ func TestDesktopLongLivedInviteShowsRiskAndDeviceLimit(t *testing.T) {
 }
 
 func TestDesktopMainWindowExposesDeviceAdminControls(t *testing.T) {
-	b, err := os.ReadFile("main_windows.go")
+	b, err := readDesktopUISource()
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -608,7 +579,7 @@ func TestDesktopDeviceListShowsConnectionPathQualityStatus(t *testing.T) {
 }
 
 func TestDesktopMainWindowExposesOneClickDiagnosticReport(t *testing.T) {
-	b, err := os.ReadFile("main_windows.go")
+	b, err := readDesktopUISource()
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -859,4 +830,17 @@ func TestAgentRunningAfterStartReportsStoppedStatusWithLogTail(t *testing.T) {
 	if !strings.Contains(err.Error(), "bind: forbidden") {
 		t.Fatalf("error = %q, want log tail with bind failure", err.Error())
 	}
+}
+
+// UI construction lives separately from the desktop's connection lifecycle.
+func readDesktopUISource() ([]byte, error) {
+	main, err := os.ReadFile("main_windows.go")
+	if err != nil {
+		return nil, err
+	}
+	ui, err := os.ReadFile("ui_windows.go")
+	if err != nil {
+		return nil, err
+	}
+	return append(main, ui...), nil
 }

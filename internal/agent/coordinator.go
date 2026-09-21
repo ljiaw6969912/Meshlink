@@ -683,6 +683,7 @@ func (c *coordinator) handle(p *coordinatorPeer, env proto.ControlEnvelope) erro
 			return nil
 		}
 		if !result.Success {
+			c.a.log.Warn("direct negotiation failed", "peer", p.node.NodeID, "pair", s.pair, "code", publicPeerError(result.Code))
 			c.abortLocked(s, "connection_failed")
 			return nil
 		}
@@ -830,14 +831,39 @@ func (c *coordinator) updateCandidatesLocked(p *coordinatorPeer, update proto.Ca
 		address := c.a.serverPublicAddress
 		candidates = append(candidates, proto.Candidate{Address: address.Addr().Unmap().String(), Port: address.Port(), Scope: "public", Priority: 50, ExpiresAt: now.Add(candidateTTL)})
 	}
+	// A peer refreshes candidates for every prepare. Renewing unchanged live
+	// endpoints must not invalidate its readiness for other concurrent pairs.
+	unchanged := sameLiveCandidateEndpoints(p.candidates, candidates, now)
 	p.candidates = candidates
 	c.metrics.CandidateRefreshes++
 	for pair, s := range c.negotiations {
-		if s.phase == "prepare" && (pair[0] == p.node.NodeID || pair[1] == p.node.NodeID) {
+		if !unchanged && s.phase == "prepare" && (pair[0] == p.node.NodeID || pair[1] == p.node.NodeID) {
 			delete(s.ready, p.node.NodeID)
 		}
 	}
 	return nil
+}
+
+func sameLiveCandidateEndpoints(previous, next []proto.Candidate, now time.Time) bool {
+	if len(previous) != len(next) {
+		return false
+	}
+	endpoints := make(map[proto.Candidate]int, len(previous))
+	for _, candidate := range previous {
+		if !candidate.ExpiresAt.After(now) {
+			return false
+		}
+		candidate.ExpiresAt = time.Time{}
+		endpoints[candidate]++
+	}
+	for _, candidate := range next {
+		candidate.ExpiresAt = time.Time{}
+		if endpoints[candidate] == 0 {
+			return false
+		}
+		endpoints[candidate]--
+	}
+	return true
 }
 
 func (c *coordinator) requestLocked(p *coordinatorPeer, targetID, requestID string) error {

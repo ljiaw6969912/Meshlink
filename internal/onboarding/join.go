@@ -179,6 +179,9 @@ func (m Manager) enrollSpoke(req JoinSpokeRequest, invite InviteLink, nodeID str
 	if err := writePrettyJSON(m.activeConfigPath(), cfg); err != nil {
 		return JoinSpokeResult{}, err
 	}
+	if err := m.rememberJoinedNetwork(cfg, req); err != nil {
+		return JoinSpokeResult{}, fmt.Errorf("保存加入信息失败（已保留本机身份，可重新连接）：%w", err)
+	}
 	return JoinSpokeResult{
 		ConfigPath: m.activeConfigPath(),
 		VirtualIP:  cfg.VirtualIP,
