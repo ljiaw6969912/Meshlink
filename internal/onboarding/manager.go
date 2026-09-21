@@ -36,6 +36,7 @@ type CreateHubResult struct {
 }
 
 type StartServerRequest struct {
+	NodeName      string `json:"node_name,omitempty"`
 	ServerAddress string `json:"server_address"`
 	ListenPort    int    `json:"listen_port"`
 	LongLived     bool   `json:"long_lived,omitempty"`
@@ -51,10 +52,15 @@ type StartServerResult struct {
 }
 
 func (m Manager) StartServerMode(req StartServerRequest) (StartServerResult, error) {
+	if req.NodeName != "" {
+		if err := validateEnrollmentNodeName(req.NodeName); err != nil {
+			return StartServerResult{}, err
+		}
+	}
 	if existing, err := config.Load(m.activeConfigPath()); err == nil && existing.Mode == "hub" && existing.NetworkCIDR != "" && existing.NetworkCIDR != "10.77.0.0/24" {
 		return StartServerResult{}, fmt.Errorf("现有服务器使用自定义网段 %s，已保留原配置；当前简化组网模式需要 10.77.0.0/24", existing.NetworkCIDR)
 	}
-	hubReq := defaultCreateHubRequest(CreateHubRequest{ListenPort: req.ListenPort})
+	hubReq := defaultCreateHubRequest(CreateHubRequest{NodeName: req.NodeName, ListenPort: req.ListenPort})
 	if hubReq.ListenPort <= 0 || hubReq.ListenPort > 65535 {
 		return StartServerResult{}, fmt.Errorf("listen_port must be between 1 and 65535")
 	}
@@ -164,6 +170,7 @@ func (m Manager) CreateHub(req CreateHubRequest) (CreateHubResult, error) {
 		NetworkCIDR: req.VirtualCIDR,
 	}
 	if existing != nil {
+		cfg.DisplayName = existing.DisplayName
 		cfg.ServerNodeConfig = existing.ServerNodeConfig
 		cfg.ServerPublicEndpoint = existing.ServerPublicEndpoint
 	}

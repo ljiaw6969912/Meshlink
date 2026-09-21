@@ -1,0 +1,19 @@
+[Unit]
+Description=Meshlink Linux coordinator and local mesh node
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=simple
+User=root
+WorkingDirectory=/opt/meshlink-linux
+ExecStart=/opt/meshlink-linux/bin/mesh-coordinator -data /opt/meshlink-linux/data
+Restart=on-failure
+RestartSec=5
+TimeoutStopSec=30
+UMask=0077
+# The TUN interface needs CAP_NET_ADMIN and access to /dev/net/tun.
+# Do not enable PrivateDevices or PrivateNetwork for this service.
+
+[Install]
+WantedBy=multi-user.target
