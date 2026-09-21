@@ -739,6 +739,12 @@ func (h *pureP2PHarness) startPeers(ids ...string) {
 	for _, id := range ids {
 		peer := h.peers[id]
 		integrationEventually(h.t, integrationWait, func() (bool, string) {
+			select {
+			case err := <-peer.process.done:
+				peer.process.done <- err
+				return false, fmt.Sprintf("%s process ended: %v", id, err)
+			default:
+			}
 			status := peer.agent.status.snapshot()
 			return status.CoordinatorState == networkstate.Connected,
 				fmt.Sprintf("%s coordinator state=%s", id, status.CoordinatorState)
@@ -1474,7 +1480,10 @@ func TestRevocationAfterCoordinatorReturnDeliversLargeRetainedSetWithoutDisconne
 	}
 	f.coordinator.mu.Unlock()
 
-	b, _ := f.connect("B")
+	b := f.dial("B")
+	b.send(proto.ControlTypeClientHello, f.hello("B"))
+	b.want(proto.ControlTypeServerHello)
+	b.want(proto.ControlTypeProbeCredential)
 	seen := make(map[string]struct{}, maxCoordinatorRelationships)
 	for range maxCoordinatorRelationships {
 		revocation := decodeCoordinatorBody[proto.DisconnectPeer](t, b.want(proto.ControlTypeDisconnectPeer))
@@ -1486,6 +1495,7 @@ func TestRevocationAfterCoordinatorReturnDeliversLargeRetainedSetWithoutDisconne
 		}
 		seen[revocation.NodeID] = struct{}{}
 	}
+	b.want(proto.ControlTypeMemberSnapshot)
 	// Delivery of a set larger than the per-peer output queue must not make
 	// the coordinator evict the healthy survivor control connection.
 	b.barrier()
@@ -1511,10 +1521,14 @@ func TestRevocationAfterCoordinatorReturnKeepsClaimWhenSourceReadmitsFirst(t *te
 	f.nodes[1]["routes"] = []string{"192.168.99.0/24"}
 	f.saveRegistry()
 	newC, _ := f.connect("C")
-	b, _ := f.connect("B")
+	b := f.dial("B")
+	b.send(proto.ControlTypeClientHello, f.hello("B"))
+	b.want(proto.ControlTypeServerHello)
+	b.want(proto.ControlTypeProbeCredential)
 	if got := decodeCoordinatorBody[proto.DisconnectPeer](t, b.want(proto.ControlTypeDisconnectPeer)); got.NodeID != "C" {
 		t.Fatalf("source-first readmission erased old C revocation: %+v", got)
 	}
+	b.want(proto.ControlTypeMemberSnapshot)
 	b.barrier()
 	newC.barrier()
 }

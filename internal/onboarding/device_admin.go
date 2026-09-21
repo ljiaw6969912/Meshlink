@@ -3,7 +3,6 @@ package onboarding
 import (
 	"errors"
 	"fmt"
-	"os"
 	"strings"
 	"time"
 )
@@ -26,7 +25,7 @@ type DeviceRejection struct {
 func (m Manager) LoadRegisteredNodes() ([]RegisteredNode, error) {
 	// The enrollment/admin loader intentionally treats a missing file as a new
 	// empty registry. Admission must distinguish that outage from member removal.
-	data, err := os.ReadFile(m.deviceRegistryPath())
+	data, err := readJSONFile(m.deviceRegistryPath())
 	if err != nil {
 		return nil, fmt.Errorf("%w: %w", ErrDeviceRegistryUnavailable, err)
 	}

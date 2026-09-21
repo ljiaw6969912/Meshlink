@@ -241,7 +241,10 @@ func (c *ControlClient) serve(parent context.Context, conn net.Conn) error {
 	if env.Type == proto.ControlTypeError {
 		body, e := proto.DecodeControlBody[proto.ControlError](env)
 		if e == nil {
-			return permanentControlError(body.Code)
+			if body.Code == "registry_unavailable" {
+				return fmt.Errorf("coordinator admission unavailable: %s", body.Code)
+			}
+			return fmt.Errorf("coordinator rejected admission: %s: %w", body.Message, permanentControlError(body.Code))
 		}
 	}
 	server, err := proto.DecodeControlBody[proto.ServerHello](env)

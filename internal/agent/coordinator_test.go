@@ -250,7 +250,9 @@ func TestCoordinatorRegistryUnavailablePreservesControlsAndRelationships(t *test
 			// Availability failure must still deny fresh admission and authorization.
 			newControl := f.dial("E")
 			newControl.send(proto.ControlTypeClientHello, f.hello("E"))
-			newControl.want(proto.ControlTypeError)
+			if failure := decodeCoordinatorBody[proto.ControlError](t, newControl.want(proto.ControlTypeError)); failure.Code != "registry_unavailable" {
+				t.Fatalf("temporary registry outage became an identity rejection: %+v", failure)
+			}
 			newControl.closed()
 			e.barrier()
 			b.send(proto.ControlTypeConnectRequest, proto.ConnectRequest{TargetNodeID: "C"})
@@ -342,7 +344,18 @@ func TestCoordinatorOfflinePeerReceivesIdentityRevocation(t *testing.T) {
 			if state != "both_offline" {
 				c.closed()
 			}
-			b, _ = f.connect("B")
+			if state == "same_tuple" {
+				b, _ = f.connect("B")
+			} else {
+				b = f.dial("B")
+				b.send(proto.ControlTypeClientHello, f.hello("B"))
+				b.want(proto.ControlTypeServerHello)
+				b.want(proto.ControlTypeProbeCredential)
+				if got := decodeCoordinatorBody[proto.DisconnectPeer](t, b.want(proto.ControlTypeDisconnectPeer)); got.NodeID != "C" {
+					t.Fatalf("offline survivor lost targeted revocation: %+v", got)
+				}
+				b.want(proto.ControlTypeMemberSnapshot)
+			}
 			report := func(s proto.ConnectPrepare) {
 				b.send(proto.ControlTypeActiveSessions, proto.ActiveSessions{Sessions: []proto.ActiveSession{{SessionID: s.SessionID, Generation: s.Generation, PeerNodeID: "C", PathType: "quic_udp"}}})
 			}
@@ -352,9 +365,8 @@ func TestCoordinatorOfflinePeerReceivesIdentityRevocation(t *testing.T) {
 				b.absent(proto.ControlTypeDisconnectPeer)
 				return
 			}
-			if got := decodeCoordinatorBody[proto.DisconnectPeer](t, b.want(proto.ControlTypeDisconnectPeer)); got.NodeID != "C" {
-				t.Fatalf("offline survivor lost targeted revocation: %+v", got)
-			}
+			b.barrier() // The startup report must not repeat the old revocation.
+			b.absent(proto.ControlTypeDisconnectPeer)
 			// Merely reporting a larger generation is not new authorization.
 			forged := old
 			forged.Generation += 1000000000

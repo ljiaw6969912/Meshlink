@@ -53,8 +53,9 @@ type fragmentHeader struct {
 }
 
 type reassemblyKey struct {
-	peerID   string
-	packetID uint64
+	peerID     string
+	generation uint64
+	packetID   uint64
 }
 
 type incompletePacket struct {
@@ -167,6 +168,11 @@ func validateReassemblyLimits(limits ReassemblyLimits) error {
 
 // Add retains one fragment and returns a packet only when every fragment arrived.
 func (r *Reassembler) Add(peerID string, fragment []byte, now time.Time) ([]byte, bool, error) {
+	return r.addForGeneration(peerID, 0, fragment, now)
+}
+
+// Keep session fragments separate while retaining shared per-device limits.
+func (r *Reassembler) addForGeneration(peerID string, generation uint64, fragment []byte, now time.Time) ([]byte, bool, error) {
 	if peerID == "" {
 		return nil, false, fmt.Errorf("%w: peer ID is required", ErrInvalidFragment)
 	}
@@ -187,7 +193,7 @@ func (r *Reassembler) Add(peerID string, fragment []byte, now time.Time) ([]byte
 		return nil, false, fmt.Errorf("%w: packet length %d cannot fit cache byte limits", ErrReassemblyLimit, header.originalLength)
 	}
 
-	key := reassemblyKey{peerID: peerID, packetID: header.packetID}
+	key := reassemblyKey{peerID: peerID, generation: generation, packetID: header.packetID}
 	entry, ok := r.packets[key]
 	if !ok {
 		r.sequence++

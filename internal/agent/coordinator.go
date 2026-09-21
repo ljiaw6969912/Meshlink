@@ -266,10 +266,13 @@ func (c *coordinator) serveControl(ctx context.Context, conn net.Conn) {
 	}
 	cn, fp := certInfoFromTLS(conn)
 	registeredNodes, registryErr := c.manager.LoadRegisteredNodes()
-	node, err := registeredNodeFromSnapshot(registeredNodes, hello.NodeID)
 	if registryErr != nil {
-		err = registryErr
+		// A temporarily unreadable registry cannot authorize a new connection,
+		// but it is not evidence that the authenticated device was revoked.
+		writeControlError(conn, "registry_unavailable", "The device registry is temporarily unavailable; retry admission.")
+		return
 	}
+	node, err := registeredNodeFromSnapshot(registeredNodes, hello.NodeID)
 	exactIdentity := hasVerifiedClientCertificate(conn) && err == nil && cn == hello.NodeID && node.NodeID == hello.NodeID && node.CertFingerprint == fp && node.VirtualIP == hello.VirtualIP && slices.Equal(node.Routes, hello.Routes)
 	if exactIdentity && (node.Disabled || node.DeletedAt != nil) {
 		// A v2 client sends CandidateUpdate and ActiveSessions before waiting
@@ -347,8 +350,12 @@ func (c *coordinator) serveControl(ctx context.Context, conn net.Conn) {
 	p.send(proto.ControlTypeServerHello, "", proto.ServerHello{ProtocolVersion: 2, NetworkCIDR: c.a.cfg.NetworkCIDR, MemberRevision: c.revision, Capabilities: []string{"quic_udp_v1", proto.DeviceMetadataCapability}})
 	c.issueProbeLocked(p)
 	c.a.status.upsertPeer(PeerStatus{NodeID: node.NodeID, DisplayName: node.DisplayName, Mode: "spoke", VirtualIP: node.VirtualIP, Routes: node.Routes, Fingerprint: node.CertFingerprint, CommonName: node.NodeID, ConnectedAt: time.Now()})
-	c.broadcastMembersLocked()
 	c.sendRetainedRevocationsLocked(p, registeredNodes)
+	// Consume historical authorizations before publishing currently admitted
+	// identities. A same-MAC peer may have renewed its certificate while this
+	// control connection was away; an old node-scoped revocation must not
+	// override the newer online membership that permits a fresh handshake.
+	c.broadcastMembersLocked()
 	c.publishMetrics()
 	c.mu.Unlock()
 	defer c.remove(p)
@@ -1059,12 +1066,15 @@ func (c *coordinator) runMaintenance(ctx context.Context) {
 func (c *coordinator) reconcileRegistry() {
 	c.mu.Lock()
 	defer c.mu.Unlock()
+	// One consistent read also bounds a Windows sharing outage to a single
+	// retry budget, instead of holding the coordinator lock for one per node.
+	nodes, err := c.manager.LoadRegisteredNodes()
+	if err != nil {
+		return
+	}
 	changed := false
 	for id, known := range c.known {
-		node, err := c.manager.LookupDevice(id)
-		if errors.Is(err, onboarding.ErrDeviceRegistryUnavailable) {
-			continue
-		}
+		node, err := registeredNodeFromSnapshot(nodes, id)
 		if err == nil && validRegisteredNode(node) && sameRegisteredIdentity(node, known) {
 			if node.DisplayName != known.DisplayName {
 				c.known[id] = node

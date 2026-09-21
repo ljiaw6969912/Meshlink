@@ -61,12 +61,14 @@ type SessionManagerConfig struct {
 	PeerMember        func(string) (proto.Member, bool)
 	RequestSession    func(string)
 	DeliverPacket     func(string, []byte) error
-	SessionChanged    func(SessionSnapshot)
-	HeartbeatInterval time.Duration
-	HeartbeatTimeout  time.Duration
-	DialTimeout       time.Duration
-	Now               func() time.Time
-	Logger            *slog.Logger
+	// Preferred by owners that must reject delayed delivery after revocation.
+	DeliverPacketContext func(context.Context, string, []byte) error
+	SessionChanged       func(SessionSnapshot)
+	HeartbeatInterval    time.Duration
+	HeartbeatTimeout     time.Duration
+	DialTimeout          time.Duration
+	Now                  func() time.Time
+	Logger               *slog.Logger
 }
 
 type SessionManager struct {
@@ -81,6 +83,7 @@ type SessionManager struct {
 	peerMember           func(string) (proto.Member, bool)
 	requestSession       func(string)
 	deliverPacket        func(string, []byte) error
+	deliverPacketContext func(context.Context, string, []byte) error
 	sessionChanged       func(SessionSnapshot)
 	heartbeatInterval    time.Duration
 	heartbeatTimeout     time.Duration
@@ -207,7 +210,7 @@ func NewSessionManager(cfg SessionManagerConfig) (*SessionManager, error) {
 	if cfg.PeerMember == nil {
 		return nil, errors.New("session manager peer authorization callback is required")
 	}
-	if cfg.DeliverPacket == nil {
+	if cfg.DeliverPacket == nil && cfg.DeliverPacketContext == nil {
 		return nil, errors.New("session manager packet delivery callback is required")
 	}
 
@@ -253,6 +256,7 @@ func NewSessionManager(cfg SessionManagerConfig) (*SessionManager, error) {
 		peerMember:           cfg.PeerMember,
 		requestSession:       cfg.RequestSession,
 		deliverPacket:        cfg.DeliverPacket,
+		deliverPacketContext: cfg.DeliverPacketContext,
 		sessionChanged:       cfg.SessionChanged,
 		heartbeatInterval:    heartbeatInterval,
 		heartbeatTimeout:     heartbeatTimeout,
@@ -617,6 +621,38 @@ func (m *SessionManager) ClosePeer(peerID, code string) error {
 	if session != nil {
 		session.stop("closed")
 	}
+	m.emit(snapshot)
+	return nil
+}
+
+// ReauthorizePeer permits new offers after the owner has closed the old peer
+// and published a fresh authenticated online membership. It never revives a
+// transport or pairing key. Keep the generation floor so old offers stay spent.
+func (m *SessionManager) ReauthorizePeer(peerID string) error {
+	peerID = strings.TrimSpace(peerID)
+	member, authorized := m.peerMember(peerID)
+	if peerID == "" || peerID == m.nodeID || !authorized || member.Status != "online" {
+		return fmt.Errorf("%w: fresh online peer authorization is required", ErrSessionNotReady)
+	}
+	m.mu.Lock()
+	if m.closed {
+		m.mu.Unlock()
+		return ErrSessionManagerClosed
+	}
+	old := m.pairs[peerID]
+	if old == nil || !old.closed {
+		m.mu.Unlock()
+		return nil
+	}
+	// Replace the owner instead of reusing it: an old retry worker may still
+	// be exiting and must not consume or reset the new owner's timer.
+	pair := &sessionPair{
+		peerID: peerID, highestGeneration: old.highestGeneration,
+		snapshot: SessionSnapshot{PeerNodeID: peerID, State: PathStateIdle},
+	}
+	m.pairs[peerID] = pair
+	snapshot := m.snapshotLocked(pair)
+	m.mu.Unlock()
 	m.emit(snapshot)
 	return nil
 }
@@ -1198,7 +1234,7 @@ func (s *managedSession) datagramLoop() {
 			}
 			return
 		}
-		packet, complete, err := s.manager.reassembler.Add(s.peerID, fragment, s.manager.clock())
+		packet, complete, err := s.manager.reassembler.addForGeneration(s.peerID, s.generation, fragment, s.manager.clock())
 		if err != nil {
 			s.inboundDropped.Add(1)
 			s.manager.notifyPeer(s.peerID)
@@ -1213,7 +1249,7 @@ func (s *managedSession) datagramLoop() {
 			s.manager.notifyPeer(s.peerID)
 			continue
 		}
-		if err := s.manager.invokeDeliverPacket(s.peerID, append([]byte(nil), packet...)); err != nil {
+		if err := s.manager.invokeDeliverPacket(s.ctx, s.peerID, append([]byte(nil), packet...)); err != nil {
 			s.inboundDropped.Add(1)
 			s.manager.notifyPeer(s.peerID)
 			continue
@@ -1674,17 +1710,29 @@ func (m *SessionManager) emit(snapshot SessionSnapshot) {
 	}
 }
 
-func (m *SessionManager) invokeDeliverPacket(peerID string, packet []byte) error {
+func (m *SessionManager) invokeDeliverPacket(ctx context.Context, peerID string, packet []byte) error {
 	select {
+	case <-ctx.Done():
+		return ctx.Err()
 	case <-m.ctx.Done():
 		return ErrSessionManagerClosed
 	default:
 	}
 	result := make(chan error, 1)
-	go func() { result <- m.deliverPacket(peerID, packet) }()
+	go func() {
+		if m.deliverPacketContext != nil {
+			result <- m.deliverPacketContext(ctx, peerID, packet)
+		} else if err := ctx.Err(); err != nil {
+			result <- err
+		} else {
+			result <- m.deliverPacket(peerID, packet)
+		}
+	}()
 	select {
 	case err := <-result:
 		return err
+	case <-ctx.Done():
+		return ctx.Err()
 	case <-m.ctx.Done():
 		return ErrSessionManagerClosed
 	}

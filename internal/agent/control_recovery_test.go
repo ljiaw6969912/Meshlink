@@ -19,6 +19,9 @@ func TestOnlineMembershipRequestsEachEligiblePeerOnceWithoutTraffic(t *testing.T
 		t.Fatal(err)
 	}
 	f.members[2].Status = "offline"
+	// Revoked E remains absent. A fresh online entry would explicitly admit
+	// it again (for example after same-MAC certificate renewal).
+	f.members = f.members[:3]
 	c := attachRuntimeControl(t, r)
 	if err := r.applyMembers(proto.MemberSnapshot{Revision: 3, Members: f.members}); err != nil {
 		t.Fatal(err)
@@ -125,6 +128,41 @@ func TestControlDisconnectBeforeServerHelloIsRetryable(t *testing.T) {
 		}
 	case <-time.After(time.Second):
 		t.Fatal("control disconnect did not return")
+	}
+}
+
+func TestAdmissionRegistryOutageIsRetryableButIdentityRejectionIsPermanent(t *testing.T) {
+	for _, code := range []string{"registry_unavailable", "identity_mismatch"} {
+		t.Run(code, func(t *testing.T) {
+			f := newRuntimeFixture(t, "B")
+			local, remote := net.Pipe()
+			defer remote.Close()
+			ctx, cancel := context.WithCancel(context.Background())
+			defer cancel()
+			done := make(chan error, 1)
+			go func() { done <- f.r["B"].control.serve(ctx, local) }()
+			for range 3 {
+				if _, err := proto.Read(remote); err != nil {
+					t.Fatal(err)
+				}
+			}
+			payload, err := proto.MarshalControl(proto.ControlTypeError, "", proto.ControlError{Code: code, Message: "admission unavailable"})
+			if err != nil {
+				t.Fatal(err)
+			}
+			if err := proto.Write(remote, proto.TypeControl, payload); err != nil {
+				t.Fatal(err)
+			}
+			select {
+			case err := <-done:
+				var permanent *controlCompatibilityError
+				if err == nil || errors.As(err, &permanent) != (code == "identity_mismatch") {
+					t.Fatalf("wrong admission retry policy for %s: %v", code, err)
+				}
+			case <-time.After(time.Second):
+				t.Fatal("admission did not return")
+			}
+		})
 	}
 }
 

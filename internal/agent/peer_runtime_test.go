@@ -425,9 +425,13 @@ func TestMemberSnapshotAtomicConflictAndIdentityRevocation(t *testing.T) {
 		t.Fatal(err)
 	}
 	s, _ := f.r["B"].sessions.Snapshot("C")
-	if s.State != p2p.PathStateClosed {
-		t.Fatalf("changed fingerprint retained session: %+v", s)
+	if s.State != p2p.PathStateRequesting || s.SessionID != "" || s.PathType != "" {
+		t.Fatalf("changed fingerprint must discard the old session and request a new one: %+v", s)
 	}
+	runtimeEventually(t, func() bool {
+		peer, _ := f.r["C"].sessions.Snapshot("B")
+		return peer.State != p2p.PathStateLANDirect && peer.State != p2p.PathStatePublicDirect
+	})
 }
 
 func TestMemberSnapshotAbsencePreservesReadyDirectAuthorization(t *testing.T) {

@@ -59,18 +59,19 @@ func (a *Agent) configuredPeerSessionTimings() peerSessionTimings {
 
 // This owner is created once per agent, outside all control connection contexts.
 type peerRuntime struct {
-	a          *Agent
-	candidates *p2p.CandidateService
-	sessions   *p2p.SessionManager
-	control    *ControlClient
-	mu         sync.RWMutex
-	routes     *p2p.RouteTable
-	members    map[string]proto.Member
-	revoked    map[string]bool
-	closeOnce  sync.Once
-	closeErr   error
-	closed     atomic.Bool
-	eventMu    sync.Mutex
+	a            *Agent
+	candidates   *p2p.CandidateService
+	sessions     *p2p.SessionManager
+	control      *ControlClient
+	mu           sync.RWMutex
+	routes       *p2p.RouteTable
+	members      map[string]proto.Member
+	revoked      map[string]bool
+	closeOnce    sync.Once
+	closeErr     error
+	closed       atomic.Bool
+	eventMu      sync.Mutex
+	membershipMu sync.Mutex
 }
 
 func peerNetworkID(path string) (string, error) {
@@ -122,7 +123,7 @@ func newPeerRuntime(a *Agent) (*peerRuntime, error) {
 	}
 	r.sessions, err = p2p.NewSessionManager(p2p.SessionManagerConfig{
 		NodeID: a.cfg.NodeID, NetworkID: networkID, MTU: a.cfg.MTU, Candidates: service, TLSConfig: quicTLS.Clone(), LocalVirtualIP: localIP, LocalRoutes: a.routes,
-		PeerMember: r.member, RequestSession: r.requestSession, DeliverPacket: r.deliverPacket, SessionChanged: r.sessionChanged,
+		PeerMember: r.member, RequestSession: r.requestSession, DeliverPacketContext: r.deliverPacketContext, SessionChanged: r.sessionChanged,
 		HeartbeatInterval: timings.heartbeatInterval, HeartbeatTimeout: timings.heartbeatTimeout, DialTimeout: timings.dialTimeout,
 		Logger: a.log,
 	})
@@ -187,6 +188,10 @@ func (r *peerRuntime) applyMembers(snapshot proto.MemberSnapshot) error {
 	return r.applyMembership(snapshot, nil, true)
 }
 func (r *peerRuntime) applyMembership(snapshot proto.MemberSnapshot, removed []string, presence bool) error {
+	// Keep revocation, old-session teardown and readmission ordered, including
+	// direct callers outside the control connection's serial reader.
+	r.membershipMu.Lock()
+	defer r.membershipMu.Unlock()
 	changed, err := r.publishMembership(snapshot, removed, presence)
 	if err != nil {
 		return err
@@ -198,6 +203,22 @@ func (r *peerRuntime) applyMembership(snapshot proto.MemberSnapshot, removed []s
 			code = "peer_revoked"
 		}
 		_ = r.sessions.ClosePeer(id, code)
+	}
+	for _, member := range snapshot.Members {
+		if member.Status != "online" || !slices.Contains(changed, member.NodeID) {
+			continue
+		}
+		// Only an explicit, authenticated online membership can readmit this
+		// identity. Cached/offline presence cannot undo a revocation. The old
+		// transport and offers have already been closed before this point.
+		r.a.status.mu.Lock()
+		r.mu.Lock()
+		delete(r.revoked, member.NodeID)
+		r.mu.Unlock()
+		r.a.status.mu.Unlock()
+		if err := r.sessions.ReauthorizePeer(member.NodeID); err != nil {
+			return err
+		}
 	}
 	r.connectOnlineMembers()
 	return nil
@@ -266,7 +287,9 @@ func (r *peerRuntime) publishMembership(snapshot proto.MemberSnapshot, removed [
 			return nil, errors.New("duplicate member")
 		}
 		seen[m.NodeID] = true
-		if old, ok := r.members[m.NodeID]; ok && (old.Fingerprint != m.Fingerprint || old.VirtualIP != m.VirtualIP || !slices.Equal(old.Routes, m.Routes)) {
+		old, known := r.members[m.NodeID]
+		identityChanged := known && (old.Fingerprint != m.Fingerprint || old.VirtualIP != m.VirtualIP || !slices.Equal(old.Routes, m.Routes))
+		if identityChanged || (r.revoked[m.NodeID] && m.Status == "online") {
 			if m.NodeID == r.a.cfg.NodeID {
 				r.mu.Unlock()
 				return nil, permanentControlError("identity_mismatch")
@@ -333,12 +356,19 @@ func (r *peerRuntime) readDevice(ctx context.Context) error {
 		}
 	}
 }
-func (r *peerRuntime) deliverPacket(id string, packet []byte) error {
+func (r *peerRuntime) deliverPacketContext(ctx context.Context, id string, packet []byte) error {
+	// Authorization publication waits for any already accepted device write;
+	// delayed callbacks from a closed session cannot use a newer membership.
+	r.mu.RLock()
+	defer r.mu.RUnlock()
 	if r.closed.Load() {
 		return p2p.ErrSessionManagerClosed
 	}
-	m, ok := r.member(id)
-	if !ok {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	m, ok := r.members[id]
+	if !ok || r.revoked[id] || id == r.a.cfg.NodeID {
 		return p2p.ErrSessionNotReady
 	}
 	if err := p2p.ValidateInboundPacket(m, netip.MustParseAddr(r.a.cfg.VirtualIP), r.a.routes, packet); err != nil {
