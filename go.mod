@@ -2,6 +2,9 @@ module meshlink
 
 go 1.26
 
+// Local Walk patch fixes asynchronous layout shutdown; see third_party/walk/README.meshlink.md.
+replace github.com/lxn/walk => ./third_party/walk
+
 require (
 	github.com/lxn/walk v0.0.0-20210112085537-c389da54e794
 	github.com/quic-go/quic-go v0.61.0

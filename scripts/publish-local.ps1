@@ -6,7 +6,8 @@ outcome from a non-elevated caller. Do not use build-clean.ps1 for local upgrade
 #>
 param(
   [string]$RepositoryRoot = (Join-Path $PSScriptRoot '..'),
-  [string]$ResultPath = ''
+  [string]$ResultPath = '',
+  [switch]$IncludeLinux
 )
 
 $ErrorActionPreference = 'Stop'
@@ -32,6 +33,24 @@ function Get-MeshlinkSourceInformation([string]$Root) {
   }
 }
 
+function Get-MeshlinkLinuxPackages([string]$Root, [string]$Version) {
+  $cache = Join-Path $Root '.cache'
+  $receipt = Get-Content -LiteralPath (Join-Path $cache 'linux-coordinator-packages.json') -Raw -Encoding UTF8 | ConvertFrom-Json
+  if ($receipt.schema -cne 'meshlink-linux-packages-v1' -or $receipt.version -cne $Version) { throw 'Linux packages do not match VERSION' }
+  $expected = @('meshlink-linux-amd64.tar.gz', 'meshlink-linux-arm64.tar.gz')
+  if (@($receipt.archives).Count -ne 2) { throw 'Both Linux architectures must be built before publication' }
+  $seen = @{}
+  foreach ($archive in $receipt.archives) {
+    $file = [string]$archive.file
+    if ($file -cnotin $expected -or $seen.ContainsKey($file)) { throw "Unexpected or duplicate Linux package: $file" }
+    $seen[$file] = $true
+    $source = Join-Path $cache $file
+    $item = Get-Item -LiteralPath $source
+    if ($item.PSIsContainer -or $item.Length -ne $archive.size -or (Get-FileHash -LiteralPath $source -Algorithm SHA256).Hash -ne $archive.sha256) { throw "Linux package hash mismatch: $file" }
+    [pscustomobject]@{file=$file; source=$source; sha256=$archive.sha256; size=$archive.size}
+  }
+}
+
 $releaseRoot = 'C:\Users\Administrator\Desktop\wireguard\release'
 $destinationRoot = Join-Path $releaseRoot 'meshlink'
 $runtime = New-MeshlinkRuntimeState
@@ -51,6 +70,8 @@ try {
   $version = (Get-Content -LiteralPath (Join-Path $root 'VERSION') -Raw -Encoding UTF8).Trim()
   if ($version -notmatch '^[0-9]+\.[0-9]+\.[0-9]+(?:-[0-9A-Za-z.-]+)?$') { throw 'VERSION is invalid' }
   $metadata = Read-MeshlinkBuildMetadata -BinDirectory $bin -Version $version
+  $linuxPackages = @()
+  if ($IncludeLinux) { $linuxPackages = @(Get-MeshlinkLinuxPackages -Root $root -Version $version) }
   $source = Get-MeshlinkSourceInformation $root
   $metadata | Add-Member -NotePropertyName source -NotePropertyValue $source -Force
   $result.version = $version
@@ -92,6 +113,14 @@ try {
   if ($packageResult.Archive -ne $result.archive -or -not $packageResult.StoppedBeforePackaging) { throw 'Clean-package verification did not report the expected archive' }
   $result.archive_files = $packageResult.Files
   $result.archive_sha256 = (Get-FileHash -LiteralPath $result.archive -Algorithm SHA256).Hash.ToLowerInvariant()
+  $result.linux_archives = @()
+  foreach ($linuxPackage in $linuxPackages) {
+    Assert-MeshlinkStopped
+    $target = Get-MeshlinkDestinationPath -Root $releaseRoot -Relative $linuxPackage.file
+    Copy-Item -LiteralPath $linuxPackage.source -Destination $target -Force
+    if ((Get-FileHash -LiteralPath $target -Algorithm SHA256).Hash -ne $linuxPackage.sha256) { throw "Published Linux package hash mismatch: $($linuxPackage.file)" }
+    $result.linux_archives += [ordered]@{path=$target; sha256=$linuxPackage.sha256; size=$linuxPackage.size}
+  }
   Assert-MeshlinkStopped
   Assert-MeshlinkDataUnchanged -Root $destinationRoot -Before $before
 } catch { $failures.Add($_.Exception.Message) }

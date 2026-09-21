@@ -38,7 +38,7 @@ Meshlink 自建 v2 的方向是“私有远程桌面组网 + 协调面 Hub + 纯
 
 ## 本机更新与外发
 
-编译使用 `scripts/build.ps1`。以管理员权限运行 `scripts/publish-local.ps1`，发布到固定的 `release/meshlink` 并覆盖 `release/meshlink-无配置.zip`。发布脚本先停止并确认相关服务和进程退出，校验构建文件与全部本机运行数据，最后恢复此前运行的服务。
+双击根目录 `build-all.bat` 可一键测试、编译和发布 Windows 与 Linux 包。发布到固定的 `release/meshlink`，覆盖 `release/meshlink-无配置.zip`、两种架构的 Linux 包和更新清单。测试通过后才停止并确认相关服务和进程退出；编译及发布结束后恢复此前运行的服务。
 
 升级保留本机配置、证书和运行数据；外发包只包含白名单程序和说明文件。不要使用旧的 `build-clean.ps1` 清理本机运行目录。早期版本没有保存的客户端邀请链接和验证码无法补回，已有证书身份仍可直接重连。
 
@@ -117,30 +117,21 @@ Wintun 源代码采用 GPLv2 发布；官方预编译并签名的 `wintun.dll` �
 
 ## 构建
 
-```powershell
-powershell -ExecutionPolicy Bypass -File .\scripts\build.ps1
-```
+Windows 安装 Go、Git，确认 `bin\wintun.dll` 存在后，双击根目录的 `build-all.bat` 并允许管理员权限提示。脚本先执行完整 Go 测试与 `go vet`，通过后停止所有相关 Meshlink 服务和进程，编译 Windows 程序与 Linux amd64/arm64 命令行程序，再校验并覆盖固定发布文件。已运行的服务和桌面程序随后恢复，原本停止的服务保持停止。
 
-同时构建并打包：
-
-```powershell
-powershell -ExecutionPolicy Bypass -File .\scripts\build.ps1 -Package
-```
-
-Windows 上也可以直接双击根目录的 `build-all.bat`。它会请求管理员权限，停止并强制结束从当前仓库 `bin` 启动的 Meshlink 服务和进程，保留 `bin\wintun.dll`，清空其余旧 `bin` 产物以及 `dist`、`release`，然后执行完整测试、Windows/Linux 编译、标准包和私有包校验。安装在其他目录的发行版以及 `configs`、`certs`、`invites`、日志不会被修改。
-
-打包文件位于：
+输出统一放在 `C:\Users\Administrator\Desktop\wireguard\release`：
 
 ```text
-dist\meshlink.zip
-```
-
-发行目录同时会生成：
-
-```text
+release\meshlink\                 本机完整运行目录，保留配置及身份
+release\meshlink-无配置.zip         Windows 外发包
+release\meshlink-linux-amd64.tar.gz
+release\meshlink-linux-arm64.tar.gz
 release\manifest.json
-release\meshlink-版本号.zip
 ```
+
+每次覆盖同名产物，不创建版本号或时间戳目录，不删除 `release`。外发包不包含配置、证书、私钥、邀请码、设备登记或日志。脚本读取 `VERSION`，不会自动增加版本号；测试或编译失败会停止后续发布，停服后发生错误仍会尝试恢复原服务。重复启动会被构建锁拒绝。
+
+运行日志和结果分别位于 `.cache\build-all.log`、`.cache\build-all-result.json`。命令行也可在管理员 PowerShell 中运行 `powershell -NoProfile -ExecutionPolicy Bypass -File .\scripts\build-all.ps1`。仅编译 Windows 等基础程序而不发布时使用 `scripts/build.ps1`；Linux 单独构建见 [Linux 使用说明](docs/linux-coordinator.md)。
 
 ## 桌面程序
 

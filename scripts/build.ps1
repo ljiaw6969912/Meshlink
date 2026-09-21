@@ -86,7 +86,7 @@ New-Item -ItemType Directory -Force -Path (Join-Path $binDir "linux") | Out-Null
 $versionFlags = "-X meshlink/internal/version.Version=$Version -X meshlink/internal/version.BuildTime=$BuildTime"
 
 if (-not $SkipTests) {
-  Invoke-Go -Arguments @("test", "-count=1", "./...")
+  Invoke-Go -Arguments @("test", "-count=1", "./...", "github.com/lxn/walk")
 }
 Invoke-Go -Arguments @("build", "-ldflags", $versionFlags, "-o", (Join-Path $binDir "mesh-agent.exe"), ".\cmd\mesh-agent")
 Invoke-Go -Arguments @("build", "-ldflags", $versionFlags, "-o", (Join-Path $binDir "meshctl.exe"), ".\cmd\meshctl")

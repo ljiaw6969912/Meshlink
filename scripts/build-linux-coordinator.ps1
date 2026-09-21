@@ -44,6 +44,7 @@ try {
   $helper = Join-Path $cache "meshlink-linux-package.exe"
   Invoke-Go -Arguments @("build", "-trimpath", "-o", $helper, "./scripts/linux-package")
 
+  $packages = @()
   foreach ($architecture in ($Architectures | Select-Object -Unique)) {
     $stage = Join-Path $cache "linux-coordinator/$architecture/meshlink-linux"
     foreach ($directory in @("bin", "docs", "systemd")) {
@@ -84,8 +85,13 @@ try {
     $archive = Join-Path $cache "meshlink-linux-$architecture.tar.gz"
     & $helper -source $stage -output $archive
     if ($LASTEXITCODE -ne 0) { throw "Linux package verification failed for $architecture" }
+    $packages += [ordered]@{file=(Split-Path $archive -Leaf); sha256=(Get-FileHash -LiteralPath $archive -Algorithm SHA256).Hash.ToLowerInvariant(); size=(Get-Item -LiteralPath $archive).Length}
     Write-Output "Built and verified $archive ($version; linux/$architecture)"
   }
+  # Written only after every requested architecture has been verified. The
+  # publisher checks this receipt before stopping services or copying files.
+  $receipt = [ordered]@{schema='meshlink-linux-packages-v1'; version=$version; build_time=$buildTime; archives=$packages}
+  Write-Utf8NoBom (Join-Path $cache 'linux-coordinator-packages.json') (($receipt | ConvertTo-Json -Depth 8) + "`n")
 } finally {
   $env:GOOS = $oldGOOS
   $env:GOARCH = $oldGOARCH

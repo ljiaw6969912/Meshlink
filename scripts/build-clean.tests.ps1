@@ -2,7 +2,6 @@ $ErrorActionPreference = "Stop"
 
 $root = [System.IO.Path]::GetFullPath((Join-Path $PSScriptRoot ".."))
 $subject = Join-Path $PSScriptRoot "build-clean.ps1"
-$batch = Join-Path $root "build-all.bat"
 
 function Assert-True([bool]$Condition, [string]$Message) {
   if (-not $Condition) {
@@ -36,7 +35,6 @@ function New-TestRoot([bool]$IncludeWintun) {
 $tempRoots = @()
 try {
   Assert-True (Test-Path -LiteralPath $subject -PathType Leaf) "build-clean.ps1 is missing"
-  Assert-True (Test-Path -LiteralPath $batch -PathType Leaf) "build-all.bat is missing"
 
   $cleanRoot = New-TestRoot $true
   $tempRoots += $cleanRoot
@@ -64,11 +62,6 @@ try {
   Assert-True (Test-Path -LiteralPath (Join-Path $missingRoot "bin\mesh-agent.exe") -PathType Leaf) "cleanup started before wintun preflight failed"
   Assert-True (Test-Path -LiteralPath (Join-Path $missingRoot "dist\meshlink.zip") -PathType Leaf) "dist was deleted before wintun preflight failed"
 
-  $batchText = Get-Content -Raw -LiteralPath $batch
-  Assert-True ($batchText.Contains("scripts\build-clean.ps1")) "batch entry does not call build-clean.ps1"
-  Assert-True ($batchText.Contains("-PrivatePackage")) "batch entry does not request the private package"
-  Assert-True ($batchText.Contains("-Verb RunAs")) "batch entry does not request administrator elevation"
-
   $identity = [Security.Principal.WindowsIdentity]::GetCurrent()
   $principal = New-Object Security.Principal.WindowsPrincipal($identity)
   $isAdministrator = $principal.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
@@ -88,6 +81,9 @@ try {
   Write-Output "build-clean tests passed"
 } finally {
   foreach ($path in $tempRoots) {
+    $full = [IO.Path]::GetFullPath($path)
+    $base = [IO.Path]::GetFullPath([IO.Path]::GetTempPath()).TrimEnd('\') + '\'
+    if (-not $full.StartsWith($base, [StringComparison]::OrdinalIgnoreCase) -or (Split-Path $full -Leaf) -notlike 'meshlink-build-clean-test-*') { throw 'Unsafe test cleanup path' }
     if (Test-Path -LiteralPath $path) {
       Remove-Item -LiteralPath $path -Recurse -Force
     }

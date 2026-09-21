@@ -77,6 +77,8 @@ Linux 更新通过替换对应架构的二进制包完成。更新前先停止�
 
 ## 从源码构建
 
+Windows 上完整编译和发布可直接运行源码根目录的 `build-all.bat`。它同时生成 Windows 无配置包、Linux amd64/arm64 包和更新清单，保留现有运行数据，并恢复原先运行的 Meshlink 服务。最终包放在固定的 `C:\Users\Administrator\Desktop\wireguard\release`。
+
 在 Windows 源码目录使用已安装的 Go 和 PowerShell：
 
 ```powershell
